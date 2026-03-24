@@ -16,6 +16,7 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [stream, setStream] = useState<MediaStream | null>(null);
+  const [sermonTopic, setSermonTopic] = useState('');
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -24,9 +25,13 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
   const sendBufferRef = useRef<Float32Array[]>([]);
   const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryDelayRef = useRef(1000);
-  const pendingBufferRef = useRef<ArrayBuffer[]>([]);  // buffer while disconnected
+  const pendingBufferRef = useRef<ArrayBuffer[]>([]);
   const shouldReconnectRef = useRef(false);
   const sampleRateRef = useRef(48000);
+  const sermonTopicRef = useRef('');
+
+  // Keep ref in sync so reconnect handler has current topic value
+  useEffect(() => { sermonTopicRef.current = sermonTopic; }, [sermonTopic]);
 
   const flushBuffer = useCallback(() => {
     if (sendBufferRef.current.length === 0 || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -39,7 +44,6 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
     let offset = 0;
     for (const c of chunks) { merged.set(c, offset); offset += c.length; }
 
-    // Encode to bytes then base64
     const bytes = new Uint8Array(merged.buffer, merged.byteOffset, merged.byteLength);
     let binary = '';
     for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
@@ -60,9 +64,12 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
       setStatus('active');
       setErrorMsg('');
       retryDelayRef.current = 1000;
-      ws.send(JSON.stringify({ type: 'session.start', sampleRate: sampleRateRef.current }));
+      ws.send(JSON.stringify({
+        type: 'session.start',
+        sampleRate: sampleRateRef.current,
+        topic: sermonTopicRef.current,
+      }));
 
-      // Flush any audio buffered during reconnect
       for (const buf of pendingBufferRef.current) {
         const bytes = new Uint8Array(buf);
         let binary = '';
@@ -162,8 +169,9 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
     setStatus('idle');
   }, []);
 
-  // Cleanup on unmount
   useEffect(() => () => stop(), [stop]);
+
+  const isLive = status === 'active' || status === 'reconnecting';
 
   const statusLabel: Record<Status, string> = {
     idle: 'Ready',
@@ -190,6 +198,29 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
         </span>
       </div>
 
+      {/* Sermon topic — editable before going live, read-only during session */}
+      <div className="space-y-1">
+        <label className="text-gray-400 text-xs font-medium uppercase tracking-wide">
+          Sermon Topic
+        </label>
+        {isLive ? (
+          <p className="text-gray-300 text-sm bg-gray-700 rounded px-3 py-2">
+            {sermonTopic || <span className="text-gray-500 italic">No topic set</span>}
+          </p>
+        ) : (
+          <input
+            type="text"
+            value={sermonTopic}
+            onChange={(e) => setSermonTopic(e.target.value)}
+            placeholder="e.g. The Great Commission — Matthew 28"
+            className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 placeholder-gray-500 border border-gray-600 focus:border-blue-500 focus:outline-none"
+          />
+        )}
+        <p className="text-gray-500 text-xs">
+          Helps the AI resolve ambiguous theological terms correctly.
+        </p>
+      </div>
+
       <VUMeter stream={stream} />
 
       {errorMsg && (
@@ -197,15 +228,15 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
       )}
 
       <button
-        onClick={status === 'idle' || status === 'error' ? start : stop}
+        onClick={isLive ? stop : start}
         disabled={status === 'connecting' || status === 'reconnecting'}
         className={`w-full py-3 rounded-lg font-semibold text-white transition-colors disabled:opacity-50 ${
-          status === 'active' || status === 'reconnecting'
+          isLive
             ? 'bg-red-600 hover:bg-red-700'
             : 'bg-green-600 hover:bg-green-700'
         }`}
       >
-        {status === 'active' || status === 'reconnecting' ? 'End Session' : 'Go Live'}
+        {isLive ? 'End Session' : 'Go Live'}
       </button>
 
       <p className="text-gray-500 text-xs text-center">Church: {churchId}</p>

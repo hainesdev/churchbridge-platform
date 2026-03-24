@@ -38,7 +38,8 @@ async def stream_audio(
 
             if msg_type == "session.start":
                 sample_rate = msg.get("sampleRate", 48000)
-                session = await _session_manager.create(church_id, ws, sample_rate)
+                sermon_topic = msg.get("topic", "").strip()
+                session = await _session_manager.create(church_id, ws, sample_rate, sermon_topic)
 
             elif msg_type == "audio":
                 if session:

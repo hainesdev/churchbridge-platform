@@ -2,45 +2,52 @@ import os
 import asyncio
 import logging
 from collections import deque
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
-from server.services.prompt_manager import build_system_prompt
+from server.services.prompt_manager import build_system_prompt, build_user_message
+
+if TYPE_CHECKING:
+    from server.services.topic_tracker import TopicTracker
 
 logger = logging.getLogger(__name__)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+CONTEXT_WINDOW = 5   # verbatim utterances kept for pronoun/term continuity
 
 
 class TranslationService:
     """Translates Deepgram final transcripts via OpenAI streaming.
 
-    - Maintains a 3-segment context window for coherence across utterances.
-    - Streams tokens immediately to on_token callback.
-    - Calls on_complete with the full translated segment when done.
-    - Cancels in-flight translation if a new final segment arrives (fast speaker).
+    Improvements over v1:
+    - temperature=0 (translation is deterministic — no creative variation)
+    - presence_penalty=0, frequency_penalty=0 (preserve source repetition)
+    - 5-utterance verbatim context window (up from 3)
+    - TopicTracker integration: rolling sermon summary injected per call
+    - Two-part user message: topic context + recent utterances + source text
+    - Cancels in-flight translation if a new final segment arrives
     """
 
     def __init__(
         self,
         church_id: str,
         church_terms: dict[str, str],
+        topic_tracker: "TopicTracker",
         on_token: Callable[[str], Awaitable[None]],
         on_complete: Callable[[str, str], Awaitable[None]],
     ):
         self._church_id = church_id
-        self._church_terms = church_terms
+        self._topic_tracker = topic_tracker
         self._on_token = on_token
         self._on_complete = on_complete
-        self._context: deque[str] = deque(maxlen=3)
+        self._context: deque[str] = deque(maxlen=CONTEXT_WINDOW)
         self._client = AsyncOpenAI()
-        self._system_prompt = build_system_prompt(church_terms)
+        self._static_prompt = build_system_prompt(church_terms)
         self._active_task: asyncio.Task | None = None
 
     async def translate(self, spanish_text: str):
         """Called on each Deepgram is_final event."""
-        # Cancel previous translation if still streaming (speaker moved on)
         if self._active_task and not self._active_task.done():
             self._active_task.cancel()
 
@@ -50,17 +57,28 @@ class TranslationService:
         )
 
     async def _stream_translation(self, text: str):
-        context_str = " | ".join(self._context)
+        # Build context: all utterances except the current one (which is being translated)
+        recent = list(self._context)[:-1]
+        topic_context = self._topic_tracker.get_context()
+
+        user_msg = build_user_message(
+            current_text=text,
+            recent_utterances=recent,
+            topic_context=topic_context,
+        )
+
         try:
             stream = await self._client.chat.completions.create(
                 model=OPENAI_MODEL,
                 stream=True,
                 messages=[
-                    {"role": "system", "content": self._system_prompt},
-                    {"role": "user", "content": f"Context: {context_str}\nTranslate: {text}"},
+                    {"role": "system", "content": self._static_prompt},
+                    {"role": "user",   "content": user_msg},
                 ],
-                max_tokens=200,
-                temperature=0.1,   # low temperature for consistency
+                max_tokens=250,
+                temperature=0,
+                presence_penalty=0,
+                frequency_penalty=0,
             )
 
             full = ""
