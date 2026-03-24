@@ -96,7 +96,7 @@ class DeepgramSession:
             ready.set()  # unblock start() if we failed before setting it
 
     async def send(self, pcm16_bytes: bytes):
-        if self._ws and not self._ws.closed:
+        if self._ws:
             try:
                 await self._ws.send(pcm16_bytes)
             except websockets.ConnectionClosed:
@@ -105,7 +105,7 @@ class DeepgramSession:
     async def stop(self):
         if self._stop_event:
             self._stop_event.set()
-        if self._ws and not self._ws.closed:
+        if self._ws:
             try:
                 await self._ws.close()
             except Exception:
