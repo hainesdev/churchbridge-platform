@@ -76,5 +76,13 @@ async def init_db():
         await db.commit()
 
 
-async def get_db() -> aiosqlite.Connection:
-    return await aiosqlite.connect(DB_PATH)
+def get_db() -> aiosqlite.Connection:
+    """Return an aiosqlite connection context manager.
+
+    Usage: `async with get_db() as db:`
+    Do NOT await this — aiosqlite.connect() returns a context manager that
+    starts its background thread in __aenter__. Awaiting it first and then
+    using async-with calls __aenter__ again, raising 'threads can only be
+    started once'.
+    """
+    return aiosqlite.connect(DB_PATH)
