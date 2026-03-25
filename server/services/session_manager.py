@@ -3,7 +3,6 @@ import time
 from fastapi import WebSocket
 
 from server.db.glossary import get_glossary
-from server.db.church_terms import load_church_terms
 from server.db.sessions import (
     create_service_session,
     close_service_session,
@@ -12,6 +11,7 @@ from server.db.sessions import (
 from server.services.audio_utils import resample_float32_to_pcm16, base64_to_float32_bytes
 from server.services.deepgram_session import DeepgramSession
 from server.services.google_translate_service import GoogleTranslateService
+from server.services.sentence_buffer import SentenceBuffer
 from server.services.broadcaster import Broadcaster
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class ServiceSession:
     """One active session per church_id. Owns the Deepgram connection,
-    GoogleTranslateService, and the admin WebSocket."""
+    SentenceBuffer, GoogleTranslateService, and the admin WebSocket."""
 
     def __init__(self, church_id: str, ws: WebSocket, broadcaster: Broadcaster):
         self._church_id = church_id
@@ -28,6 +28,7 @@ class ServiceSession:
         self._sample_rate = 48000
         self._db_session_id: int | None = None
         self._deepgram: DeepgramSession | None = None
+        self._sentence_buffer: SentenceBuffer | None = None
         self._translation: GoogleTranslateService | None = None
 
     async def start(self, sample_rate: int, sermon_topic: str = ""):
@@ -36,7 +37,12 @@ class ServiceSession:
 
         glossary = await get_glossary(self._church_id)
 
-        self._translation = GoogleTranslateService(on_complete=self._on_complete)
+        self._sentence_buffer = SentenceBuffer(on_sentence=self._on_sentence)
+
+        self._translation = GoogleTranslateService(
+            on_translation=self._on_translation,
+            on_correction=self._on_correction,
+        )
 
         self._deepgram = DeepgramSession(
             church_id=self._church_id,
@@ -59,6 +65,8 @@ class ServiceSession:
             await self._deepgram.send(pcm16)
 
     async def close(self):
+        if self._sentence_buffer:
+            await self._sentence_buffer.stop()  # flush any remaining text
         if self._deepgram:
             await self._deepgram.stop()
         if self._db_session_id:
@@ -71,21 +79,33 @@ class ServiceSession:
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
 
     async def _on_final(self, text: str):
-        await self._broadcast({"type": "final_spanish", "text": text, "ts": _now()})
+        """Feed into sentence buffer — don't translate individual fragments."""
+        if self._sentence_buffer:
+            await self._sentence_buffer.add(text)
+
+    # --- Sentence buffer callback ---
+
+    async def _on_sentence(self, text: str):
+        ts = _now()
+        await self._broadcast({"type": "final_spanish", "text": text, "ts": ts})
         if self._translation:
-            await self._translation.translate(text)
+            await self._translation.translate(text, ts)
 
-    # --- Translation callback ---
+    # --- Translation callbacks ---
 
-    async def _on_complete(self, spanish: str, english: str):
+    async def _on_translation(self, spanish: str, english: str, ts: int):
         await self._broadcast({
             "type": "translation",
             "spanish": spanish,
             "english": english,
-            "ts": _now(),
+            "ts": ts,
         })
         if self._db_session_id:
             await append_segment(self._db_session_id, spanish, english)
+
+    async def _on_correction(self, ts: int, english: str):
+        """Silently update a previously broadcast translation with better context."""
+        await self._broadcast({"type": "correction", "ts": ts, "english": english})
 
     # --- Helpers ---
 

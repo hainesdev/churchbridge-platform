@@ -42,11 +42,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
           setPartialEnglish(msg.text);
         } else if (msg.type === 'translation') {
           setSegments((prev) => [
-            ...prev.slice(-30),   // keep last 30 segments
+            ...prev.slice(-30),
             { id: msg.ts, spanish: msg.spanish, english: msg.english },
           ]);
           setPartialSpanish('');
           setPartialEnglish('');
+        } else if (msg.type === 'correction') {
+          setSegments((prev) =>
+            prev.map((s) => s.id === msg.ts ? { ...s, english: msg.english } : s)
+          );
         }
       };
     };

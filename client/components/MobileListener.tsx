@@ -8,7 +8,7 @@ interface MobileListenerProps {
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 
 export function MobileListener({ churchId }: MobileListenerProps) {
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<{ id: number; text: string }[]>([]);
   const [partial, setPartial] = useState('');
   const [connected, setConnected] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -28,8 +28,12 @@ export function MobileListener({ churchId }: MobileListenerProps) {
         if (msg.type === 'interim_translation') {
           setPartial(msg.text);
         } else if (msg.type === 'translation') {
-          setLines((prev) => [...prev.slice(-50), msg.english]);
+          setLines((prev) => [...prev.slice(-50), { id: msg.ts, text: msg.english }]);
           setPartial('');
+        } else if (msg.type === 'correction') {
+          setLines((prev) =>
+            prev.map((l) => l.id === msg.ts ? { ...l, text: msg.english } : l)
+          );
         }
       };
     };
@@ -59,9 +63,9 @@ export function MobileListener({ churchId }: MobileListenerProps) {
           </p>
         )}
 
-        {lines.map((line, i) => (
-          <p key={i} className="text-xl leading-relaxed text-gray-200">
-            {line}
+        {lines.map((line) => (
+          <p key={line.id} className="text-xl leading-relaxed text-gray-200">
+            {line.text}
           </p>
         ))}
 
