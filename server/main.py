@@ -14,7 +14,7 @@ from server.routes import stream, display, listen
 
 logging.basicConfig(level=logging.INFO)
 
-REQUIRED = ["DEEPGRAM_API_KEY", "OPENAI_API_KEY"]
+REQUIRED = ["DEEPL_API_KEY", "OPENAI_API_KEY"]
 for key in REQUIRED:
     if not os.getenv(key):
         raise RuntimeError(f"Missing required environment variable: {key}")

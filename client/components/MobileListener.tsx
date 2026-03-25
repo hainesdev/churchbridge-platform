@@ -25,8 +25,8 @@ export function MobileListener({ churchId }: MobileListenerProps) {
 
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'token') {
-          setPartial((prev) => prev + msg.text);
+        if (msg.type === 'interim_translation') {
+          setPartial(msg.text);
         } else if (msg.type === 'translation') {
           setLines((prev) => [...prev.slice(-50), msg.english]);
           setPartial('');

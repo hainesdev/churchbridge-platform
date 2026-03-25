@@ -1,9 +1,7 @@
-import asyncio
 import logging
 import time
 from fastapi import WebSocket
 
-from server.db.glossary import get_glossary
 from server.db.church_terms import load_church_terms
 from server.db.sessions import (
     create_service_session,
@@ -11,17 +9,15 @@ from server.db.sessions import (
     append_segment,
 )
 from server.services.audio_utils import resample_float32_to_pcm16, base64_to_float32_bytes
-from server.services.deepgram_session import DeepgramSession
-from server.services.translation_service import TranslationService
-from server.services.topic_tracker import TopicTracker
+from server.services.deepl_voice_session import DeepLVoiceSession
+from server.services.deepl_glossary import get_or_create_glossary
 from server.services.broadcaster import Broadcaster
 
 logger = logging.getLogger(__name__)
 
 
 class ServiceSession:
-    """One active session per church_id. Owns the Deepgram connection,
-    TopicTracker, TranslationService, and the admin WebSocket."""
+    """One active session per church_id. Owns the DeepL Voice connection and admin WebSocket."""
 
     def __init__(self, church_id: str, ws: WebSocket, broadcaster: Broadcaster):
         self._church_id = church_id
@@ -29,36 +25,24 @@ class ServiceSession:
         self._broadcaster = broadcaster
         self._sample_rate = 48000
         self._db_session_id: int | None = None
-        self._deepgram: DeepgramSession | None = None
-        self._translation: TranslationService | None = None
-        self._topic_tracker: TopicTracker | None = None
+        self._deepl: DeepLVoiceSession | None = None
 
     async def start(self, sample_rate: int, sermon_topic: str = ""):
         self._sample_rate = sample_rate
         self._db_session_id = await create_service_session(self._church_id)
 
-        glossary = await get_glossary(self._church_id)
         church_terms = await load_church_terms(self._church_id)
+        glossary_id = await get_or_create_glossary(self._church_id, church_terms)
 
-        self._topic_tracker = TopicTracker(
+        self._deepl = DeepLVoiceSession(
             church_id=self._church_id,
-            sermon_topic=sermon_topic,
+            glossary_id=glossary_id,
+            on_interim_spanish=self._on_interim_spanish,
+            on_final_spanish=self._on_final_spanish,
+            on_interim_english=self._on_interim_english,
+            on_final_english=self._on_final_english,
         )
-
-        self._translation = TranslationService(
-            church_id=self._church_id,
-            church_terms=church_terms,
-            topic_tracker=self._topic_tracker,
-            on_token=self._on_token,
-            on_complete=self._on_complete,
-        )
-
-        self._deepgram = DeepgramSession(
-            church_id=self._church_id,
-            on_interim=self._on_interim,
-            on_final=self._on_final,
-        )
-        await self._deepgram.start(glossary=glossary, sample_rate=16000)
+        await self._deepl.start()
 
         await self._send({"type": "session_started", "sessionId": self._db_session_id})
         logger.info(
@@ -67,40 +51,33 @@ class ServiceSession:
         )
 
     async def ingest(self, audio_b64: str):
-        """Receive a base64 Float32 chunk from the browser, resample, forward to Deepgram."""
+        """Receive a base64 Float32 chunk from the browser, resample to 16kHz PCM16, forward to DeepL."""
         raw = base64_to_float32_bytes(audio_b64)
         pcm16 = resample_float32_to_pcm16(raw, self._sample_rate, dst_rate=16000)
-        if self._deepgram:
-            await self._deepgram.send(pcm16)
+        if self._deepl:
+            await self._deepl.send(pcm16)
 
     async def close(self):
-        if self._deepgram:
-            await self._deepgram.stop()
-        if self._topic_tracker:
-            await self._topic_tracker.stop()
+        if self._deepl:
+            await self._deepl.stop()
         if self._db_session_id:
             await close_service_session(self._db_session_id)
         logger.info("[session] Closed for church %s", self._church_id)
 
-    # --- Deepgram callbacks ---
+    # --- DeepL Voice callbacks ---
 
-    async def _on_interim(self, text: str):
+    async def _on_interim_spanish(self, text: str):
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
 
-    async def _on_final(self, text: str):
+    async def _on_final_spanish(self, text: str):
+        # Broadcast for any display that wants to show committed Spanish
         await self._broadcast({"type": "final_spanish", "text": text, "ts": _now()})
-        # Feed both the tracker and translator
-        if self._topic_tracker:
-            self._topic_tracker.add_segment(text)
-        if self._translation:
-            await self._translation.translate(text)
 
-    # --- Translation callbacks ---
+    async def _on_interim_english(self, text: str):
+        # Full tentative phrase — listeners replace (not append) their partial display
+        await self._broadcast({"type": "interim_translation", "text": text, "ts": _now()})
 
-    async def _on_token(self, token: str):
-        await self._broadcast({"type": "token", "text": token, "ts": _now()})
-
-    async def _on_complete(self, spanish: str, english: str):
+    async def _on_final_english(self, spanish: str, english: str):
         await self._broadcast({
             "type": "translation",
             "spanish": spanish,

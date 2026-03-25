@@ -26,7 +26,7 @@ async def listen_ws(
             async for payload in _broadcaster.subscribe(church_id):
                 msg = json.loads(payload)
                 # Mobile only needs tokens and completed translations
-                if msg.get("type") in ("token", "translation"):
+                if msg.get("type") in ("interim_translation", "translation"):
                     await ws.send_text(payload)
         except WebSocketDisconnect:
             logger.info("[listen] Mobile disconnected for church %s", church_id)
@@ -40,7 +40,7 @@ async def listen_ws(
             while True:
                 payload = await queue.get()
                 msg = json.loads(payload)
-                if msg.get("type") in ("token", "translation"):
+                if msg.get("type") in ("interim_translation", "translation"):
                     await ws.send_text(payload)
         except WebSocketDisconnect:
             pass

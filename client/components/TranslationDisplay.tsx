@@ -38,8 +38,8 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
 
         if (msg.type === 'interim') {
           setPartialSpanish(msg.text);
-        } else if (msg.type === 'token') {
-          setPartialEnglish((prev) => prev + msg.text);
+        } else if (msg.type === 'interim_translation') {
+          setPartialEnglish(msg.text);
         } else if (msg.type === 'translation') {
           setSegments((prev) => [
             ...prev.slice(-30),   // keep last 30 segments
