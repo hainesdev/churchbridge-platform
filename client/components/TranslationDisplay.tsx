@@ -14,42 +14,48 @@ interface TranslationDisplayProps {
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 
-// How many committed sentences to keep in the visible history trail
+// Number of committed sentences kept visible above the active line.
+// Slots are always rendered (even empty) so the layout height never changes.
 const HISTORY_LINES = 2;
 
+// Opacity for each history slot — slot 0 is oldest/dimmest
+const SLOT_OPACITY = ['opacity-20', 'opacity-50'];
+
+// Reserved minimum heights keep layout stable before content arrives.
+// Increase if your font size causes wrapping that clips the history.
+const HISTORY_SLOT_MIN_H = 'min-h-[3.5rem]'; // ~56px — 1 line of text-2xl
+const ACTIVE_SLOT_MIN_H  = 'min-h-[4.5rem]'; // ~72px — 1 line of text-4xl
+
 /**
- * Word-level stable text renderer.
+ * Word-level stable text.
  *
- * Unchanged words keep their DOM node (no animation). Only words that are
- * new or changed get a new key and trigger animate-fade-in. This makes text
- * feel "sticky" — corrections shimmer only the changed words, new words
- * fade in at their natural position, nothing jumps.
+ * Words that haven't changed keep their DOM node — no animation, no jump.
+ * Only new or corrected words get a fresh uid and trigger animate-fade-in.
+ * This makes the text feel spatially anchored: corrections shimmer only the
+ * changed words, new words appear in place without displacing anything.
  */
 function StableText({
   text,
   className = '',
-  cursorColor = '',
   showCursor = false,
+  cursorColor = 'text-blue-400',
 }: {
   text: string;
   className?: string;
-  cursorColor?: string;
   showCursor?: boolean;
+  cursorColor?: string;
 }) {
-  type WordEntry = { word: string; uid: number; isNew: boolean };
-  const [entries, setEntries] = useState<WordEntry[]>([]);
+  type Entry = { word: string; uid: number; isNew: boolean };
+  const [entries, setEntries] = useState<Entry[]>([]);
   const uidRef = useRef(0);
 
   useEffect(() => {
     const incoming = text.split(/\s+/).filter(Boolean);
+    if (incoming.length === 0) { setEntries([]); return; }
     setEntries((prev) =>
       incoming.map((word, i) => {
         const existing = prev[i];
-        if (existing && existing.word === word) {
-          // Same word at same position — keep stable, no animation
-          return { ...existing, isNew: false };
-        }
-        // New or changed word — assign fresh uid to trigger fade-in
+        if (existing && existing.word === word) return { ...existing, isNew: false };
         return { word, uid: ++uidRef.current, isNew: true };
       })
     );
@@ -62,10 +68,42 @@ function StableText({
           {e.word}{' '}
         </span>
       ))}
-      {showCursor && (
-        <span className={`animate-pulse ${cursorColor}`}>▌</span>
-      )}
+      {showCursor && <span className={`animate-pulse ${cursorColor}`}>▌</span>}
     </span>
+  );
+}
+
+/**
+ * A single history slot.
+ *
+ * The outer div always occupies HISTORY_SLOT_MIN_H — even when empty.
+ * This is the key to preventing vertical jumps: the layout height is
+ * reserved from page load. Content fades in within the fixed space.
+ *
+ * key={segment.id} on the inner div triggers animate-fade-in whenever
+ * the content changes, without remounting the outer reserved slot.
+ */
+function HistorySlot({
+  segment,
+  opacity,
+  renderContent,
+}: {
+  segment: Segment | null;
+  opacity: string;
+  renderContent: (s: Segment) => React.ReactNode;
+}) {
+  return (
+    <div className={`${HISTORY_SLOT_MIN_H} flex items-end overflow-hidden`}>
+      {segment && (
+        <div
+          key={segment.id}
+          className={`w-full ${opacity} animate-fade-in`}
+          style={{ transition: 'opacity 1400ms ease-out' }}
+        >
+          {renderContent(segment)}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -105,10 +143,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         }
       };
     };
-
     connect();
     return () => wsRef.current?.close();
   }, [churchId]);
+
+  // Always exactly HISTORY_LINES slots, null when not yet filled
+  const historySlots = Array.from({ length: HISTORY_LINES }, (_, i) => {
+    const dataIndex = segments.length - HISTORY_LINES + i;
+    return dataIndex >= 0 ? segments[dataIndex] : null;
+  });
 
   const statusBar = (label: string) => (
     <div className="flex-none px-6 py-2 bg-gray-900 flex items-center gap-2">
@@ -116,12 +159,6 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       <span className="text-xs text-gray-400">{connected ? label : 'Connecting...'}</span>
     </div>
   );
-
-  // History trail: last HISTORY_LINES committed sentences, oldest → dimmest
-  const history = segments.slice(-HISTORY_LINES);
-
-  // Opacity steps for history lines: oldest is most faded
-  const historyOpacity = ['opacity-20', 'opacity-45'];
 
   // ── Lower-thirds overlay ──────────────────────────────────────────────────
   if (mode === 'lowerthird') {
@@ -148,23 +185,21 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       <div className="h-full flex flex-col bg-black text-white overflow-hidden">
         {statusBar('En vivo')}
         <div className="flex-1" />
-
         <div className="flex-none px-10 pb-12 space-y-3">
-          {/* History trail */}
-          {history.map((s, i) => {
-            const opacity = historyOpacity[i + (HISTORY_LINES - history.length)] ?? 'opacity-20';
-            return (
-              <div key={s.id} className={`${opacity} transition-opacity duration-700`}>
+          {historySlots.map((seg, i) => (
+            <HistorySlot
+              key={i}
+              segment={seg}
+              opacity={SLOT_OPACITY[i]}
+              renderContent={(s) => (
                 <StableText text={s.spanish} className="text-2xl font-semibold leading-snug" />
-              </div>
-            );
-          })}
-
-          {/* Active line — fragments + in-progress partial */}
-          <div className="text-4xl font-bold leading-snug text-white">
+              )}
+            />
+          ))}
+          <div className={`${ACTIVE_SLOT_MIN_H} flex items-start`}>
             <StableText
               text={[activeSpanish, partialSpanish].filter(Boolean).join(' ')}
-              className="text-white"
+              className="text-4xl font-bold leading-snug text-white"
               showCursor
               cursorColor="text-yellow-400"
             />
@@ -181,31 +216,29 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       <div className="h-full flex flex-col bg-black text-white overflow-hidden">
         {statusBar('Live')}
         <div className="flex-1" />
-
-        <div className="flex-none px-10 pb-12 space-y-4">
-          {history.map((s, i) => {
-            const opacity = historyOpacity[i + (HISTORY_LINES - history.length)] ?? 'opacity-20';
-            return (
-              <div key={s.id} className={`${opacity} transition-opacity duration-700 space-y-0.5`}>
-                <StableText text={s.spanish} className="text-2xl font-bold leading-snug block" />
-                <StableText text={s.english} className="text-lg text-blue-300 leading-snug block" />
-              </div>
-            );
-          })}
-
-          {/* Active pair */}
-          <div className="space-y-1">
-            <div className="text-3xl font-bold leading-snug text-white">
-              <StableText
-                text={[activeSpanish, partialSpanish].filter(Boolean).join(' ')}
-                showCursor
-                cursorColor="text-yellow-400"
-              />
-            </div>
+        <div className="flex-none px-10 pb-12 space-y-3">
+          {historySlots.map((seg, i) => (
+            <HistorySlot
+              key={i}
+              segment={seg}
+              opacity={SLOT_OPACITY[i]}
+              renderContent={(s) => (
+                <div className="space-y-0.5">
+                  <StableText text={s.spanish} className="text-2xl font-bold leading-snug block" />
+                  <StableText text={s.english} className="text-base text-blue-300 leading-snug block" />
+                </div>
+              )}
+            />
+          ))}
+          <div className={`${ACTIVE_SLOT_MIN_H} flex flex-col justify-start gap-1`}>
+            <StableText
+              text={[activeSpanish, partialSpanish].filter(Boolean).join(' ')}
+              className="text-3xl font-bold leading-snug text-white"
+              showCursor
+              cursorColor="text-yellow-400"
+            />
             {partialEnglish && (
-              <div className="text-xl text-blue-300 leading-snug">
-                <StableText text={partialEnglish} />
-              </div>
+              <StableText text={partialEnglish} className="text-xl text-blue-300 leading-snug" />
             )}
           </div>
         </div>
@@ -218,22 +251,24 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     <div className="h-full flex flex-col bg-black text-white overflow-hidden">
       {statusBar('Live')}
       <div className="flex-1" />
-
-      <div className="flex-none px-10 pb-12 space-y-4">
-        {history.map((s, i) => {
-          const opacity = historyOpacity[i + (HISTORY_LINES - history.length)] ?? 'opacity-20';
-          return (
-            <div key={s.id} className={`${opacity} transition-opacity duration-700 space-y-0.5`}>
-              <StableText text={s.english} className="text-2xl font-bold leading-snug block" />
-              <StableText text={s.spanish} className="text-base text-gray-500 block" />
-            </div>
-          );
-        })}
-
-        {/* Active partial */}
-        <div className="text-4xl font-bold leading-snug text-white">
+      <div className="flex-none px-10 pb-12 space-y-3">
+        {historySlots.map((seg, i) => (
+          <HistorySlot
+            key={i}
+            segment={seg}
+            opacity={SLOT_OPACITY[i]}
+            renderContent={(s) => (
+              <div className="space-y-0.5">
+                <StableText text={s.english} className="text-2xl font-bold leading-snug block" />
+                <StableText text={s.spanish} className="text-sm text-gray-500 block" />
+              </div>
+            )}
+          />
+        ))}
+        <div className={`${ACTIVE_SLOT_MIN_H} flex items-start`}>
           <StableText
             text={partialEnglish}
+            className="text-4xl font-bold leading-snug text-white"
             showCursor
             cursorColor="text-blue-400"
           />
