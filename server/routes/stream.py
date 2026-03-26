@@ -31,6 +31,7 @@ async def stream_audio(
     """
     await ws.accept()
     session = None
+    audio_chunks_received = 0
 
     try:
         async for msg in ws.iter_json():
@@ -42,6 +43,11 @@ async def stream_audio(
                 session = await _session_manager.create(church_id, ws, sample_rate, sermon_topic)
 
             elif msg_type == "audio":
+                audio_chunks_received += 1
+                if audio_chunks_received == 1:
+                    logger.info("[stream] First audio chunk received for church %s", church_id)
+                elif audio_chunks_received == 50:
+                    logger.info("[stream] 50 audio chunks received for church %s — audio is flowing", church_id)
                 if session:
                     await session.ingest(msg["audio"])
 
