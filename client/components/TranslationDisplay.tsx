@@ -1,6 +1,5 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
-import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 
 interface Segment {
   id: number;
@@ -15,71 +14,54 @@ interface TranslationDisplayProps {
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 
-// How many committed sentences remain visible above the active line
-const HISTORY_LINES = 2;
-
-// Spring physics — controls the "friction" feel of blocks moving through space.
-// Lower stiffness = more inertia (sluggish). Higher damping = less bounce.
-const SPRING = { type: 'spring' as const, stiffness: 180, damping: 38 };
-const FADE   = { duration: 1.1, ease: [0.4, 0, 0.2, 1] as [number,number,number,number] };
-
-// Opacity of history slots — oldest first
-const HISTORY_OPACITY = [0.18, 0.48];
-
 /**
- * Word-level stable text.
+ * Three fixed zones, anchored to the bottom of the screen.
+ * Zones never move or resize — they are permanent spatial regions.
+ * Only the content within zones changes, fading in when replaced.
  *
- * Each word is a motion.span with layout={true}. When new words arrive and
- * cause line-wrapping, existing words physically slide to their new grid
- * position (spring). Only new or corrected words fade in from zero —
- * unchanged words are spatially stable with no animation.
+ *  ┌───────────────────────────────┐
+ *  │  flexible empty space         │
+ *  ├───────────────────────────────┤
+ *  │  ZONE 0  dim  (oldest)        │  opacity 0.18
+ *  ├───────────────────────────────┤
+ *  │  ZONE 1  dim  (recent)        │  opacity 0.48
+ *  ├───────────────────────────────┤
+ *  │  ZONE 2  full (active)        │  opacity 1.0
+ *  └───────────────────────────────┘
+ *
+ * When a sentence commits it appears in Zone 1, Zone 1's old content
+ * moves to Zone 0, Zone 0's old content fades out.
+ * Zone 2 rebuilds from empty as the next sentence arrives.
+ *
+ * Content in each zone fades in via CSS animation when replaced.
+ * Opacity on zones is static — no layout or position animation anywhere.
  */
-function StableText({
-  text,
+
+// Minimum height reserved for each zone so layout never shifts.
+// Increase if wrapped text is taller than these values.
+const ZONE_H = ['min-h-[3.2rem]', 'min-h-[3.2rem]', 'min-h-[5rem]'];
+
+// CSS fade-in is applied by remounting inner content (key change).
+// Duration is controlled in globals.css: .animate-fade-in
+
+function Zone({
+  children,
+  minH,
+  opacity,
   className = '',
-  showCursor = false,
-  cursorColor = 'text-blue-400',
 }: {
-  text: string;
+  children?: React.ReactNode;
+  minH: string;
+  opacity: number;
   className?: string;
-  showCursor?: boolean;
-  cursorColor?: string;
 }) {
-  type Entry = { word: string; uid: number; isNew: boolean };
-  const [entries, setEntries] = useState<Entry[]>([]);
-  const uidRef = useRef(0);
-
-  useEffect(() => {
-    const incoming = text.split(/\s+/).filter(Boolean);
-    if (incoming.length === 0) { setEntries([]); return; }
-    setEntries((prev) =>
-      incoming.map((word, i) => {
-        const existing = prev[i];
-        if (existing && existing.word === word) return { ...existing, isNew: false };
-        return { word, uid: ++uidRef.current, isNew: true };
-      })
-    );
-  }, [text]);
-
   return (
-    <span className={`inline ${className}`}>
-      <AnimatePresence mode="popLayout">
-        {entries.map((e) => (
-          <motion.span
-            key={e.uid}
-            layout
-            initial={e.isNew ? { opacity: 0 } : false}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ layout: SPRING, opacity: { duration: 0.5 } }}
-            className="inline"
-          >
-            {e.word}{' '}
-          </motion.span>
-        ))}
-      </AnimatePresence>
-      {showCursor && <span className={`animate-pulse ${cursorColor}`}>▌</span>}
-    </span>
+    <div
+      className={`${minH} overflow-hidden flex items-end ${className}`}
+      style={{ opacity, transition: 'opacity 1300ms ease-out' }}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -130,8 +112,10 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     </div>
   );
 
-  // Visible history: last HISTORY_LINES segments
-  const history = segments.slice(-HISTORY_LINES);
+  // Slot assignment: last two committed segments fill zones 0 and 1.
+  // Always two slots — null when not yet filled (zone stays reserved but empty).
+  const slot0 = segments.length >= 2 ? segments[segments.length - 2] : null;
+  const slot1 = segments.length >= 1 ? segments[segments.length - 1] : null;
 
   // ── Lower-thirds overlay ──────────────────────────────────────────────────
   if (mode === 'lowerthird') {
@@ -158,37 +142,29 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       <div className="h-full flex flex-col bg-black text-white overflow-hidden">
         {statusBar('En vivo')}
         <div className="flex-1" />
-        <LayoutGroup>
-          <div className="flex-none px-10 pb-12 space-y-3">
-            <AnimatePresence mode="popLayout">
-              {history.map((s, i) => {
-                const targetOpacity = HISTORY_OPACITY[i + (HISTORY_LINES - history.length)];
-                return (
-                  <motion.div
-                    key={s.id}
-                    layout
-                    layoutId={`seg-es-${s.id}`}
-                    initial={{ opacity: 0, y: 12 }}
-                    animate={{ opacity: targetOpacity, y: 0 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ layout: SPRING, opacity: FADE }}
-                  >
-                    <StableText text={s.spanish} className="text-2xl font-semibold leading-snug" />
-                  </motion.div>
-                );
-              })}
-            </AnimatePresence>
-
-            <motion.div layout transition={{ layout: SPRING }}>
-              <StableText
-                text={[activeSpanish, partialSpanish].filter(Boolean).join(' ')}
-                className="text-4xl font-bold leading-snug text-white"
-                showCursor
-                cursorColor="text-yellow-400"
-              />
-            </motion.div>
-          </div>
-        </LayoutGroup>
+        <div className="flex-none px-10 pb-12 space-y-3">
+          <Zone minH={ZONE_H[0]} opacity={0.18}>
+            {slot0 && (
+              <p key={slot0.id} className="text-2xl font-semibold leading-snug animate-fade-in">
+                {slot0.spanish}
+              </p>
+            )}
+          </Zone>
+          <Zone minH={ZONE_H[1]} opacity={0.5}>
+            {slot1 && (
+              <p key={slot1.id} className="text-2xl font-semibold leading-snug animate-fade-in">
+                {slot1.spanish}
+              </p>
+            )}
+          </Zone>
+          <Zone minH={ZONE_H[2]} opacity={1} className="items-start">
+            <p className="text-4xl font-bold leading-snug">
+              {activeSpanish}{activeSpanish && partialSpanish ? ' ' : ''}
+              <span className="text-gray-300">{partialSpanish}</span>
+              <span className="animate-pulse text-yellow-400">▌</span>
+            </p>
+          </Zone>
+        </div>
       </div>
     );
   }
@@ -200,42 +176,36 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       <div className="h-full flex flex-col bg-black text-white overflow-hidden">
         {statusBar('Live')}
         <div className="flex-1" />
-        <LayoutGroup>
-          <div className="flex-none px-10 pb-12 space-y-4">
-            <AnimatePresence mode="popLayout">
-              {history.map((s, i) => {
-                const targetOpacity = HISTORY_OPACITY[i + (HISTORY_LINES - history.length)];
-                return (
-                  <motion.div
-                    key={s.id}
-                    layout
-                    layoutId={`seg-bi-${s.id}`}
-                    initial={{ opacity: 0, y: 12 }}
-                    animate={{ opacity: targetOpacity, y: 0 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ layout: SPRING, opacity: FADE }}
-                    className="space-y-0.5"
-                  >
-                    <StableText text={s.spanish} className="text-2xl font-bold leading-snug block" />
-                    <StableText text={s.english} className="text-base text-blue-300 leading-snug block" />
-                  </motion.div>
-                );
-              })}
-            </AnimatePresence>
-
-            <motion.div layout transition={{ layout: SPRING }} className="space-y-1">
-              <StableText
-                text={[activeSpanish, partialSpanish].filter(Boolean).join(' ')}
-                className="text-3xl font-bold leading-snug text-white"
-                showCursor
-                cursorColor="text-yellow-400"
-              />
+        <div className="flex-none px-10 pb-12 space-y-3">
+          <Zone minH={ZONE_H[0]} opacity={0.18}>
+            {slot0 && (
+              <div key={slot0.id} className="animate-fade-in space-y-0.5 w-full">
+                <p className="text-2xl font-bold leading-snug">{slot0.spanish}</p>
+                <p className="text-base text-blue-300 leading-snug">{slot0.english}</p>
+              </div>
+            )}
+          </Zone>
+          <Zone minH={ZONE_H[1]} opacity={0.5}>
+            {slot1 && (
+              <div key={slot1.id} className="animate-fade-in space-y-0.5 w-full">
+                <p className="text-2xl font-bold leading-snug">{slot1.spanish}</p>
+                <p className="text-base text-blue-300 leading-snug">{slot1.english}</p>
+              </div>
+            )}
+          </Zone>
+          <Zone minH={ZONE_H[2]} opacity={1} className="items-start">
+            <div className="space-y-1 w-full">
+              <p className="text-3xl font-bold leading-snug">
+                {activeSpanish}{activeSpanish && partialSpanish ? ' ' : ''}
+                <span className="text-gray-300">{partialSpanish}</span>
+                <span className="animate-pulse text-yellow-400">▌</span>
+              </p>
               {partialEnglish && (
-                <StableText text={partialEnglish} className="text-xl text-blue-300 leading-snug" />
+                <p className="text-xl text-blue-300 leading-snug">{partialEnglish}</p>
               )}
-            </motion.div>
-          </div>
-        </LayoutGroup>
+            </div>
+          </Zone>
+        </div>
       </div>
     );
   }
@@ -245,39 +215,30 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     <div className="h-full flex flex-col bg-black text-white overflow-hidden">
       {statusBar('Live')}
       <div className="flex-1" />
-      <LayoutGroup>
-        <div className="flex-none px-10 pb-12 space-y-4">
-          <AnimatePresence mode="popLayout">
-            {history.map((s, i) => {
-              const targetOpacity = HISTORY_OPACITY[i + (HISTORY_LINES - history.length)];
-              return (
-                <motion.div
-                  key={s.id}
-                  layout
-                  layoutId={`seg-en-${s.id}`}
-                  initial={{ opacity: 0, y: 12 }}
-                  animate={{ opacity: targetOpacity, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ layout: SPRING, opacity: FADE }}
-                  className="space-y-0.5"
-                >
-                  <StableText text={s.english} className="text-2xl font-bold leading-snug block" />
-                  <StableText text={s.spanish} className="text-sm text-gray-500 block" />
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
-
-          <motion.div layout transition={{ layout: SPRING }}>
-            <StableText
-              text={partialEnglish}
-              className="text-4xl font-bold leading-snug text-white"
-              showCursor
-              cursorColor="text-blue-400"
-            />
-          </motion.div>
-        </div>
-      </LayoutGroup>
+      <div className="flex-none px-10 pb-12 space-y-3">
+        <Zone minH={ZONE_H[0]} opacity={0.18}>
+          {slot0 && (
+            <div key={slot0.id} className="animate-fade-in space-y-0.5 w-full">
+              <p className="text-2xl font-bold leading-snug">{slot0.english}</p>
+              <p className="text-sm text-gray-500">{slot0.spanish}</p>
+            </div>
+          )}
+        </Zone>
+        <Zone minH={ZONE_H[1]} opacity={0.5}>
+          {slot1 && (
+            <div key={slot1.id} className="animate-fade-in space-y-0.5 w-full">
+              <p className="text-2xl font-bold leading-snug">{slot1.english}</p>
+              <p className="text-sm text-gray-500">{slot1.spanish}</p>
+            </div>
+          )}
+        </Zone>
+        <Zone minH={ZONE_H[2]} opacity={1} className="items-start">
+          <p className="text-4xl font-bold leading-snug">
+            {partialEnglish}
+            <span className="animate-pulse text-blue-400">▌</span>
+          </p>
+        </Zone>
+      </div>
     </div>
   );
 }
