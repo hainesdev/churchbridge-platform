@@ -14,12 +14,30 @@ interface TranslationDisplayProps {
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 
-// How many committed segments to keep visible above the active partial.
-// Older segments fade out to guide eyes toward the bottom.
-const VISIBLE_SEGMENTS = 2;
-const VISIBLE_CAPTION_LINES = 3;
+/**
+ * Two-slot spatial model:
+ *
+ *  ┌─────────────────────────────┐
+ *  │   flexible empty space      │
+ *  ├─────────────────────────────┤
+ *  │  SLOT A — fixed height      │  "just read" — dim, eye dismisses it
+ *  ├─────────────────────────────┤
+ *  │  SLOT B — fixed height      │  active reading zone — eye lives here
+ *  ├─────────────────────────────┤
+ *  │   bottom padding            │
+ *  └─────────────────────────────┘
+ *
+ * Slots never move or resize. Content transitions within them.
+ * When a sentence commits: old Slot B cross-fades into Slot A, Slot B clears.
+ * Words flowing into Slot B need no animation — the fixed boundary contains them.
+ */
+
+// Slot height constants — adjust to match your screen and font size preferences
+const SLOT_A_H = 'h-24';   // ~96px  — previous sentence (smaller, dimmed)
+const SLOT_B_H = 'h-32';   // ~128px — active sentence   (larger, bright)
 
 export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDisplayProps) {
+  // Full segment history kept only for correction events
   const [segments, setSegments] = useState<Segment[]>([]);
   const [spanishLines, setSpanishLines] = useState<string[]>([]);
   const [partialSpanish, setPartialSpanish] = useState('');
@@ -31,12 +49,8 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     const connect = () => {
       const ws = new WebSocket(`${WS_URL}/api/display/v1?church_id=${encodeURIComponent(churchId)}`);
       wsRef.current = ws;
-
       ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
-        setConnected(false);
-        setTimeout(connect, 2000);
-      };
+      ws.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
 
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
@@ -44,7 +58,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         if (msg.type === 'interim') {
           setPartialSpanish(msg.text);
         } else if (msg.type === 'stt_final') {
-          setSpanishLines((prev) => [...prev, msg.text].slice(-VISIBLE_CAPTION_LINES));
+          setSpanishLines((prev) => [...prev, msg.text].slice(-4));
           setPartialSpanish('');
         } else if (msg.type === 'interim_translation') {
           setPartialEnglish((prev) => prev ? prev + ' ' + msg.text : msg.text);
@@ -65,9 +79,17 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     return () => wsRef.current?.close();
   }, [churchId]);
 
-  const statusDot = (
-    <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
+  const statusBar = (label: string) => (
+    <div className="flex-none px-6 py-2 bg-gray-900 flex items-center gap-2">
+      <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
+      <span className="text-xs text-gray-400">{connected ? label : 'Connecting...'}</span>
+    </div>
   );
+
+  // Slot A = last committed sentence. Slot B = current partial.
+  // key on Slot A content triggers fade-in animation on each new sentence.
+  const slotA = segments[segments.length - 1] ?? null;
+  const activeSpanish = spanishLines.join(' ');
 
   // ── Lower-thirds overlay ──────────────────────────────────────────────────
   if (mode === 'lowerthird') {
@@ -81,52 +103,48 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         ))}
         {partialEnglish && (
           <div className="bg-black/70 px-4 py-2 rounded text-white/80 text-2xl italic">
-            {partialEnglish}
-            <span className="animate-pulse">▌</span>
+            {partialEnglish}<span className="animate-pulse">▌</span>
           </div>
         )}
       </div>
     );
   }
 
-  // ── Spanish captions only ─────────────────────────────────────────────────
+  // ── Spanish captions ──────────────────────────────────────────────────────
   if (mode === 'spanish') {
-    const committed = segments.slice(-1);          // last committed sentence
-    const activeText = spanishLines.join(' ');     // current accumulating fragments
-
     return (
       <div className="h-full flex flex-col bg-black text-white overflow-hidden">
-        <div className="flex-none px-6 py-2 bg-gray-900 flex items-center gap-2">
-          {statusDot}
-          <span className="text-xs text-gray-400">{connected ? 'En vivo' : 'Conectando...'}</span>
-        </div>
+        {statusBar('En vivo')}
 
-        {/* Fixed bottom-anchored display — no scroll */}
-        <div className="flex-1 flex flex-col justify-end px-8 pb-10 pt-4 gap-4 overflow-hidden">
-          {/* Previously committed sentence — dimmed to signal it's been read */}
-          {committed.map((s) => (
-            <p key={s.id} className="text-3xl font-semibold leading-snug text-gray-500 transition-opacity duration-500">
-              {s.spanish}
-            </p>
-          ))}
+        {/* Flexible empty space — eye should not be here */}
+        <div className="flex-1" />
 
-          {/* Active line: committed fragments + in-progress partial */}
-          {(activeText || partialSpanish) && (
-            <p className="text-4xl font-bold leading-snug text-white animate-slide-up">
-              {activeText}
-              {activeText && partialSpanish ? ' ' : ''}
-              {partialSpanish && (
+        {/* Fixed caption area */}
+        <div className="flex-none px-10 pb-12 space-y-4">
+
+          {/* Slot A — previous committed Spanish sentence, dim */}
+          <div className={`${SLOT_A_H} overflow-hidden flex items-end`}>
+            {slotA && (
+              <p key={slotA.id} className="text-3xl font-semibold leading-snug text-gray-500 animate-fade-in">
+                {slotA.spanish}
+              </p>
+            )}
+          </div>
+
+          {/* Slot B — active: committed fragments + in-progress partial */}
+          <div className={`${SLOT_B_H} overflow-hidden flex items-start`}>
+            {(activeSpanish || partialSpanish) ? (
+              <p className="text-4xl font-bold leading-snug text-white">
+                {activeSpanish}
+                {activeSpanish && partialSpanish ? ' ' : ''}
                 <span className="text-gray-300 italic">{partialSpanish}</span>
-              )}
-              <span className="animate-pulse text-yellow-400">▌</span>
-            </p>
-          )}
+                <span className="animate-pulse text-yellow-400">▌</span>
+              </p>
+            ) : (
+              <p className="text-gray-700 text-2xl">Esperando...</p>
+            )}
+          </div>
 
-          {!activeText && !partialSpanish && segments.length === 0 && (
-            <p className="text-gray-600 text-center text-lg">
-              Esperando que comience el servicio...
-            </p>
-          )}
         </div>
       </div>
     );
@@ -134,101 +152,79 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
 
   // ── Bilingual: Spanish primary + English secondary ────────────────────────
   if (mode === 'bilingual') {
-    const visible = segments.slice(-VISIBLE_SEGMENTS);
-    const activeSpanish = spanishLines.join(' ');
-
     return (
       <div className="h-full flex flex-col bg-black text-white overflow-hidden">
-        <div className="flex-none px-6 py-2 bg-gray-900 flex items-center gap-2">
-          {statusDot}
-          <span className="text-xs text-gray-400">{connected ? 'Live' : 'Connecting...'}</span>
-        </div>
+        {statusBar('Live')}
 
-        <div className="flex-1 flex flex-col justify-end px-8 pb-10 pt-4 gap-5 overflow-hidden">
-          {visible.length === 0 && !activeSpanish && !partialSpanish && (
-            <p className="text-gray-600 text-center text-lg">Waiting for service to begin...</p>
-          )}
+        <div className="flex-1" />
 
-          {/* Committed bilingual pairs — older ones are dimmer */}
-          {visible.map((s, i) => {
-            const isNewest = i === visible.length - 1;
-            return (
-              <div
-                key={s.id}
-                className={`space-y-1 border-l-2 pl-4 transition-opacity duration-500 ${
-                  isNewest
-                    ? 'border-gray-500 opacity-100 animate-slide-up'
-                    : 'border-gray-700 opacity-40'
-                }`}
-              >
-                <p className="text-3xl font-bold leading-tight">{s.spanish}</p>
-                <p className="text-lg text-blue-300 leading-snug">{s.english}</p>
+        <div className="flex-none px-10 pb-12 space-y-4">
+
+          {/* Slot A — previous committed pair, dim */}
+          <div className={`${SLOT_A_H} overflow-hidden flex flex-col justify-end gap-1`}>
+            {slotA && (
+              <div key={slotA.id} className="animate-fade-in">
+                <p className="text-2xl font-bold leading-snug text-gray-500">{slotA.spanish}</p>
+                <p className="text-lg text-blue-400/50 leading-snug">{slotA.english}</p>
               </div>
-            );
-          })}
+            )}
+          </div>
 
-          {/* Active partial — Spanish builds fast, English follows */}
-          {(activeSpanish || partialSpanish || partialEnglish) && (
-            <div className="space-y-1 border-l-2 border-yellow-600/60 pl-4 animate-slide-up">
-              <p className="text-3xl font-bold leading-tight text-white">
-                {activeSpanish}
-                {activeSpanish && partialSpanish ? ' ' : ''}
-                {partialSpanish && <span className="text-gray-400 italic">{partialSpanish}</span>}
-                <span className="animate-pulse text-yellow-400">▌</span>
-              </p>
-              {partialEnglish && (
-                <p className="text-lg text-blue-400/70 leading-snug italic">{partialEnglish}</p>
-              )}
-            </div>
-          )}
+          {/* Slot B — active pair */}
+          <div className={`${SLOT_B_H} overflow-hidden flex flex-col justify-start gap-1`}>
+            {(activeSpanish || partialSpanish || partialEnglish) ? (
+              <>
+                <p className="text-3xl font-bold leading-snug text-white">
+                  {activeSpanish}
+                  {activeSpanish && partialSpanish ? ' ' : ''}
+                  <span className="text-gray-300 italic">{partialSpanish}</span>
+                  <span className="animate-pulse text-yellow-400">▌</span>
+                </p>
+                {partialEnglish && (
+                  <p className="text-xl text-blue-300 leading-snug">{partialEnglish}</p>
+                )}
+              </>
+            ) : (
+              <p className="text-gray-700 text-2xl">Waiting...</p>
+            )}
+          </div>
+
         </div>
       </div>
     );
   }
 
-  // ── Full mode: English primary, Spanish secondary ─────────────────────────
-  const visible = segments.slice(-VISIBLE_SEGMENTS);
-
+  // ── Full mode: English primary ────────────────────────────────────────────
   return (
     <div className="h-full flex flex-col bg-black text-white overflow-hidden">
-      <div className="flex-none px-6 py-2 bg-gray-900 flex items-center gap-2">
-        {statusDot}
-        <span className="text-xs text-gray-400">{connected ? 'Live' : 'Connecting...'}</span>
-      </div>
+      {statusBar('Live')}
 
-      <div className="flex-1 flex flex-col justify-end px-8 pb-10 pt-4 gap-6 overflow-hidden">
-        {visible.length === 0 && !partialEnglish && (
-          <p className="text-gray-600 text-center text-lg">Waiting for service to begin...</p>
-        )}
+      <div className="flex-1" />
 
-        {/* Committed segments — older one dimmed */}
-        {visible.map((s, i) => {
-          const isNewest = i === visible.length - 1;
-          return (
-            <div
-              key={s.id}
-              className={`space-y-1 transition-opacity duration-500 ${
-                isNewest ? 'opacity-100 animate-slide-up' : 'opacity-35'
-              }`}
-            >
-              <p className="text-4xl font-bold leading-tight">{s.english}</p>
-              <p className="text-gray-500 text-lg">{s.spanish}</p>
+      <div className="flex-none px-10 pb-12 space-y-4">
+
+        {/* Slot A — previous English sentence, dim */}
+        <div className={`${SLOT_A_H} overflow-hidden flex flex-col justify-end gap-1`}>
+          {slotA && (
+            <div key={slotA.id} className="animate-fade-in">
+              <p className="text-2xl font-bold leading-snug text-gray-500">{slotA.english}</p>
+              <p className="text-base text-gray-600">{slotA.spanish}</p>
             </div>
-          );
-        })}
+          )}
+        </div>
 
-        {/* Active partial */}
-        {partialEnglish && (
-          <div className="space-y-1">
-            <p className="text-4xl font-bold leading-tight text-gray-300">
+        {/* Slot B — active English partial */}
+        <div className={`${SLOT_B_H} overflow-hidden flex items-start`}>
+          {partialEnglish ? (
+            <p className="text-4xl font-bold leading-snug text-white">
               {partialEnglish}
               <span className="animate-pulse text-blue-400">▌</span>
             </p>
-            {partialSpanish && (
-              <p className="text-gray-600 text-lg italic">{partialSpanish}</p>
-            )}
-          </div>
-        )}
+          ) : (
+            <p className="text-gray-700 text-2xl">Waiting...</p>
+          )}
+        </div>
+
       </div>
     </div>
   );
