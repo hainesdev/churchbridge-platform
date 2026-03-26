@@ -39,7 +39,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         if (msg.type === 'interim') {
           setPartialSpanish(msg.text);
         } else if (msg.type === 'interim_translation') {
-          setPartialEnglish(msg.text);
+          setPartialEnglish((prev) => prev ? prev + ' ' + msg.text : msg.text);
         } else if (msg.type === 'translation') {
           setSegments((prev) => [
             ...prev.slice(-30),
