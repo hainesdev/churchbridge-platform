@@ -80,6 +80,7 @@ class ServiceSession:
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
 
     async def _on_final(self, text: str):
+        await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
         if self._translation:
             await self._translation.translate_fragment(text)  # fast track: show immediately
         if self._sentence_buffer:
