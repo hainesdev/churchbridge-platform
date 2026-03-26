@@ -151,6 +151,9 @@ export function MobileTest({ churchId }: MobileTestProps) {
       const ctx = new AudioContext();
       ctxRef.current = ctx;
       sampleRateRef.current = ctx.sampleRate;
+      // Mobile browsers (iOS/Android) often start AudioContext in 'suspended'
+      // state. Resume explicitly before using the worklet.
+      if (ctx.state === 'suspended') await ctx.resume();
       await ctx.audioWorklet.addModule('/worklets/recorder-worklet.js');
       const source = ctx.createMediaStreamSource(mediaStream);
       const worklet = new AudioWorkletNode(ctx, 'recorder-processor');

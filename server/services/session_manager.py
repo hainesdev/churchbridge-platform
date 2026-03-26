@@ -80,6 +80,7 @@ class ServiceSession:
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
 
     async def _on_final(self, text: str):
+        logger.info("[session] STT final: %s", text)
         await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
         if self._translation:
             await self._translation.translate_fragment(text)  # fast track: show immediately
@@ -90,6 +91,7 @@ class ServiceSession:
 
     async def _on_sentence(self, text: str):
         ts = _now()
+        logger.info("[session] Sentence flushed: %s", text)
         await self._broadcast({"type": "final_spanish", "text": text, "ts": ts})
         if self._translation:
             await self._translation.translate(text, ts)
@@ -97,6 +99,7 @@ class ServiceSession:
     # --- Translation callbacks ---
 
     async def _on_translation(self, spanish: str, english: str, ts: int):
+        logger.info("[session] Translation: %s -> %s", spanish[:60], english[:60])
         await self._broadcast({
             "type": "translation",
             "spanish": spanish,
