@@ -42,6 +42,7 @@ class ServiceSession:
         self._translation = GoogleTranslateService(
             on_translation=self._on_translation,
             on_correction=self._on_correction,
+            on_interim_translation=self._on_interim_translation,
         )
 
         self._deepgram = DeepgramSession(
@@ -79,9 +80,10 @@ class ServiceSession:
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
 
     async def _on_final(self, text: str):
-        """Feed into sentence buffer — don't translate individual fragments."""
+        if self._translation:
+            await self._translation.translate_fragment(text)  # fast track: show immediately
         if self._sentence_buffer:
-            await self._sentence_buffer.add(text)
+            await self._sentence_buffer.add(text)             # accurate track: accumulate
 
     # --- Sentence buffer callback ---
 
@@ -102,6 +104,9 @@ class ServiceSession:
         })
         if self._db_session_id:
             await append_segment(self._db_session_id, spanish, english)
+
+    async def _on_interim_translation(self, text: str):
+        await self._broadcast({"type": "interim_translation", "text": text, "ts": _now()})
 
     async def _on_correction(self, ts: int, english: str):
         """Silently update a previously broadcast translation with better context."""

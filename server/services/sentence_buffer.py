@@ -5,8 +5,8 @@ from typing import Callable, Awaitable
 logger = logging.getLogger(__name__)
 
 SENTENCE_ENDINGS = frozenset('.?!…;')
-MAX_WORDS = 25
-FLUSH_DELAY_S = 2.5
+MAX_WORDS = 40
+FLUSH_DELAY_S = 3.5
 
 
 class SentenceBuffer:

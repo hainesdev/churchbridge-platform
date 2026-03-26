@@ -16,30 +16,52 @@ CONTEXT_WINDOW = 2  # previous sentences sent alongside current for disambiguati
 class GoogleTranslateService:
     """Translates sentences via Google Cloud Translation v2.
 
-    Two accuracy techniques in a single API call per sentence:
+    Two display tracks:
+
+    Fast track — translate_fragment() translates each Deepgram final immediately,
+    emitting interim_translation so the congregation sees something within ~400ms.
+    No context, no correction. Cancelled if a newer fragment arrives first.
+
+    Accurate track — translate() is called when SentenceBuffer flushes a full
+    sentence. Uses two additional accuracy techniques in a single API call:
 
     1. Context injection — prepends up to CONTEXT_WINDOW previous Spanish
-       sentences so Google can disambiguate pronouns and theological terms
-       using surrounding meaning.
+       sentences so Google can disambiguate pronouns and theological terms.
 
-    2. Forward-only dual-pass correction — the combined input also retranslates
-       the previous sentence with the new sentence as trailing context.
-       If the result differs from the originally broadcast translation, a
-       'correction' event is emitted so the display can silently update that
-       committed line. Corrections never touch the line the congregation is
-       currently reading.
+    2. Forward-only dual-pass correction — also retranslates the previous
+       sentence with the new sentence as trailing context. If the result
+       differs, a 'correction' event silently updates that committed line.
     """
 
     def __init__(
         self,
         on_translation: Callable[[str, str, int], Awaitable[None]],
         on_correction: Callable[[int, str], Awaitable[None]],
+        on_interim_translation: Callable[[str], Awaitable[None]],
     ):
         self._on_translation = on_translation
         self._on_correction = on_correction
+        self._on_interim_translation = on_interim_translation
         self._api_key = os.environ["GOOGLE_TRANSLATE_API_KEY"]
         self._context: deque[tuple[str, str, int]] = deque(maxlen=CONTEXT_WINDOW)
         self._active_task: asyncio.Task | None = None
+        self._fragment_task: asyncio.Task | None = None
+
+    async def translate_fragment(self, spanish: str):
+        """Fast track: translate a single fragment immediately, no context.
+        Cancels any in-flight fragment request to prevent stale out-of-order updates."""
+        if self._fragment_task and not self._fragment_task.done():
+            self._fragment_task.cancel()
+        self._fragment_task = asyncio.create_task(self._do_translate_fragment(spanish))
+
+    async def _do_translate_fragment(self, spanish: str):
+        try:
+            english = await self._call_api(spanish)
+            await self._on_interim_translation(english)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("[google_translate] Fragment error for '%s': %s", spanish[:40], e)
 
     async def translate(self, spanish: str, ts: int):
         if self._active_task and not self._active_task.done():
