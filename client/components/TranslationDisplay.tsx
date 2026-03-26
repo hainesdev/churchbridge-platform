@@ -41,8 +41,11 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         if (msg.type === 'interim') {
           setPartialSpanish(msg.text);
         } else if (msg.type === 'stt_final') {
-          // Raw Deepgram final — used by spanish + bilingual modes for fast committed captions
-          setSpanishLines((prev) => [...prev.slice(-(MAX_CAPTION_SEGMENTS - 1)), msg.text]);
+          // Raw Deepgram final — append to rolling Spanish caption
+          setSpanishLines((prev) => {
+            const all = [...prev, msg.text];
+            return all.slice(-MAX_CAPTION_SEGMENTS);
+          });
           setPartialSpanish('');
         } else if (msg.type === 'interim_translation') {
           setPartialEnglish((prev) => prev ? prev + ' ' + msg.text : msg.text);
