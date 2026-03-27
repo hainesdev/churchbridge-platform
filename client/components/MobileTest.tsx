@@ -158,8 +158,17 @@ export function MobileTest({ churchId }: MobileTestProps) {
       const source = ctx.createMediaStreamSource(mediaStream);
       const worklet = new AudioWorkletNode(ctx, 'recorder-processor');
       workletRef.current = worklet;
+      let _debugChunk = 0;
       worklet.port.onmessage = (e) => {
-        if (e.data.type === 'chunk') sendBufferRef.current.push(e.data.samples);
+        if (e.data.type === 'chunk') {
+          sendBufferRef.current.push(e.data.samples);
+          _debugChunk++;
+          if (_debugChunk <= 5) {
+            const s = e.data.samples as Float32Array;
+            const max = s.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+            console.log(`[MobileTest] chunk ${_debugChunk} len=${s.length} max=${max.toFixed(6)} ctx=${ctx.state}`);
+          }
+        }
       };
       source.connect(worklet);
       worklet.connect(ctx.destination);
