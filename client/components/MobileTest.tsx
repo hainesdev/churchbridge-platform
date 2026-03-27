@@ -146,7 +146,14 @@ export function MobileTest({ churchId }: MobileTestProps) {
     setStatus('connecting');
     setErrorMsg('');
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,   // Chrome's processing destroys signal for STT
+          noiseSuppression: false,   // let Deepgram handle noise, not the browser
+          autoGainControl: true,
+        },
+        video: false,
+      });
       streamRef.current = mediaStream;
       const ctx = new AudioContext();
       ctxRef.current = ctx;
