@@ -144,6 +144,7 @@ class DeepgramSession:
             alt = channel["alternatives"][0]
             text = alt.get("transcript", "").strip()
             if not text:
+                logger.info("[deepgram:%s] Empty transcript received (silence/noise)", self._church_id)
                 return
 
             is_final = msg.get("is_final", False)
