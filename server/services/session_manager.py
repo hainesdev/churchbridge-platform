@@ -60,17 +60,7 @@ class ServiceSession:
 
     async def ingest(self, audio_b64: str):
         """Receive a base64 Float32 chunk from the browser, resample, forward to Deepgram."""
-        import numpy as np
         raw = base64_to_float32_bytes(audio_b64)
-        self._ingest_count = getattr(self, '_ingest_count', 0) + 1
-        if self._ingest_count in (10, 30, 50):
-            samples = np.frombuffer(raw, dtype=np.float32)
-            rms = float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
-            level = "SILENT" if rms < 0.005 else "low" if rms < 0.02 else "OK"
-            logger.info(
-                "[session:%s] Audio RMS=%.5f [%s] at chunk %d",
-                self._church_id, rms, level, self._ingest_count,
-            )
         pcm16 = resample_float32_to_pcm16(raw, self._sample_rate, dst_rate=16000)
         if self._deepgram:
             await self._deepgram.send(pcm16)

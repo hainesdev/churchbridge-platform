@@ -41,10 +41,7 @@ class Broadcaster:
             await self._redis.publish(channel, payload)
         else:
             # In-process fallback for local dev without Redis
-            subs = self._local_subs.get(channel, [])
-            if subs:
-                logger.info("[broadcaster] %d subscriber(s) on %s", len(subs), channel)
-            for cb in subs:
+            for cb in self._local_subs.get(channel, []):
                 asyncio.create_task(cb(payload))
 
     def subscribe_local(self, church_id: str, callback: Callable):
