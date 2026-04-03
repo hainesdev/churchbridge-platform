@@ -82,7 +82,13 @@ cd server
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --reload
+```
+
+Run the API from the **repository root** (imports use the `server` package):
+
+```bash
+cd ..                          # back to churchbridge-ai root
+python -m uvicorn server.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ### Frontend
@@ -99,12 +105,35 @@ npm run dev
 docker run -d -p 6379:6379 redis:alpine
 ```
 
+Without Redis, the server falls back to in-process broadcast (fine for a single machine; use Redis if you need pub/sub across processes or hosts).
+
 ### Environment
 
 ```bash
 cp .env.example .env
-# Fill in DEEPGRAM_API_KEY and OPENAI_API_KEY
+# Fill in DEEPGRAM_API_KEY, GOOGLE_TRANSLATE_API_KEY, and OPENAI_API_KEY
 ```
+
+Place `.env` in the repository root so the backend loads it. For Next.js, copy `client/.env.local.example` to `client/.env.local` if you need to override `NEXT_PUBLIC_WS_URL` or `NEXT_PUBLIC_API_URL` (defaults target `localhost:8000`).
+
+## Running the app
+
+Start these in separate terminals (after [Setup](#setup) once). Order: Redis → API → web UI.
+
+| Step | What | Command |
+|------|------|---------|
+| 1 | **Redis** (optional but recommended) | `docker run -d -p 6379:6379 redis:alpine` |
+| 2 | **Backend** (FastAPI + WebSockets) | From repo root, with `server/.venv` activated: `python -m uvicorn server.main:app --reload --host 127.0.0.1 --port 8000` |
+| 3 | **Frontend** (Next.js) | `cd client && npm run dev` |
+
+**URLs**
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| Web UI | [http://localhost:3000](http://localhost:3000) | Admin, sanctuary display, and mobile listener pages (Next.js) |
+| API | [http://127.0.0.1:8000](http://127.0.0.1:8000) | REST and WebSocket endpoints; [`/health`](http://127.0.0.1:8000/health) checks the process |
+
+Open the **Next.js** URL for browser pages. Port **8000** is the API only—routes like `/display/[churchId]` live on port **3000** (for example `http://localhost:3000/display/default`).
 
 ## Latency Budget
 

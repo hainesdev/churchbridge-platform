@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from server.db.index import init_db
 from server.services.broadcaster import Broadcaster
 from server.services.session_manager import SessionManager
-from server.routes import stream, display, listen
+from server.routes import stream, display, listen, services
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,6 +48,7 @@ app.add_middleware(
 app.include_router(stream.router)
 app.include_router(display.router)
 app.include_router(listen.router)
+app.include_router(services.router)
 
 
 @app.get("/health")

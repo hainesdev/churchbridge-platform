@@ -31,6 +31,12 @@ export default function Home() {
           >
             Mobile Listener
           </a>
+          <a
+            href="/test/default"
+            className="block w-full py-3 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg text-center font-medium transition-colors"
+          >
+            Translation Test
+          </a>
         </div>
       </div>
     </main>
