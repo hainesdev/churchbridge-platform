@@ -1,21 +1,25 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
+import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
 
 interface MobileListenerProps {
   churchId: string;
 }
-
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 
 export function MobileListener({ churchId }: MobileListenerProps) {
   const [lines, setLines] = useState<{ id: number; text: string }[]>([]);
   const [partial, setPartial] = useState('');
   const [connected, setConnected] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const lastInterimTextRef = useRef<string | null>(null);
 
   useEffect(() => {
+    let ws: WebSocket;
+    let stopped = false;
+
     const connect = () => {
-      const ws = new WebSocket(`${WS_URL}/api/listen/v1?church_id=${encodeURIComponent(churchId)}`);
+      if (stopped) return;
+      ws = new WebSocket(`${getWebSocketBaseUrl()}/api/listen/v1?church_id=${encodeURIComponent(churchId)}`);
 
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
@@ -26,8 +30,13 @@ export function MobileListener({ churchId }: MobileListenerProps) {
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type === 'interim_translation') {
-          setPartial((prev) => prev ? prev + ' ' + msg.text : msg.text);
+          const t = String(msg.text ?? '').trim();
+          if (t && t !== lastInterimTextRef.current) {
+            lastInterimTextRef.current = t;
+            setPartial((prev) => (prev ? prev + ' ' + t : t));
+          }
         } else if (msg.type === 'translation') {
+          lastInterimTextRef.current = null;
           setLines((prev) => [...prev.slice(-50), { id: msg.ts, text: msg.english }]);
           setPartial('');
         } else if (msg.type === 'correction') {
@@ -39,6 +48,7 @@ export function MobileListener({ churchId }: MobileListenerProps) {
     };
 
     connect();
+    return () => { stopped = true; ws?.close(); };
   }, [churchId]);
 
   useEffect(() => {

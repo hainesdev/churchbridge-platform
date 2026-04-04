@@ -1,12 +1,9 @@
 'use client';
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-
-interface Segment {
-  id: number;
-  spanish: string;
-  english: string;
-}
+import { motion } from 'framer-motion';
+import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
+import { float32ToBase64 } from '@/lib/audioUtils';
+import { useTranslationFeed } from '@/lib/useTranslationFeed';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
 
@@ -14,23 +11,8 @@ interface MobileTestProps {
   churchId: string;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 const BATCH_INTERVAL_MS = 100;
 const MAX_RETRY_DELAY_MS = 30_000;
-const PARTIAL_FLUSH_MS = 80;
-const DRAIN_MS = 300;
-const FLASH_MS = 600;
-
-function float32ToBase64(chunks: Float32Array[]): string {
-  const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-  const merged = new Float32Array(totalLen);
-  let offset = 0;
-  for (const c of chunks) { merged.set(c, offset); offset += c.length; }
-  const bytes = new Uint8Array(merged.buffer, merged.byteOffset, merged.byteLength);
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
 
 // ── Audio capture + streaming ─────────────────────────────────────────────────
 
@@ -56,7 +38,7 @@ function useAudioStream(churchId: string) {
   }, []);
 
   const connect = useCallback(() => {
-    const ws = new WebSocket(`${WS_URL}/api/stream/v1?church_id=${encodeURIComponent(churchId)}`);
+    const ws = new WebSocket(`${getWebSocketBaseUrl()}/api/stream/v1?church_id=${encodeURIComponent(churchId)}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -136,91 +118,11 @@ function useAudioStream(churchId: string) {
   return { status, errorMsg, start, stop };
 }
 
-// ── Translation feed hook ─────────────────────────────────────────────────────
-
-function useTranslationFeed(churchId: string) {
-  const [segments, setSegments] = useState<Segment[]>([]);
-  const [spanishLines, setSpanishLines] = useState<string[]>([]);
-  const [partialSpanish, setPartialSpanish] = useState('');
-  const [partialEnglish, setPartialEnglish] = useState('');
-  const [connected, setConnected] = useState(false);
-  const [drainingEnglish, setDrainingEnglish] = useState('');
-  const [drainKey, setDrainKey] = useState(0);
-  const [flashingId, setFlashingId] = useState<number | null>(null);
-
-  const partialQueueRef = useRef('');
-  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const drainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Flush buffered tokens to state on a fixed interval
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const q = partialQueueRef.current;
-      setPartialEnglish(prev => (prev !== q ? q : prev));
-    }, PARTIAL_FLUSH_MS);
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    let ws: WebSocket;
-    let stopped = false;
-
-    const connect = () => {
-      if (stopped) return;
-      ws = new WebSocket(`${WS_URL}/api/display/v1?church_id=${encodeURIComponent(churchId)}`);
-      ws.onopen = () => setConnected(true);
-      ws.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
-      ws.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'interim') {
-          setPartialSpanish(msg.text);
-        } else if (msg.type === 'stt_final') {
-          setSpanishLines((prev) => [...prev, msg.text].slice(-8));
-          setPartialSpanish('');
-        } else if (msg.type === 'interim_translation') {
-          partialQueueRef.current = partialQueueRef.current
-            ? partialQueueRef.current + ' ' + msg.text
-            : msg.text;
-        } else if (msg.type === 'translation') {
-          partialQueueRef.current = '';
-
-          // Drain the committed text — unique key per drain prevents AnimatePresence
-          // from interrupting a mid-exit animation when sentences arrive in rapid succession
-          if (drainTimerRef.current) clearTimeout(drainTimerRef.current);
-          setDrainKey(k => k + 1);
-          setDrainingEnglish(msg.english);
-          drainTimerRef.current = setTimeout(() => setDrainingEnglish(''), DRAIN_MS + 50);
-
-          setSegments((prev) => [...prev.slice(-99), { id: msg.ts, spanish: msg.spanish, english: msg.english }]);
-          setSpanishLines([]);
-          setPartialSpanish('');
-          setPartialEnglish('');
-        } else if (msg.type === 'correction') {
-          setSegments((prev) => prev.map((s) => s.id === msg.ts ? { ...s, english: msg.english } : s));
-          setFlashingId(msg.ts);
-          if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-          flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
-        }
-      };
-    };
-
-    connect();
-    return () => {
-      stopped = true;
-      ws?.close();
-      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-      if (drainTimerRef.current) clearTimeout(drainTimerRef.current);
-    };
-  }, [churchId]);
-
-  return { segments, spanishLines, partialSpanish, partialEnglish, drainingEnglish, drainKey, connected, flashingId };
-}
-
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function MobileTest({ churchId }: MobileTestProps) {
   const { status, errorMsg, start, stop } = useAudioStream(churchId);
-  const { segments, spanishLines, partialSpanish, partialEnglish, drainingEnglish, drainKey, connected: displayConnected, flashingId } = useTranslationFeed(churchId);
+  const { segments, spanishLines, partialSpanish, partialEnglish, connected: displayConnected, flashingId } = useTranslationFeed(churchId);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -238,7 +140,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
     if (!atBottomRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [segments, partialEnglish, partialSpanish, spanishLines, drainingEnglish]);
+  }, [segments, partialEnglish, partialSpanish, spanishLines]);
 
   const scrollToLive = useCallback(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -284,9 +186,9 @@ export function MobileTest({ churchId }: MobileTestProps) {
       <div className="flex-none flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800">
         <div className="flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${
-            status === 'active'      ? 'bg-green-400 animate-pulse' :
-            status === 'reconnecting'? 'bg-yellow-400 animate-pulse' :
-                                       'bg-red-400'
+            status === 'active'       ? 'bg-green-400 animate-pulse' :
+            status === 'reconnecting' ? 'bg-yellow-400 animate-pulse' :
+                                        'bg-red-400'
           }`} />
           <span className="text-xs text-gray-400">
             {status === 'active' ? 'Live' : status === 'reconnecting' ? 'Reconnecting...' : 'Error'}
@@ -303,27 +205,20 @@ export function MobileTest({ churchId }: MobileTestProps) {
         </button>
       </div>
 
-      <motion.div
+      <div
         ref={scrollRef}
-        layoutScroll
         onScroll={handleScroll}
         className="flex-1 overflow-y-auto relative"
       >
         <div className="min-h-full flex flex-col justify-end px-5 pt-12 pb-6 gap-4">
-          {segments.length === 0 && !activeSpanish && !partialEnglish && !drainingEnglish && (
+          {segments.length === 0 && !activeSpanish && !partialEnglish && (
             <p className="text-gray-600 text-sm text-center mb-4">Waiting for speech...</p>
           )}
           {segments.map((s) => (
             <motion.div
               key={s.id}
-              layout
-              initial={{ opacity: 0, y: 22 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{
-                layout: { type: 'spring', damping: 30, stiffness: 280 },
-                opacity: { duration: 0.3 },
-                y: { duration: 0.35, ease: 'easeOut' },
-              }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1, transition: { duration: 0.4 } }}
               className="space-y-0.5"
             >
               <p className={`text-xl font-semibold leading-snug transition-colors duration-[600ms] ${
@@ -332,38 +227,16 @@ export function MobileTest({ churchId }: MobileTestProps) {
               <p className="text-sm text-gray-500 leading-snug">{s.spanish}</p>
             </motion.div>
           ))}
-          <motion.div layout transition={{ layout: { type: 'spring', damping: 30, stiffness: 280 } }} className="space-y-0.5 min-h-[2rem] relative">
-            {/* Drain: absolutely positioned so it overlaps the partial area instead of stacking above it */}
-            <AnimatePresence>
-              {drainingEnglish && (
-                <motion.p
-                  key={drainKey}
-                  exit={{ opacity: 0, y: -3 }}
-                  transition={{ duration: DRAIN_MS / 1000, ease: 'easeOut' }}
-                  className="absolute inset-x-0 top-0 text-xl font-semibold leading-snug text-gray-400 pointer-events-none"
-                >
-                  {drainingEnglish}
-                </motion.p>
-              )}
-            </AnimatePresence>
+          <div className="space-y-0.5 min-h-[2rem]">
             {partialEnglish && (
               <p className="text-xl font-semibold leading-snug text-gray-400">
                 {partialEnglish}<span className="animate-pulse text-blue-400 ml-0.5">▌</span>
               </p>
             )}
-            <AnimatePresence>
-              {activeSpanish && (
-                <motion.p
-                  key="activeSpanish"
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.2 }}
-                  className="text-sm text-gray-600 leading-snug"
-                >
-                  {activeSpanish}
-                </motion.p>
-              )}
-            </AnimatePresence>
-          </motion.div>
+            {activeSpanish && (
+              <p className="text-sm text-gray-600 leading-snug">{activeSpanish}</p>
+            )}
+          </div>
         </div>
 
         {scrolledUp && (
@@ -374,7 +247,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
             ↓ Live
           </button>
         )}
-      </motion.div>
+      </div>
 
       {errorMsg && (
         <div className="flex-none px-4 py-2 bg-red-900/50 border-t border-red-800">

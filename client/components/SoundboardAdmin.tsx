@@ -1,6 +1,8 @@
 'use client';
 import { useRef, useState, useCallback, useEffect } from 'react';
 import { VUMeter } from './VUMeter';
+import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
+import { float32ToBase64 } from '@/lib/audioUtils';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
 
@@ -8,7 +10,6 @@ interface SoundboardAdminProps {
   churchId: string;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 const BATCH_INTERVAL_MS = 100;
 const MAX_RETRY_DELAY_MS = 30_000;
 
@@ -25,39 +26,23 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
   const sendBufferRef = useRef<Float32Array[]>([]);
   const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryDelayRef = useRef(1000);
-  const pendingBufferRef = useRef<ArrayBuffer[]>([]);
   const shouldReconnectRef = useRef(false);
   const sampleRateRef = useRef(48000);
   const sermonTopicRef = useRef('');
 
-  // Keep ref in sync so reconnect handler has current topic value
-  useEffect(() => { sermonTopicRef.current = sermonTopic; }, [sermonTopic]);
+  // Assign during render so reconnect handler always reads the current value
+  sermonTopicRef.current = sermonTopic;
 
   const flushBuffer = useCallback(() => {
     if (sendBufferRef.current.length === 0 || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
     const chunks = sendBufferRef.current;
     sendBufferRef.current = [];
-
-    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-    const merged = new Float32Array(totalLen);
-    let offset = 0;
-    for (const c of chunks) { merged.set(c, offset); offset += c.length; }
-
-    const bytes = new Uint8Array(merged.buffer, merged.byteOffset, merged.byteLength);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    const b64 = btoa(binary);
-
-    if (wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'audio', audio: b64 }));
-    } else {
-      pendingBufferRef.current.push(merged.buffer);
-    }
+    wsRef.current.send(JSON.stringify({ type: 'audio', audio: float32ToBase64(chunks) }));
   }, []);
 
   const connect = useCallback(() => {
-    const ws = new WebSocket(`${WS_URL}/api/stream/v1?church_id=${encodeURIComponent(churchId)}`);
+    const ws = new WebSocket(`${getWebSocketBaseUrl()}/api/stream/v1?church_id=${encodeURIComponent(churchId)}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -69,14 +54,6 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
         sampleRate: sampleRateRef.current,
         topic: sermonTopicRef.current,
       }));
-
-      for (const buf of pendingBufferRef.current) {
-        const bytes = new Uint8Array(buf);
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        ws.send(JSON.stringify({ type: 'audio', audio: btoa(binary) }));
-      }
-      pendingBufferRef.current = [];
     };
 
     ws.onmessage = (e) => {
@@ -172,7 +149,6 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
     ctxRef.current = null;
 
     sendBufferRef.current = [];
-    pendingBufferRef.current = [];
     setStatus('idle');
   }, []);
 

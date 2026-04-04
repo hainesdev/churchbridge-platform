@@ -3,11 +3,11 @@ import logging
 import os
 import time
 
-from openai import AsyncOpenAI
+import anthropic
 
 logger = logging.getLogger(__name__)
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 SUMMARY_INTERVAL_SECS = int(os.getenv("TOPIC_SUMMARY_INTERVAL", "300"))  # 5 min default
 MIN_SEGMENTS_BEFORE_SUMMARY = 8   # wait for enough speech before first summary
 
@@ -16,9 +16,9 @@ class TopicTracker:
     """Maintains a rolling 2-3 sentence summary of sermon content.
 
     Updated every SUMMARY_INTERVAL_SECS seconds via a lightweight async
-    GPT-4o-mini call. The summary is injected into each translation system
-    prompt to resolve theological term ambiguity — e.g. whether "misión"
-    means a mission trip or the Great Commission in this particular sermon.
+    Claude Haiku call. The summary is injected into each enrichment prompt
+    to resolve theological term ambiguity — e.g. whether "misión" means a
+    mission trip or the Great Commission in this particular sermon.
 
     The tracker never blocks translation. Summary updates run as a fire-and-
     forget background task; the previous summary remains available until the
@@ -33,7 +33,7 @@ class TopicTracker:
         self._summary: str = sermon_topic.strip()
         self._last_summary_time: float = 0.0
         self._update_task: asyncio.Task | None = None
-        self._client = AsyncOpenAI()
+        self._client = anthropic.AsyncAnthropic()
 
     def add_segment(self, spanish_text: str):
         """Record a final transcript segment and schedule a summary refresh if due."""
@@ -41,7 +41,7 @@ class TopicTracker:
         self._maybe_schedule_update()
 
     def get_context(self) -> str:
-        """Return the current topic summary for injection into the translation prompt.
+        """Return the current topic summary for injection into the enrichment prompt.
         Returns the sermon topic alone if no summary has been generated yet."""
         return self._summary
 
@@ -61,17 +61,16 @@ class TopicTracker:
         topic_hint = f' The sermon topic is: "{self._sermon_topic}".' if self._sermon_topic else ""
 
         try:
-            response = await self._client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = await self._client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=120,
+                temperature=0,
+                system=(
+                    "You summarize live Spanish sermon transcripts for a simultaneous interpreter. "
+                    "Be brief and precise. Focus on theological themes, key terms, and the "
+                    "current direction of the message. Respond in English."
+                ),
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You summarize live Spanish sermon transcripts for a simultaneous interpreter. "
-                            "Be brief and precise. Focus on theological themes, key terms, and the "
-                            "current direction of the message."
-                        ),
-                    },
                     {
                         "role": "user",
                         "content": (
@@ -79,12 +78,10 @@ class TopicTracker:
                             f"focusing on theological themes and any key Spanish terms used.{topic_hint}\n\n"
                             f"Transcript:\n{recent_text}"
                         ),
-                    },
+                    }
                 ],
-                max_tokens=120,
-                temperature=0,
             )
-            new_summary = response.choices[0].message.content.strip()
+            new_summary = response.content[0].text.strip()
             self._summary = new_summary
             logger.info("[topic] Summary updated for church %s: %s", self._church_id, new_summary[:100])
         except asyncio.CancelledError:

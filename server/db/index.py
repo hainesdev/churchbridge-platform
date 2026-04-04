@@ -35,6 +35,31 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     english     TEXT NOT NULL,
     ts          TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS verse_detections (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        INTEGER NOT NULL REFERENCES service_sessions(id),
+    segment_ts        INTEGER NOT NULL,
+    book              TEXT NOT NULL,
+    chapter           INTEGER NOT NULL,
+    verse_start       INTEGER NOT NULL,
+    verse_end         INTEGER,
+    reference         TEXT NOT NULL,
+    spanish_text      TEXT NOT NULL,
+    canonical_english TEXT NOT NULL,
+    confidence        TEXT NOT NULL DEFAULT 'explicit',
+    detected_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS verse_suggestions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        INTEGER NOT NULL REFERENCES service_sessions(id),
+    segment_ts        INTEGER NOT NULL,
+    reference         TEXT NOT NULL,
+    canonical_english TEXT NOT NULL,
+    relevance_note    TEXT NOT NULL,
+    suggested_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 SEED_DEFAULT_TERMS = """

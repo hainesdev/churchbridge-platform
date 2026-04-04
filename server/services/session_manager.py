@@ -3,6 +3,7 @@ import time
 from fastapi import WebSocket
 
 from server.db.glossary import get_glossary
+from server.db.church_terms import load_church_terms
 from server.db.sessions import (
     create_service_session,
     close_service_session,
@@ -11,7 +12,9 @@ from server.db.sessions import (
 from server.services.audio_utils import resample_float32_to_pcm16, base64_to_float32_bytes
 from server.services.deepgram_session import DeepgramSession
 from server.services.google_translate_service import GoogleTranslateService
+from server.services.llm_enrichment_service import LLMEnrichmentService
 from server.services.sentence_buffer import SentenceBuffer
+from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
 
 logger = logging.getLogger(__name__)
@@ -19,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 class ServiceSession:
     """One active session per church_id. Owns the Deepgram connection,
-    SentenceBuffer, GoogleTranslateService, and the admin WebSocket."""
+    SentenceBuffer, GoogleTranslateService, LLMEnrichmentService,
+    TopicTracker, and the admin WebSocket."""
 
     def __init__(self, church_id: str, ws: WebSocket, broadcaster: Broadcaster):
         self._church_id = church_id
@@ -30,12 +34,20 @@ class ServiceSession:
         self._deepgram: DeepgramSession | None = None
         self._sentence_buffer: SentenceBuffer | None = None
         self._translation: GoogleTranslateService | None = None
+        self._enrichment: LLMEnrichmentService | None = None
+        self._topic_tracker: TopicTracker | None = None
 
     async def start(self, sample_rate: int, sermon_topic: str = ""):
         self._sample_rate = sample_rate
         self._db_session_id = await create_service_session(self._church_id)
 
         glossary = await get_glossary(self._church_id)
+        church_terms = await load_church_terms(self._church_id)
+
+        self._topic_tracker = TopicTracker(
+            church_id=self._church_id,
+            sermon_topic=sermon_topic,
+        )
 
         self._sentence_buffer = SentenceBuffer(on_sentence=self._on_sentence)
 
@@ -43,6 +55,16 @@ class ServiceSession:
             on_translation=self._on_translation,
             on_correction=self._on_correction,
             on_interim_translation=self._on_interim_translation,
+        )
+
+        self._enrichment = LLMEnrichmentService(
+            church_id=self._church_id,
+            church_terms=church_terms,
+            topic_tracker=self._topic_tracker,
+            on_translation_update=self._on_translation_update,
+            on_verse_detected=self._on_verse_detected,
+            on_verse_suggestion=self._on_verse_suggestion,
+            session_id=self._db_session_id,
         )
 
         self._deepgram = DeepgramSession(
@@ -67,9 +89,15 @@ class ServiceSession:
 
     async def close(self):
         if self._sentence_buffer:
-            await self._sentence_buffer.stop()  # flush any remaining text
+            await self._sentence_buffer.stop()
         if self._deepgram:
             await self._deepgram.stop()
+        if self._translation:
+            await self._translation.close()
+        if self._enrichment:
+            await self._enrichment.close()
+        if self._topic_tracker:
+            await self._topic_tracker.stop()
         if self._db_session_id:
             await close_service_session(self._db_session_id)
         logger.info("[session] Closed for church %s", self._church_id)
@@ -83,9 +111,9 @@ class ServiceSession:
         logger.info("[session:%s] STT final: %s", self._church_id, text)
         await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
         if self._translation:
-            await self._translation.translate_fragment(text)  # fast track: show immediately
+            await self._translation.translate_fragment(text)
         if self._sentence_buffer:
-            await self._sentence_buffer.add(text)             # accurate track: accumulate
+            await self._sentence_buffer.add(text)
 
     # --- Sentence buffer callback ---
 
@@ -93,10 +121,12 @@ class ServiceSession:
         ts = _now()
         logger.info("[session:%s] Sentence flushed: %s", self._church_id, text)
         await self._broadcast({"type": "final_spanish", "text": text, "ts": ts})
+        if self._topic_tracker:
+            self._topic_tracker.add_segment(text)
         if self._translation:
             await self._translation.translate(text, ts)
 
-    # --- Translation callbacks ---
+    # --- Google Translation callbacks ---
 
     async def _on_translation(self, spanish: str, english: str, ts: int):
         logger.info("[session:%s] Translation: %s -> %s", self._church_id, spanish[:60], english[:60])
@@ -108,6 +138,8 @@ class ServiceSession:
         })
         if self._db_session_id:
             await append_segment(self._db_session_id, spanish, english)
+        if self._enrichment:
+            self._enrichment.enrich(spanish, english, ts)
 
     async def _on_interim_translation(self, text: str):
         await self._broadcast({"type": "interim_translation", "text": text, "ts": _now()})
@@ -115,6 +147,24 @@ class ServiceSession:
     async def _on_correction(self, ts: int, english: str):
         """Silently update a previously broadcast translation with better context."""
         await self._broadcast({"type": "correction", "ts": ts, "english": english})
+
+    # --- LLM Enrichment callbacks ---
+
+    async def _on_translation_update(self, ts: int, english: str):
+        """LLM-improved translation; replaces the Google translation on the display."""
+        logger.info("[session:%s] Translation update ts=%d: %s", self._church_id, ts, english[:60])
+        await self._broadcast({"type": "translation_update", "ts": ts, "english": english})
+
+    async def _on_verse_detected(self, ts: int, verse: dict):
+        logger.info("[session:%s] Verse detected: %s", self._church_id, verse.get("reference"))
+        await self._broadcast({"type": "verse_detected", "ts": ts, "verse": verse})
+
+    async def _on_verse_suggestion(self, ts: int, suggestions: list[dict]):
+        logger.info(
+            "[session:%s] Verse suggestions for ts=%d: %s",
+            self._church_id, ts, [s["reference"] for s in suggestions],
+        )
+        await self._broadcast({"type": "verse_suggestion", "ts": ts, "suggestions": suggestions})
 
     # --- Helpers ---
 
