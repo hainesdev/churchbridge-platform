@@ -33,7 +33,7 @@ class TopicTracker:
         self._summary: str = sermon_topic.strip()
         self._last_summary_time: float = 0.0
         self._update_task: asyncio.Task | None = None
-        self._client = anthropic.AsyncAnthropic()
+        self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     def add_segment(self, spanish_text: str):
         """Record a final transcript segment and schedule a summary refresh if due."""

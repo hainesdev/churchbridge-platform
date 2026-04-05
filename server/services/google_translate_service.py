@@ -162,12 +162,20 @@ class GoogleTranslateService:
         parts = _unwrap(translated)
         current_en = parts[-1] if parts else translated.strip()
 
+        logger.info("[google_translate] Translation: '%s' → '%s'", spanish[:60], current_en[:60])
+
         # Dual-pass correction: update immediately previous segment
         if context and len(parts) >= 2:
             _, prev_en_orig, prev_ts = context[-1]
             corrected_en = parts[-2]
             if corrected_en != prev_en_orig:
+                logger.info(
+                    "[google_translate] Dual-pass correction ts=%d:\n  before: %s\n   after: %s",
+                    prev_ts, prev_en_orig[:80], corrected_en[:80],
+                )
                 await self._on_correction(prev_ts, corrected_en)
+            else:
+                logger.info("[google_translate] Dual-pass checked ts=%d — no change", prev_ts)
 
         self._context.append((spanish, current_en, ts))
         await self._on_translation(spanish, current_en, ts)

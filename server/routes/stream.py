@@ -51,7 +51,7 @@ async def stream_audio(
     except WebSocketDisconnect:
         logger.info("[stream] Admin disconnected for church %s", church_id)
     except Exception as e:
-        logger.error("[stream] Error for church %s: %s", church_id, e)
+        logger.error("[stream] Error for church %s: %s", church_id, e, exc_info=True)
         try:
             await ws.send_json({"type": "error", "message": str(e)})
         except Exception:

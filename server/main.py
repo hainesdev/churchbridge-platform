@@ -12,7 +12,13 @@ from server.services.broadcaster import Broadcaster
 from server.services.session_manager import SessionManager
 from server.routes import stream, display, listen, services
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+    force=True,
+)
+for _name in ("server.services", "server.db", "server.routes"):
+    logging.getLogger(_name).setLevel(logging.INFO)
 
 REQUIRED = ["DEEPGRAM_API_KEY", "GOOGLE_TRANSLATE_API_KEY", "ANTHROPIC_API_KEY"]
 for key in REQUIRED:

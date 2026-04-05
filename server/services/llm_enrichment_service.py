@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import os
+import re
 from typing import Callable, Awaitable, TYPE_CHECKING
 
 import anthropic
@@ -66,7 +68,7 @@ def _build_system_prompt(church_terms: dict[str, str]) -> str:
         glossary_block = f"THEOLOGICAL GLOSSARY — always use these exact translations:\n{lines}"
     else:
         glossary_block = ""
-    return _SYSTEM_PROMPT_BASE.format(glossary_block=glossary_block)
+    return _SYSTEM_PROMPT_BASE.replace("{glossary_block}", glossary_block)
 
 
 def _build_user_message(
@@ -111,7 +113,7 @@ class LLMEnrichmentService:
         self._on_verse_suggestion = on_verse_suggestion
         self._session_id = session_id
         self._system_prompt = _build_system_prompt(church_terms)
-        self._client = anthropic.AsyncAnthropic()
+        self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self._tasks: list[asyncio.Task] = []
 
     def enrich(self, spanish: str, google_english: str, ts: int) -> asyncio.Task:
@@ -141,47 +143,65 @@ class LLMEnrichmentService:
             logger.warning("[enrichment:%s] Claude call failed for ts=%d: %s", self._church_id, ts, e)
             return
 
+        # Strip markdown fences if Claude wrapped the response
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+
         try:
             result = json.loads(raw)
         except json.JSONDecodeError:
             logger.warning("[enrichment:%s] Could not parse JSON for ts=%d: %.120s", self._church_id, ts, raw)
             return
 
+        if not isinstance(result, dict):
+            logger.warning("[enrichment:%s] Expected JSON object for ts=%d, got %s", self._church_id, ts, type(result).__name__)
+            return
+
         # --- Translation improvement ---
         improved = result.get("improved_translation", "").strip()
         if improved and improved != google_english:
+            logger.info(
+                "[enrichment:%s] Translation improved ts=%d:\n  google: %s\n     llm: %s",
+                self._church_id, ts, google_english[:80], improved[:80],
+            )
             try:
                 await self._on_translation_update(ts, improved)
             except Exception as e:
                 logger.warning("[enrichment:%s] on_translation_update failed: %s", self._church_id, e)
+        else:
+            logger.info("[enrichment:%s] Translation accepted ts=%d — no change", self._church_id, ts)
 
         # --- Verse detection ---
         verse = result.get("verse_detected")
         if verse and isinstance(verse, dict) and _is_valid_verse(verse):
+            logger.info(
+                "[enrichment:%s] Verse detected ts=%d: %s (%s)",
+                self._church_id, ts, verse["reference"], verse["confidence"],
+            )
             try:
                 await self._on_verse_detected(ts, verse)
                 await save_verse_detection(self._session_id, ts, verse)
             except Exception as e:
                 logger.warning("[enrichment:%s] on_verse_detected failed: %s", self._church_id, e)
+        else:
+            logger.info("[enrichment:%s] No verse detected ts=%d", self._church_id, ts)
 
         # --- Verse suggestions ---
         suggestions = result.get("verse_suggestions", [])
         if isinstance(suggestions, list):
             valid = [s for s in suggestions if _is_valid_suggestion(s)]
             if valid:
+                logger.info(
+                    "[enrichment:%s] Verse suggestions ts=%d: %s",
+                    self._church_id, ts, [s["reference"] for s in valid],
+                )
                 try:
                     await self._on_verse_suggestion(ts, valid)
                     await save_verse_suggestions(self._session_id, ts, valid)
                 except Exception as e:
                     logger.warning("[enrichment:%s] on_verse_suggestion failed: %s", self._church_id, e)
-
-        logger.debug(
-            "[enrichment:%s] ts=%d improved=%s verse=%s suggestions=%d",
-            self._church_id, ts,
-            improved != google_english if improved else False,
-            verse.get("reference") if verse else None,
-            len(suggestions) if isinstance(suggestions, list) else 0,
-        )
+            else:
+                logger.info("[enrichment:%s] No verse suggestions ts=%d", self._church_id, ts)
 
     async def close(self) -> None:
         for task in self._tasks:
