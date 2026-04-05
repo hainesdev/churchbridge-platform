@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS verse_detections (
     spanish_text      TEXT NOT NULL,
     canonical_english TEXT NOT NULL,
     confidence        TEXT NOT NULL DEFAULT 'explicit',
+    audio_start       REAL,
+    audio_end         REAL,
     detected_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -59,6 +61,15 @@ CREATE TABLE IF NOT EXISTS verse_suggestions (
     canonical_english TEXT NOT NULL,
     relevance_note    TEXT NOT NULL,
     suggested_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sermon_mode_transitions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES service_sessions(id),
+    from_mode   TEXT NOT NULL,
+    to_mode     TEXT NOT NULL,
+    segment_ts  INTEGER NOT NULL,
+    occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -91,12 +102,31 @@ INSERT OR IGNORE INTO church_glossary (church_id, term, boost) VALUES
 """
 
 
+async def _migrate(db) -> None:
+    """Apply incremental schema changes to existing databases.
+
+    CREATE TABLE IF NOT EXISTS won't alter tables that already exist, so new
+    columns are added here with ALTER TABLE … ADD COLUMN. SQLite raises
+    OperationalError if a column already exists; we catch and ignore that.
+    """
+    migrations = [
+        "ALTER TABLE verse_detections ADD COLUMN audio_start REAL",
+        "ALTER TABLE verse_detections ADD COLUMN audio_end REAL",
+    ]
+    for stmt in migrations:
+        try:
+            await db.execute(stmt)
+        except Exception:
+            pass  # column already exists
+
+
 async def init_db():
     import os
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
         await db.executescript(SEED_DEFAULT_TERMS)
+        await _migrate(db)
         await db.execute("PRAGMA journal_mode=WAL")
         await db.commit()
 

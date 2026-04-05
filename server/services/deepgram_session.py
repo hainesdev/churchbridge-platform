@@ -10,6 +10,8 @@ import websockets
 logger = logging.getLogger(__name__)
 
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
+RECONNECT_DELAY_S = 1.5   # initial backoff after a clean drop
+RECONNECT_ERROR_S = 3.0   # backoff after an unexpected error
 
 
 class DeepgramSession:
@@ -21,20 +23,32 @@ class DeepgramSession:
 
     Uses the websockets library (pure asyncio) directly against the
     Deepgram v1/listen WebSocket endpoint.
+
+    Timestamp normalization
+    -----------------------
+    Deepgram's `start` field resets to 0.0 on each new WebSocket connection.
+    _stream_offset accumulates the high-water audio end time across reconnects
+    so all (audio_start, audio_end) values emitted by on_final are
+    monotonically increasing sermon-relative seconds, regardless of drops.
     """
 
     def __init__(
         self,
         church_id: str,
         on_interim: Callable[[str], Awaitable[None]],
-        on_final: Callable[[str], Awaitable[None]],
+        on_final: Callable[[str, float, float], Awaitable[None]],
+        on_utterance_end: Callable[[], Awaitable[None]] | None = None,
     ):
         self._church_id = church_id
         self._on_interim = on_interim
         self._on_final = on_final
+        self._on_utterance_end = on_utterance_end
         self._ws = None
         self._stop_event: asyncio.Event | None = None
         self._task: asyncio.Task | None = None
+        # Sermon-relative timestamp normalization
+        self._stream_offset: float = 0.0
+        self._last_audio_end: float = 0.0
 
     async def start(self, glossary: dict[str, int], sample_rate: int = 16000):
         self._stop_event = asyncio.Event()
@@ -62,38 +76,63 @@ class DeepgramSession:
             ("vad_events",       "true"),
             ("smart_format",     "true"),
         ]
-        # Deepgram accepts repeated ?keywords=term:boost params
         for term, boost in glossary.items():
             params.append(("keywords", f"{term}:{boost}"))
 
         url = f"{DEEPGRAM_WS_URL}?{urlencode(params)}"
         api_key = os.environ["DEEPGRAM_API_KEY"]
+        first_connect = True
 
-        try:
-            async with websockets.connect(
-                url,
-                additional_headers={"Authorization": f"Token {api_key}"},
-                ping_interval=20,
-                ping_timeout=10,
-            ) as ws:
-                self._ws = ws
-                ready.set()
-                logger.debug("[deepgram] WebSocket connected for church %s", self._church_id)
+        while not self._stop_event.is_set():
+            try:
+                async with websockets.connect(
+                    url,
+                    additional_headers={"Authorization": f"Token {api_key}"},
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    self._ws = ws
+                    if first_connect:
+                        ready.set()
+                        first_connect = False
+                    logger.info(
+                        "[deepgram] Connected for church %s (stream_offset=%.1fs)",
+                        self._church_id, self._stream_offset,
+                    )
 
-                async for raw in ws:
-                    if self._stop_event.is_set():
-                        break
-                    await self._handle_raw(raw)
+                    async for raw in ws:
+                        if self._stop_event.is_set():
+                            break
+                        await self._handle_raw(raw)
 
-        except websockets.ConnectionClosedOK:
-            logger.info("[deepgram] Connection closed cleanly for church %s", self._church_id)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error("[deepgram] Connection error for church %s: %s", self._church_id, e)
-        finally:
-            self._ws = None
-            ready.set()  # unblock start() if we failed before setting it
+            except websockets.ConnectionClosedOK:
+                if self._stop_event.is_set():
+                    break
+                logger.info(
+                    "[deepgram] Connection dropped for church %s — reconnecting (offset was %.1fs)",
+                    self._church_id, self._stream_offset,
+                )
+                self._stream_offset += self._last_audio_end
+                self._ws = None
+                await asyncio.sleep(RECONNECT_DELAY_S)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as e:
+                if self._stop_event.is_set():
+                    break
+                logger.error(
+                    "[deepgram] Connection error for church %s: %s — retrying in %.1fs",
+                    self._church_id, e, RECONNECT_ERROR_S,
+                )
+                self._stream_offset += self._last_audio_end
+                self._ws = None
+                await asyncio.sleep(RECONNECT_ERROR_S)
+
+        self._ws = None
+        if first_connect:
+            ready.set()  # unblock start() if we never successfully connected
 
     async def send(self, pcm16_bytes: bytes):
         if self._ws:
@@ -135,8 +174,13 @@ class DeepgramSession:
             logger.debug("[deepgram] Metadata: %s", msg)
         elif msg_type == "Error":
             logger.error("[deepgram] Server error: %s", msg)
-        elif msg_type in ("UtteranceEnd", "SpeechStarted"):
-            pass  # VAD events — no action needed here
+        elif msg_type == "UtteranceEnd":
+            # Deepgram's VAD fired: speaker stopped after utterance_end_ms of silence.
+            # This is a more reliable "end of thought" signal than our fallback timer.
+            if self._on_utterance_end:
+                await self._on_utterance_end()
+        elif msg_type == "SpeechStarted":
+            pass
 
     async def _handle_transcript(self, msg: dict):
         try:
@@ -146,10 +190,19 @@ class DeepgramSession:
             if not text:
                 return
 
+            # Normalize Deepgram's stream-relative timestamps to sermon-relative seconds.
+            # _stream_offset accumulates the total audio duration of previous connections
+            # so values remain monotonically increasing across reconnects.
+            raw_start: float = msg.get("start", 0.0)
+            duration: float = msg.get("duration", 0.0)
+            audio_start = raw_start + self._stream_offset
+            audio_end   = audio_start + duration
+            self._last_audio_end = audio_end  # advance high-water mark for next reconnect
+
             is_final = msg.get("is_final", False)
             if is_final:
                 logger.debug("[deepgram] FINAL: %s", text)
-                await self._on_final(text)
+                await self._on_final(text, audio_start, audio_end)
             else:
                 await self._on_interim(text)
         except (KeyError, IndexError) as e:

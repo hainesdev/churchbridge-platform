@@ -6,8 +6,9 @@ async def save_verse_detection(session_id: int, segment_ts: int, verse: dict) ->
         cursor = await db.execute(
             """INSERT INTO verse_detections
                (session_id, segment_ts, book, chapter, verse_start, verse_end,
-                reference, spanish_text, canonical_english, confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                reference, spanish_text, canonical_english, confidence,
+                audio_start, audio_end)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 segment_ts,
@@ -19,6 +20,8 @@ async def save_verse_detection(session_id: int, segment_ts: int, verse: dict) ->
                 verse["spanish_text"],
                 verse["canonical_english"],
                 verse.get("confidence", "explicit"),
+                verse.get("audio_start"),
+                verse.get("audio_end"),
             ),
         )
         await db.commit()

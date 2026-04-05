@@ -19,6 +19,10 @@ export interface VerseSuggestion {
   relevance_note: string;
 }
 
+export type SermonMode =
+  | 'scripture' | 'exposition' | 'illustration'
+  | 'application' | 'exhortation' | 'procedural';
+
 export interface Segment {
   id: number;
   spanish: string;
@@ -39,6 +43,7 @@ export interface TranslationFeed {
   verses: VerseDetection[];
   suggestions: VerseSuggestion[];
   activeVerseTs: number | null;
+  sermonMode: SermonMode;
 }
 
 export function useTranslationFeed(churchId: string): TranslationFeed {
@@ -51,6 +56,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   const [verses, setVerses] = useState<VerseDetection[]>([]);
   const [suggestions, setSuggestions] = useState<VerseSuggestion[]>([]);
   const [activeVerseTs, setActiveVerseTs] = useState<number | null>(null);
+  const [sermonMode, setSermonMode] = useState<SermonMode>('exposition');
 
   const partialQueueRef = useRef('');
   const lastInterimTextRef = useRef<string | null>(null);
@@ -75,7 +81,13 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
       ws.onopen = () => setConnected(true);
       ws.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
       ws.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(e.data);
+        } catch {
+          console.warn('[useTranslationFeed] Malformed WebSocket message:', e.data);
+          return;
+        }
 
         if (msg.type === 'interim') {
           setPartialSpanish(msg.text);
@@ -116,9 +128,24 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           setVerses(prev => [...prev, msg.verse]);
           setActiveVerseTs(msg.ts);
 
+        } else if (msg.type === 'verse_range_update') {
+          // Replace the existing verse entry for this book+chapter with the
+          // expanded range as the scratch pad accumulates more detections.
+          setVerses(prev => prev.map(v =>
+            v.book === msg.verse.book && v.chapter === msg.verse.chapter
+              ? msg.verse
+              : v
+          ));
+          setSegments(prev => prev.map(s =>
+            s.id === msg.ts ? { ...s, verseDetected: msg.verse } : s
+          ));
+
         } else if (msg.type === 'verse_suggestion') {
           setSuggestions(msg.suggestions);
           setActiveVerseTs(msg.ts);
+
+        } else if (msg.type === 'mode_change') {
+          setSermonMode(msg.to as SermonMode);
         }
       };
     };
@@ -135,5 +162,6 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     segments, spanishLines, partialSpanish, partialEnglish,
     connected, flashingId,
     verses, suggestions, activeVerseTs,
+    sermonMode,
   };
 }

@@ -162,7 +162,7 @@ class GoogleTranslateService:
         parts = _unwrap(translated)
         current_en = parts[-1] if parts else translated.strip()
 
-        logger.info("[google_translate] Translation: '%s' → '%s'", spanish[:60], current_en[:60])
+        logger.info("[google_translate] Translation: '%s' → '%s'", spanish[:200], current_en[:200])
 
         # Dual-pass correction: update immediately previous segment
         if context and len(parts) >= 2:
