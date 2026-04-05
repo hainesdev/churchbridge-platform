@@ -30,10 +30,14 @@ logger = logging.getLogger(__name__)
 _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ¿¡"])')
 
 # Strips common STT noise artifacts before translation — repeated filler sounds
-# ("AAA", "Mm", "Uh") that slip through Deepgram and would pollute the translation.
+# and stuttered single letters that slip through Deepgram and pollute translation.
 # Applied to the text passed to Google and the sentence buffer; the original
 # raw text is still broadcast as stt_final so the stream display stays unmodified.
-_STT_NOISE = re.compile(r'\b(A{2,}|M{2,}|Uh+|Um+|Eh+)\b', re.IGNORECASE)
+_STT_NOISE = re.compile(
+    r'\b(A{2,}|M{2,}|Uh+|Um+|Eh+|Este+|Eeh+|Mmm+)\b'   # multi-char fillers
+    r'|(?<!\w)(\b\w\b\s+){2,}(?=\b\w{2,}\b)',            # repeated single chars: "a a Cristo"
+    re.IGNORECASE,
+)
 
 
 class ServiceSession:

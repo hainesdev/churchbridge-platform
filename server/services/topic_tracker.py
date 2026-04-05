@@ -76,9 +76,28 @@ class TopicTracker:
         self._current_mode = mode
         self._maybe_schedule_update()
 
+    def set_active_passage(self, reference: str, canonical_english: str) -> None:
+        """Receive an active passage update from LLMEnrichmentService.
+
+        Injects the current scripture reference into the sermon context so
+        subsequent enrichment prompts know what passage is being expounded,
+        even before the next TopicTracker summary fires.
+        """
+        self._active_passage_ref = reference
+        self._active_passage_en = canonical_english
+        logger.debug(
+            "[topic] Active passage updated for church %s: %s",
+            self._church_id, reference,
+        )
+
     def get_context(self) -> str:
         """Return the current context string for injection into the enrichment prompt."""
-        return self._context.to_context_str()
+        ctx = self._context.to_context_str()
+        if getattr(self, "_active_passage_ref", None):
+            ctx = (
+                f"Active scripture: {self._active_passage_ref} — {self._active_passage_en}\n{ctx}"
+            ).strip()
+        return ctx
 
     def get_context_obj(self) -> SermonContext:
         """Return the full structured context object."""

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-MAX_ENRICHMENT_TOKENS = 750
+MAX_ENRICHMENT_TOKENS = 900
 _VALID_SERMON_MODES = frozenset({
     "scripture", "exposition", "illustration", "application", "exhortation", "procedural"
 })
@@ -45,18 +45,46 @@ You are a bilingual (Spanish/English) theological assistant helping a live churc
 
 {glossary_block}
 
-Your job is to analyze one sentence from a live Spanish sermon and return a JSON object with three fields.
+Your job is to analyze one sentence from a live Spanish sermon and return a JSON object with the fields below.
 
 RULES:
 1. Output ONLY valid JSON. No prose, no markdown fences, no code blocks.
-2. improved_translation: provide a better English rendering than the Google Translate output if needed. \
-Preserve the preaching register — declarative, present tense, active voice where natural. \
-If Google's translation is already excellent, return it unchanged. \
-Common Spanish Pentecostal sermon interjections ("Santo", "Aleluya", "Gloria", "Amén") that appear \
-mid-sentence and disrupt grammatical flow should be silently removed from the translation — they are \
-STT artifacts of the preaching register, not content words.
-3. verse_detected: detect a Bible reference if the speaker explicitly announces or clearly quotes one \
-in any of these forms:
+
+2. improved_translation: provide a better English rendering than the Google Translate output if needed.
+   Preserve the preaching register — declarative, present tense, active voice where natural.
+   If Google's translation is already excellent, return it unchanged.
+   Common Spanish Pentecostal sermon interjections ("Santo", "Aleluya", "Gloria", "Amén") that appear
+   mid-sentence and disrupt grammatical flow should be silently removed from the translation — they are
+   STT artifacts of the preaching register, not content words.
+   When [PREVIOUS SENTENCE DISCOURSE] shows thought_complete: false, check whether the current sentence
+   completes that prior thought. If so, unify them naturally in improved_translation rather than
+   treating the current sentence in isolation.
+   When [PREVIOUS SENTENCE DISCOURSE] shows discourse_tag: "rhetorical_question", the current sentence
+   is likely the answer. Keep improved_translation crisp and direct — it answers the previous question.
+   When [PREVIOUS SENTENCE DISCOURSE] shows introduces_quote: true, the current sentence is quoted
+   scripture. Use formal, present-tense, verbatim-cadence register in the translation.
+
+3. discourse_tag: classify the rhetorical function of this sentence. Choose exactly one:
+   - "statement":          a declarative theological claim or exposition ("God is light")
+   - "rhetorical_question": a question the preacher asks but answers themselves ("Who is he?")
+   - "answer_to_question":  a direct answer to the preacher's own question ("Jesus Christ.")
+   - "quote_introduction":  the preacher is about to quote scripture ("Juan dice...", "dice aquí...",
+                             "la Biblia dice...", "como dice en...", "versículo dice...", "leemos que...")
+   - "scripture_quote":     the preacher is reciting or reading Bible text verbatim
+   - "transition":          moving between topics, passages, or sermon sections
+   - "exhortation_appeal":  direct appeal to the congregation ("Come to him", "Do not be afraid")
+
+4. introduces_quote: true if this sentence contains a quote introduction marker such as:
+   "Juan dice", "Pedro dice", "Pablo dice", "dice aquí", "dice la Biblia", "la Biblia dice",
+   "como dice en", "versículo dice", "leemos que", "escrito está", "está escrito".
+   false otherwise.
+
+5. thought_complete: true if this sentence expresses a complete thought on its own.
+   false if it ends mid-clause — a preposition, subordinating conjunction, or relative pronoun
+   with no resolution (e.g. "Porque anoche se acuerdan que él", "Si nosotros decimos que").
+
+6. verse_detected: detect a Bible reference if the speaker explicitly announces or clearly quotes one
+   in any of these forms:
    - Chapter + verse:   "Juan 3:16", "Romanos 8, versículo 28", "Apocalipsis capítulo 1 versículo 5"
    - Chapter-only:      "primera de Juan, capítulo 1", "Salmos capítulo 22", "vamos a Mateo capítulo cinco"
    - Ordinal book ref:  "primera de Juan dice...", "en segunda de Corintios capítulo 5"
@@ -72,30 +100,36 @@ in any of these forms:
      Gálatas = Galatians; Colosenses = Colossians; Filemón = Philemon
    For chapter-only citations: set verse_start=1, verse_end=null, reference="1 John 1", confidence="explicit".
    For clearly quoted verse text: confidence="quoted".
-   IMPORTANT: Do NOT infer a verse citation from standalone theological vocabulary words \
-("Pentecostés", "bautismo", "adoración", "gracia") even if they reference a biblical event or holiday. \
-A valid citation requires an explicit book + chapter/verse announcement, or a clear quotation of \
-specific verse text. The word "Pentecostés" alone is never a citation of Acts 2. \
-Never hallucinate — if uncertain return null.
-4. verse_suggestions: based on the theological theme of this sentence and sermon context, suggest 1–3 \
-related Bible verses the congregation would find meaningful. Use NIV text for canonical_english. \
-NEVER suggest a verse already listed in [ALREADY SUGGESTED] or the current [ACTIVE PASSAGE]. \
-Prefer thematic cross-references over the same book being expounded. Vary suggestions across sentences. \
-Return [] if the sentence is procedural or non-theological.
-5. sermon_mode: classify this sentence into exactly one of these modes:
+   IMPORTANT: Do NOT infer a verse citation from standalone theological vocabulary words
+   ("Pentecostés", "bautismo", "adoración", "gracia") even if they reference a biblical event or holiday.
+   A valid citation requires an explicit book + chapter/verse announcement, or a clear quotation of
+   specific verse text. The word "Pentecostés" alone is never a citation of Acts 2.
+   Never hallucinate — if uncertain return null.
+
+7. verse_suggestions: based on the theological theme of this sentence and sermon context, suggest 1–3
+   related Bible verses the congregation would find meaningful. Use NIV text for canonical_english.
+   NEVER suggest a verse already listed in [ALREADY SUGGESTED] or the current [ACTIVE PASSAGE].
+   Prefer thematic cross-references over the same book being expounded. Vary suggestions across sentences.
+   Return [] if the sentence is procedural or non-theological.
+
+8. sermon_mode: classify this sentence into exactly one of these modes:
    - "scripture":    pastor is directly reading or reciting Bible text verbatim
    - "exposition":   explaining, commenting on, or unpacking a biblical passage
-   - "illustration": personal story, anecdote, analogy, or parable — even if theological \
-vocabulary is present. Use this whenever the speaker shifts to past-tense personal narrative.
+   - "illustration": personal story, anecdote, analogy, or parable — even if theological
+                     vocabulary is present. Use this whenever the speaker shifts to past-tense personal narrative.
    - "application":  applying the text to the congregation's situation or behavior
    - "exhortation":  emotional appeal, motivational call, altar invitation
    - "procedural":   logistics, worship direction, prayer cues (e.g. "please stand", "let us pray")
-6. Use English book names in all references (e.g. "John", "Romans", "Revelation").
-7. Infer chapter/verse from quoted text only when highly confident.
+
+9. Use English book names in all references (e.g. "John", "Romans", "Revelation").
+10. Infer chapter/verse from quoted text only when highly confident.
 
 JSON schema (return exactly this shape):
 {
   "improved_translation": "string",
+  "discourse_tag": "statement" | "rhetorical_question" | "answer_to_question" | "quote_introduction" | "scripture_quote" | "transition" | "exhortation_appeal",
+  "introduces_quote": true | false,
+  "thought_complete": true | false,
   "sermon_mode": "scripture" | "exposition" | "illustration" | "application" | "exhortation" | "procedural",
   "verse_detected": {
     "book": "string",
@@ -135,6 +169,7 @@ def _build_user_message(
     active_passage: dict | None,
     shown_suggestions: set[str],
     current_mode_label: str = "",
+    prev_discourse: dict | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -160,6 +195,17 @@ def _build_user_message(
             lines.append(f"  ES: {sp}")
             lines.append(f"  EN: {en}")
         parts.append("[RECENT SENTENCES — most recent last]\n" + "\n".join(lines))
+
+    if prev_discourse:
+        tag = prev_discourse.get("discourse_tag", "statement")
+        introduces = prev_discourse.get("introduces_quote", False)
+        complete = prev_discourse.get("thought_complete", True)
+        parts.append(
+            f"[PREVIOUS SENTENCE DISCOURSE]\n"
+            f"discourse_tag: {tag}\n"
+            f"introduces_quote: {str(introduces).lower()}\n"
+            f"thought_complete: {str(complete).lower()}"
+        )
 
     parts.append(f"[SOURCE — Spanish original]\n{spanish}")
     parts.append(f"[GOOGLE TRANSLATION — may need improvement]\n{google_english}")
@@ -217,6 +263,8 @@ class LLMEnrichmentService:
         self._active_passage: dict | None = None
         # All references suggested this session — prevents repetition
         self._shown_suggestions: set[str] = set()
+        # Discourse output of the previous enriched sentence — injected as forward context
+        self._prev_discourse: dict | None = None
 
         # Verse scratch pad — accumulates detections for temporal range consolidation
         self._verse_scratch: list[VerseScratchEntry] = []
@@ -250,6 +298,7 @@ class LLMEnrichmentService:
         history = list(self._sentence_history)
         active_passage = self._active_passage
         shown = set(self._shown_suggestions)
+        prev_discourse = self._prev_discourse
         current_mode_label = (
             self._state_tracker.get_context_label() if self._state_tracker else ""
         )
@@ -266,7 +315,7 @@ class LLMEnrichmentService:
 
         user_msg = _build_user_message(
             spanish, google_english, topic_context, history, active_passage, shown,
-            current_mode_label,
+            current_mode_label, prev_discourse,
         )
 
         try:
@@ -302,6 +351,21 @@ class LLMEnrichmentService:
         # API latency; the lock ensures sentence history, active passage, shown
         # suggestions, and mode signals are always updated in arrival order.
         async with self._mutation_lock:
+            # --- Discourse tagging ---
+            discourse_tag = result.get("discourse_tag", "statement")
+            introduces_quote = bool(result.get("introduces_quote", False))
+            thought_complete = bool(result.get("thought_complete", True))
+            logger.info(
+                "[enrichment:%s] Discourse ts=%d: tag=%s introduces_quote=%s complete=%s",
+                self._church_id, ts, discourse_tag, introduces_quote, thought_complete,
+            )
+            # Store for injection into the next sentence's prompt
+            self._prev_discourse = {
+                "discourse_tag": discourse_tag,
+                "introduces_quote": introduces_quote,
+                "thought_complete": thought_complete,
+            }
+
             # --- Sermon mode ---
             sermon_mode = result.get("sermon_mode", "exposition")
             if sermon_mode not in _VALID_SERMON_MODES:
@@ -354,6 +418,9 @@ class LLMEnrichmentService:
                                 "[enrichment:%s] Active passage → %s (was: %s)",
                                 self._church_id, verse["reference"],
                                 prev["reference"] if prev else "none",
+                            )
+                            self._topic_tracker.set_active_passage(
+                                verse["reference"], verse["canonical_english"]
                             )
                     await self._handle_verse_detection(verse, audio_start, audio_end, ts)
                 else:
