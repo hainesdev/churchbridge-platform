@@ -10,6 +10,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Suppress httpx's own request/response logging — it includes the full URL
+# with query-string parameters, which would expose the API key.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # TODO (item 5): Migrate to Google Cloud Translation v3 Advanced for:
 #   - Theological glossary support (force-map terms like Espíritu Santo → Holy Spirit,
 #     gracia → grace, redención → redemption, hermanos → brothers/sisters, etc.)
@@ -180,11 +185,20 @@ class GoogleTranslateService:
         self._context.append((spanish, current_en, ts))
         await self._on_translation(spanish, current_en, ts)
 
+    def _redact(self, text: str) -> str:
+        """Remove the API key from any string before it reaches a log or exception."""
+        return text.replace(self._api_key, "[REDACTED]") if self._api_key else text
+
     async def _call_api(self, html_body: str) -> str:
-        resp = await self._http.post(
-            TRANSLATE_URL,
-            params={"key": self._api_key},
-            json={"q": html_body, "source": "es", "target": "en", "format": "html"},
-        )
-        resp.raise_for_status()
-        return resp.json()["data"]["translations"][0]["translatedText"]
+        try:
+            resp = await self._http.post(
+                TRANSLATE_URL,
+                params={"key": self._api_key},
+                json={"q": html_body, "source": "es", "target": "en", "format": "html"},
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]["translations"][0]["translatedText"]
+        except Exception as e:
+            # Redact before re-raising — httpx error messages include the full
+            # request URL, which contains the key= query parameter.
+            raise RuntimeError(self._redact(str(e))) from None

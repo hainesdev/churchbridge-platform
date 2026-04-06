@@ -17,7 +17,15 @@ UTTERANCE_END_GUARD_S = 1.0 # short hold when UtteranceEnd fires on an incomplet
 # or possessive that makes it clear the speaker hasn't finished the thought yet.
 # Used in both the fallback timer path and the UtteranceEnd soft guard.
 _INCOMPLETE_TAIL = re.compile(
-    r'\b('
+    r'(?:'
+    # Conjunction/preposition + subject pronoun — the verb is missing:
+    # "que él", "pero ella", "y nosotros", "porque yo", "si ellos"
+    r'(?:que|porque|si|aunque|cuando|mientras|como|pero|sino|y|o|ni|de|en|con|por|para|a)'
+    r'\s+(?:él|ella|ellos|ellas|yo|tú|usted|ustedes|nosotros|nosotras|'
+    r'lo|la|los|las|le|les|este|esta|esto|ese|esa|eso|aquel|aquella)'
+    r'|'
+    # Single incomplete-tail word (original patterns)
+    r'\b(?:'
     # subordinating conjunctions
     r'que|porque|cuando|si|aunque|mientras|como|ya\s+que|para\s+que|'
     r'dado\s+que|a\s+menos\s+que|con\s+tal\s+que|'
@@ -31,6 +39,7 @@ _INCOMPLETE_TAIL = re.compile(
     r'el|la|los|las|un|una|unos|unas|'
     # possessives
     r'su|sus|mi|mis|tu|tus|nuestro|nuestra|nuestros|nuestras'
+    r')'
     r')\s*$',
     re.IGNORECASE,
 )

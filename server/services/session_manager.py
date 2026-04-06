@@ -39,10 +39,12 @@ _MIN_SPLIT_WORDS = 5
 # Multi-character filler sounds: "AAA", "Mmm", "Uh", "Um", "Eh", "Este", "Eeh"
 _STT_FILLER = re.compile(r'\b(?:A{2,}|M{2,}|Uh+|Um+|Eh+|Eeh+|Mmm+|Este+)\b', re.IGNORECASE)
 
-# Same single character repeated (stutter): "a a Cristo" → "a Cristo"
-# Only matches when the SAME character appears 2+ times — avoids removing valid
-# Spanish sequences like "y a la fe" (different single-char words).
-_STT_SINGLE_REPEAT = re.compile(r'\b(\w)\s+\1(?:\s+\1)*\b', re.IGNORECASE)
+# Same single character repeated (stutter): "A a Cristo" → "a Cristo"
+# Matches when the SAME character appears 2+ times (case-insensitive).
+# Replacement keeps the LAST instance so "A a" → "a" (the article/preposition,
+# not the filler uppercase "A"). Avoids removing valid Spanish sequences like
+# "y a la fe" (different single-char words in sequence).
+_STT_SINGLE_REPEAT = re.compile(r'\b(\w)(?:\s+\1)+\b', re.IGNORECASE)
 
 # Repeated content word (stutter): "que que" → "que", "el el" → "el"
 # Limited to short words (≤ 5 chars) to avoid collapsing intentional emphasis
@@ -50,20 +52,41 @@ _STT_SINGLE_REPEAT = re.compile(r'\b(\w)\s+\1(?:\s+\1)*\b', re.IGNORECASE)
 # are always noise.
 _STT_WORD_REPEAT = re.compile(r'\b(\w{1,5})\s+\1\b', re.IGNORECASE)
 
-# Pentecostés context normalization: when "Pentecostés" is used as a noun of
-# people or a cultural/denominational reference rather than the biblical feast,
-# rewrite to the appropriate Spanish form before translation so Google and the
-# LLM both see the correct word.
+# Pentecostés context normalization.
+# "Pentecostés" (the biblical feast) vs "Pentecostales" (the people/movement).
+# Two detection strategies — either is sufficient to trigger the rewrite:
+
+# Strategy 1: direct possessive/copula prefix ("los Pentecostés", "somos Pentecostés")
 _PENTECOSTES_PEOPLE = re.compile(
     r'\b(los|las|somos|éramos|eran|son|como|otros|iglesia|pueblo|movimiento|'
     r'hablan|hablar|decimos|dicen)\s+(Pentecostés)\b',
     re.IGNORECASE,
 )
 
+# Strategy 2: discourse context — if the sentence contains narrative/conversational
+# markers alongside "Pentecostés", the preacher is almost certainly referring to
+# Pentecostal people or culture, not the feast day.
+# Matches first-person speech, reported speech, present-day location markers, etc.
+_PENTECOSTES_RE = re.compile(r'\bPentecostés\b', re.IGNORECASE)
+_PENTECOSTES_DISCOURSE = re.compile(
+    r'\b(?:dice|digo|decimos|dicen|dijo|dijeron|'
+    r'viene|vengo|venimos|vienen|'
+    r'anoche|hoy|aquí|ahora|nosotros|'
+    r'somos|éramos|eran|son|'
+    r'hablan|hablar|hablamos|llamamos|llaman|se\s+llaman|'
+    r'yo\s+soy|como\s+nosotros|entre\s+nosotros)\b',
+    re.IGNORECASE,
+)
+
 
 def _normalize_pentecostes(text: str) -> str:
-    """Rewrite 'Pentecostés' to 'Pentecostales' when used as a people/cultural reference."""
-    return _PENTECOSTES_PEOPLE.sub(lambda m: m.group(1) + ' Pentecostales', text)
+    """Rewrite 'Pentecostés' to 'Pentecostales' when context signals people/movement."""
+    # Strategy 1: direct prefix match
+    text = _PENTECOSTES_PEOPLE.sub(lambda m: m.group(1) + ' Pentecostales', text)
+    # Strategy 2: discourse context — if ANY discourse marker co-occurs with Pentecostés
+    if _PENTECOSTES_RE.search(text) and _PENTECOSTES_DISCOURSE.search(text):
+        text = _PENTECOSTES_RE.sub('Pentecostales', text)
+    return text
 
 
 def _clean_stt(text: str) -> str:
@@ -81,7 +104,9 @@ def _clean_stt(text: str) -> str:
     """
     text = _STT_FILLER.sub('', text)
     text = _STT_WORD_REPEAT.sub(r'\1', text)
-    text = _STT_SINGLE_REPEAT.sub(r'\1', text)
+    # Keep the LAST instance of a stuttered single character so "A a Cristo" → "a Cristo"
+    # (the article/preposition "a", not the filler "A").
+    text = _STT_SINGLE_REPEAT.sub(lambda m: m.group(0).split()[-1], text)
     text = _normalize_pentecostes(text)
     return ' '.join(text.split())
 
@@ -240,13 +265,21 @@ class ServiceSession:
     async def _on_final(self, text: str, audio_start: float, audio_end: float):
         logger.info("[session:%s] STT final: %s", self._church_id, text)
         await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
-        # Clean noise artifacts before translation; broadcast keeps the raw text.
+        # Clean noise artifacts before segmentation; broadcast keeps the raw text.
         clean = _clean_stt(text)
         if not clean:
             return
         if self._translation:
             await self._translation.translate_fragment(clean)
         if self._sentence_buffer:
+            # Proactive hold: if this fragment contains a quote introduction, set
+            # a hold BEFORE adding it so the buffer's next timer waits for the
+            # actual quote content to arrive. This covers the case where the intro
+            # and the quote span separate Deepgram finals — the intro accumulates
+            # in the buffer with extra time for the quote to join it.
+            if _QUOTE_INTRO.search(clean):
+                self._sentence_buffer.hold_next("quote_introduction_proactive", hold_secs=4.0)
+                logger.debug("[session:%s] Proactive hold: quote_introduction", self._church_id)
             parts = _split_segments(clean)
             if len(parts) == 1:
                 await self._sentence_buffer.add(clean, audio_start, audio_end)
