@@ -42,12 +42,19 @@ class SentenceBuffer:
     Primary flush signals (in priority order):
     1. Terminal punctuation at end of combined text (. ? ! … ;)
     2. utterance_end() called by the session when Deepgram fires UtteranceEnd —
-       the VAD detected the speaker stopped; flush whatever is buffered.
+       applies an incomplete-tail soft guard first; flushes if tail looks complete.
     3. Accumulated word count reaches MAX_WORDS (safety valve)
     4. Fallback timer (FLUSH_DELAY_S) with incomplete-tail guard:
        if the accumulated text ends with a preposition/conjunction/article that
-       signals an incomplete clause, the timer is extended once (FLUSH_DELAY_EXTENDED_S)
-       before flushing unconditionally.
+       signals an incomplete clause, the timer is extended up to MAX_EXTENSIONS times.
+
+    Discourse-based holds
+    ---------------------
+    The session can call hold_next(reason, secs) after flushing a sentence that
+    introduced a quote or asked a rhetorical question. The next delayed flush will
+    wait an extra hold_secs before triggering, giving the continuation time to arrive.
+    This is also used as a feedback loop from LLM enrichment: when thought_complete
+    is false for sentence N, hold_next is called so sentence N+1 accumulates longer.
 
     Audio timing
     ------------
@@ -64,9 +71,25 @@ class SentenceBuffer:
         self._parts: list[str] = []
         self._timer: asyncio.Task | None = None
         self._extension_count: int = 0  # number of timer extensions granted so far
+        # Extra hold requested by the session for the next delayed flush
+        self._hold_secs: float = 0.0
+        self._hold_reason: str = ""
         # Sermon-relative audio span of the current accumulated sentence
         self._audio_start: float | None = None
         self._audio_end: float = 0.0
+
+    def hold_next(self, reason: str, hold_secs: float = 3.0) -> None:
+        """Request an extended delay before the next sentence is flushed.
+
+        Called by the session when the just-flushed sentence introduced a quote,
+        asked a rhetorical question, or was flagged incomplete by the LLM.
+        The next timer-based flush will sleep an extra hold_secs before triggering.
+        Multiple calls keep the maximum, not the sum — one hold at a time.
+        Has no effect on punctuation-triggered or UtteranceEnd flushes.
+        """
+        self._hold_secs = max(self._hold_secs, hold_secs)
+        self._hold_reason = reason
+        logger.debug("[sentence_buffer] Hold queued: %s (%.1fs)", reason, hold_secs)
 
     async def add(self, text: str, audio_start: float = 0.0, audio_end: float = 0.0):
         self._cancel_timer()
@@ -137,12 +160,23 @@ class SentenceBuffer:
         return stripped[-1] in SENTENCE_ENDINGS or len(stripped.split()) >= MAX_WORDS
 
     async def _delayed_flush(self):
-        """Fallback timer flush. Extends up to MAX_EXTENSIONS times when the tail
-        looks like an incomplete clause. Each extension gives the speaker another
-        FLUSH_DELAY_EXTENDED_S to complete the thought before we flush anyway.
+        """Fallback timer flush. Consumes any pending discourse hold first, then
+        extends up to MAX_EXTENSIONS times when the tail looks incomplete.
         """
+        # Consume hold — set by the session after a quote intro or rhetorical question
+        hold = self._hold_secs
+        hold_reason = self._hold_reason
+        self._hold_secs = 0.0
+        self._hold_reason = ""
+        effective_delay = FLUSH_DELAY_S + hold
+
         try:
-            await asyncio.sleep(FLUSH_DELAY_S)
+            if hold > 0:
+                logger.debug(
+                    "[sentence_buffer] Discourse hold %.1fs (%s): %s",
+                    hold, hold_reason, ' '.join(self._parts)[:60],
+                )
+            await asyncio.sleep(effective_delay)
             if not self._parts:
                 return
             combined = ' '.join(self._parts)
@@ -186,6 +220,9 @@ class SentenceBuffer:
             self._audio_start = None
             self._audio_end = 0.0
             self._extension_count = 0
+            # Do not reset _hold_secs/_hold_reason here — they are set by the session
+            # AFTER _on_sentence returns, in response to the content of the sentence
+            # just flushed. Resetting them here would clear them before they can be used.
             logger.debug("[sentence_buffer] Flushing: %s", sentence[:60])
             await self._on_sentence(sentence, audio_start, audio_end)
 

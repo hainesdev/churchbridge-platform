@@ -155,7 +155,10 @@ JSON schema (return exactly this shape):
 def _build_system_prompt(church_terms: dict[str, str]) -> str:
     if church_terms:
         lines = "\n".join(f"  {es} → {en}" for es, en in church_terms.items())
-        glossary_block = f"THEOLOGICAL GLOSSARY — always use these exact translations:\n{lines}"
+        glossary_block = (
+            "THEOLOGICAL GLOSSARY — prefer these translations, adapting grammatical form "
+            "and number to match the context (e.g. singular/plural, noun/adjective):\n" + lines
+        )
     else:
         glossary_block = ""
     return _SYSTEM_PROMPT_BASE.replace("{glossary_block}", glossary_block)
@@ -237,7 +240,8 @@ class LLMEnrichmentService:
         on_verse_range_update: Callable[[int, dict], Awaitable[None]],
         on_verse_suggestion: Callable[[int, list[dict]], Awaitable[None]],
         on_enrichment_settled: Callable[[int], Awaitable[None]],
-        session_id: int,
+        on_buffer_hold: Callable[[str, float], Awaitable[None]] | None = None,
+        session_id: int = 0,
         state_tracker: "SermonStateTracker | None" = None,
     ):
         self._church_id = church_id
@@ -248,6 +252,7 @@ class LLMEnrichmentService:
         self._on_verse_range_update = on_verse_range_update
         self._on_verse_suggestion = on_verse_suggestion
         self._on_enrichment_settled = on_enrichment_settled
+        self._on_buffer_hold = on_buffer_hold
         self._session_id = session_id
         self._system_prompt = _build_system_prompt(church_terms)
         self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -365,6 +370,24 @@ class LLMEnrichmentService:
                 "introduces_quote": introduces_quote,
                 "thought_complete": thought_complete,
             }
+
+            # Feedback hold: if this sentence was incomplete, ask the buffer to
+            # hold the next sentence longer so its continuation can accumulate.
+            # This is a forward correction — it can't un-flush the current sentence
+            # but prevents the same pattern from repeating on the next boundary.
+            if not thought_complete and self._on_buffer_hold:
+                try:
+                    await self._on_buffer_hold("incomplete_thought", 3.5)
+                except Exception as e:
+                    logger.warning("[enrichment:%s] on_buffer_hold failed: %s", self._church_id, e)
+
+            # Also hold for quote introductions detected by the LLM (catches cases
+            # the synchronous regex in _on_sentence may have missed).
+            if introduces_quote and self._on_buffer_hold:
+                try:
+                    await self._on_buffer_hold("quote_introduction_llm", 4.0)
+                except Exception as e:
+                    logger.warning("[enrichment:%s] on_buffer_hold (quote) failed: %s", self._church_id, e)
 
             # --- Sermon mode ---
             sermon_mode = result.get("sermon_mode", "exposition")

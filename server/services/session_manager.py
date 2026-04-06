@@ -34,7 +34,7 @@ _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ¿¡"])')
 # "¿Quién es él? Jesucristo." stays as one entry rather than splitting off the answer.
 _MIN_SPLIT_WORDS = 5
 
-# --- STT noise cleanup (applied before translation; raw text is still broadcast) ---
+# --- STT noise cleanup (applied before segmentation; raw text is still broadcast) ---
 
 # Multi-character filler sounds: "AAA", "Mmm", "Uh", "Um", "Eh", "Este", "Eeh"
 _STT_FILLER = re.compile(r'\b(?:A{2,}|M{2,}|Uh+|Um+|Eh+|Eeh+|Mmm+|Este+)\b', re.IGNORECASE)
@@ -44,21 +44,67 @@ _STT_FILLER = re.compile(r'\b(?:A{2,}|M{2,}|Uh+|Um+|Eh+|Eeh+|Mmm+|Este+)\b', re.
 # Spanish sequences like "y a la fe" (different single-char words).
 _STT_SINGLE_REPEAT = re.compile(r'\b(\w)\s+\1(?:\s+\1)*\b', re.IGNORECASE)
 
+# Repeated content word (stutter): "que que" → "que", "el el" → "el"
+# Limited to short words (≤ 5 chars) to avoid collapsing intentional emphasis
+# like "muy muy" (very very) in longer words — but short function word repeats
+# are always noise.
+_STT_WORD_REPEAT = re.compile(r'\b(\w{1,5})\s+\1\b', re.IGNORECASE)
+
+# Pentecostés context normalization: when "Pentecostés" is used as a noun of
+# people or a cultural/denominational reference rather than the biblical feast,
+# rewrite to the appropriate Spanish form before translation so Google and the
+# LLM both see the correct word.
+_PENTECOSTES_PEOPLE = re.compile(
+    r'\b(los|las|somos|éramos|eran|son|como|otros|iglesia|pueblo|movimiento|'
+    r'hablan|hablar|decimos|dicen)\s+(Pentecostés)\b',
+    re.IGNORECASE,
+)
+
+
+def _normalize_pentecostes(text: str) -> str:
+    """Rewrite 'Pentecostés' to 'Pentecostales' when used as a people/cultural reference."""
+    return _PENTECOSTES_PEOPLE.sub(lambda m: m.group(1) + ' Pentecostales', text)
+
 
 def _clean_stt(text: str) -> str:
-    """Normalize STT output before translation and sentence buffering.
+    """Normalize STT output before segmentation, translation, and buffering.
 
-    Three passes, each targeted:
-    1. Remove filler sounds (AAA, Uh, Mmm, Este...).
-    2. Collapse same-character stutters ("a a Cristo" → "a Cristo").
-    3. Normalize internal whitespace introduced by removals.
+    Applied in order, each pass targeted:
+    1. Remove multi-char filler sounds (AAA, Uh, Mmm, Este...).
+    2. Collapse repeated short function words ("que que" → "que").
+    3. Collapse same-character stutters ("a a Cristo" → "a Cristo").
+    4. Context-aware Pentecostés normalization.
+    5. Normalize internal whitespace.
 
-    The original raw text is still broadcast as stt_final; this cleaned version
-    is what reaches Google Translate and the SentenceBuffer.
+    The original raw text is still broadcast as stt_final so the operator stream
+    is unmodified; only the pipeline-facing text is cleaned.
     """
     text = _STT_FILLER.sub('', text)
+    text = _STT_WORD_REPEAT.sub(r'\1', text)
     text = _STT_SINGLE_REPEAT.sub(r'\1', text)
+    text = _normalize_pentecostes(text)
     return ' '.join(text.split())
+
+
+# --- Discourse-based buffer hold detection ---
+# Applied synchronously in _on_sentence (after flush, before the next fragment
+# arrives) so there is no race with LLM enrichment timing.
+
+# Quote introductions: the next sentence is almost certainly scripture text.
+_QUOTE_INTRO = re.compile(
+    r'\b(?:'
+    r'(?:Juan|Pedro|Pablo|Jesús|Dios|David|Moisés|el\s+Señor|la\s+Biblia|'
+    r'la\s+Palabra|el\s+versículo|el\s+apóstol)\s+dic[ei]'
+    r'|dice\s+(?:aquí|ahí|la\s+Biblia|la\s+Palabra)'
+    r'|como\s+dice\s+en'
+    r'|leemos\s+que'
+    r'|está\s+escrito'
+    r'|escrito\s+está'
+    r'|la\s+Biblia\s+dice'
+    r'|la\s+Palabra\s+dice'
+    r')',
+    re.IGNORECASE,
+)
 
 
 def _split_segments(text: str) -> list[str]:
@@ -139,6 +185,7 @@ class ServiceSession:
             on_verse_range_update=self._on_verse_range_update,
             on_verse_suggestion=self._on_verse_suggestion,
             on_enrichment_settled=self._on_enrichment_settled,
+            on_buffer_hold=self._on_buffer_hold,
             session_id=self._db_session_id,
             state_tracker=self._state_tracker,
         )
@@ -221,6 +268,23 @@ class ServiceSession:
         if self._topic_tracker:
             mode = self._state_tracker.settled_mode if self._state_tracker else "exposition"
             self._topic_tracker.add_segment(text, mode=mode)
+
+        # Discourse-based holds — applied synchronously here (no LLM wait, no race).
+        # We analyse the just-flushed Spanish text and ask the buffer to extend its
+        # timer for the next sentence if we can predict what kind of content follows.
+        if self._sentence_buffer:
+            stripped = text.rstrip()
+            if _QUOTE_INTRO.search(text):
+                # The preacher just introduced a quotation. The next sentence is
+                # almost certainly scripture — give it extra time to arrive in full.
+                self._sentence_buffer.hold_next("quote_introduction", hold_secs=4.0)
+                logger.debug("[session:%s] Hold set: quote_introduction", self._church_id)
+            elif stripped.endswith('?'):
+                # Rhetorical question — the preacher will likely answer it immediately.
+                # Hold briefly so the answer arrives before we flush the question.
+                self._sentence_buffer.hold_next("rhetorical_question", hold_secs=2.0)
+                logger.debug("[session:%s] Hold set: rhetorical_question", self._church_id)
+
         if self._translation:
             self._pending_audio_timing[ts] = (audio_start, audio_end)
             # Prune entries older than 120s — these belong to sentences whose
@@ -267,6 +331,21 @@ class ServiceSession:
         await self._broadcast({"type": "correction", "ts": ts, "english": english})
 
     # --- LLM Enrichment callbacks ---
+
+    async def _on_buffer_hold(self, reason: str, hold_secs: float):
+        """LLM enrichment signals that the previous sentence was incomplete.
+
+        Called when thought_complete=false — the buffer should hold the next
+        sentence longer, giving the speaker's continuation more time to arrive
+        and accumulate before flushing. This is a forward correction: it can't
+        un-flush the incomplete sentence, but it prevents the same pattern from
+        cascading into the next sentence boundary.
+        """
+        if self._sentence_buffer:
+            self._sentence_buffer.hold_next(reason, hold_secs)
+            logger.info(
+                "[session:%s] Buffer hold from enrichment: %s (%.1fs)", self._church_id, reason, hold_secs
+            )
 
     async def _on_translation_update(self, ts: int, english: str):
         """LLM-improved translation; replaces the Google translation on the display."""
