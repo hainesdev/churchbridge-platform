@@ -66,18 +66,20 @@ class DeepgramSession:
 
     async def _run(self, glossary: dict[str, int], sample_rate: int, ready: asyncio.Event):
         params: list[tuple[str, str]] = [
-            ("model",            "nova-2"),
+            ("model",            "nova-3"),
             ("language",         "es"),
             ("encoding",         "linear16"),
             ("sample_rate",      str(sample_rate)),
             ("channels",         "1"),
             ("interim_results",  "true"),
-            ("utterance_end_ms", "1500"),
+            ("utterance_end_ms", "2000"),
             ("vad_events",       "true"),
             ("smart_format",     "true"),
+            ("punctuate",        "true"),
         ]
-        for term, boost in glossary.items():
-            params.append(("keywords", f"{term}:{boost}"))
+        # nova-3 uses keyterms (term only, no boost value); keywords is deprecated
+        for term in glossary:
+            params.append(("keyterms", term))
 
         url = f"{DEEPGRAM_WS_URL}?{urlencode(params)}"
         api_key = os.environ["DEEPGRAM_API_KEY"]
@@ -88,8 +90,8 @@ class DeepgramSession:
                 async with websockets.connect(
                     url,
                     additional_headers={"Authorization": f"Token {api_key}"},
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=10,
+                    ping_timeout=5,
                 ) as ws:
                     self._ws = ws
                     if first_connect:
