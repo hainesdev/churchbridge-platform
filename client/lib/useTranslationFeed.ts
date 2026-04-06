@@ -23,11 +23,20 @@ export type SermonMode =
   | 'scripture' | 'exposition' | 'illustration'
   | 'application' | 'exhortation' | 'procedural';
 
+export type TranslationRegister = 'scripture' | 'expository' | 'narrative' | 'exhortation';
+
 export interface Segment {
   id: number;
   spanish: string;
   english: string;
   verseDetected?: VerseDetection;
+  // TODO: use register to pull exact verse text once Bible versions are stored
+  register?: TranslationRegister;
+  paragraphBreak?: boolean;
+  sourceQuality?: 'clean' | 'noisy' | 'fragmented';
+  /** True while the segment is pending a merge or deferred translation release.
+   *  Set by segment_metadata when display_ready=false; cleared on translation_update or caption_merge. */
+  pendingCompletion?: boolean;
 }
 
 const PARTIAL_FLUSH_MS = 80;
@@ -115,8 +124,11 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
 
         } else if (msg.type === 'correction' || msg.type === 'translation_update') {
           // Both events update a committed segment's English text and flash it.
-          // translation_update is the LLM-improved version; correction is Google's dual-pass.
-          setSegments(prev => prev.map(s => s.id === msg.ts ? { ...s, english: msg.english } : s));
+          // translation_update is the LLM-improved version (or deferred release); correction is Google's dual-pass.
+          // Clear pendingCompletion — the segment is now finalised.
+          setSegments(prev => prev.map(s =>
+            s.id === msg.ts ? { ...s, english: msg.english, pendingCompletion: false } : s
+          ));
           setFlashingId(msg.ts);
           if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
           flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
@@ -143,6 +155,33 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
         } else if (msg.type === 'verse_suggestion') {
           setSuggestions(msg.suggestions);
           setActiveVerseTs(msg.ts);
+
+        } else if (msg.type === 'caption_merge') {
+          // Remove the absorbed segment and update the kept segment with merged content.
+          // Clear pendingCompletion on the kept segment — it is now the merged final caption.
+          setSegments(prev => {
+            const filtered = prev.filter(s => s.id !== (msg.ts_absorb as number));
+            return filtered.map(s =>
+              s.id === msg.ts_keep
+                ? { ...s, spanish: msg.spanish as string, english: msg.english as string, pendingCompletion: false }
+                : s
+            );
+          });
+
+        } else if (msg.type === 'segment_metadata') {
+          // Update a segment with scaffolding fields.
+          // pendingCompletion drives visual dimming until merge or deferred release fires.
+          setSegments(prev => prev.map(s =>
+            s.id === msg.ts
+              ? {
+                  ...s,
+                  register: msg.translation_register as TranslationRegister | undefined,
+                  paragraphBreak: msg.paragraph_break as boolean | undefined,
+                  sourceQuality: msg.source_quality as 'clean' | 'noisy' | 'fragmented' | undefined,
+                  pendingCompletion: msg.pending_completion as boolean | undefined,
+                }
+              : s
+          ));
 
         } else if (msg.type === 'mode_change') {
           setSermonMode(msg.to as SermonMode);

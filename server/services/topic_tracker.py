@@ -29,15 +29,27 @@ class SermonContext:
     current_mode: str = "exposition"      # current settled sermon mode
     key_themes: list[str] = field(default_factory=list)  # ["fellowship", "walking in light"]
     illustration_subject: str | None = None  # set only when mode == "illustration"
+    sermon_arc: str = ""                  # where we are in the sermon arc (e.g. "opening", "climax")
+    rhetorical_goal: str = ""             # what the preacher is trying to achieve right now
 
     def to_context_str(self) -> str:
         """Format for injection into the enrichment LLM prompt."""
         if self.illustration_subject:
             header = f"[ILLUSTRATION IN PROGRESS] {self.illustration_subject}"
             themes = f"Key themes: {', '.join(self.key_themes)}." if self.key_themes else ""
-            return f"{header}\n{themes}".strip()
+            arc_goal = ""
+            if self.sermon_arc:
+                arc_goal += f" Arc: {self.sermon_arc}."
+            if self.rhetorical_goal:
+                arc_goal += f" Goal: {self.rhetorical_goal}."
+            return f"{header}\n{themes}{arc_goal}".strip()
         themes = f" Key themes: {', '.join(self.key_themes)}." if self.key_themes else ""
-        return f"{self.summary}{themes}".strip()
+        arc_goal = ""
+        if self.sermon_arc:
+            arc_goal += f" Arc: {self.sermon_arc}."
+        if self.rhetorical_goal:
+            arc_goal += f" Goal: {self.rhetorical_goal}."
+        return f"{self.summary}{themes}{arc_goal}".strip()
 
 
 class TopicTracker:
@@ -64,6 +76,8 @@ class TopicTracker:
         self._context = SermonContext(
             summary=sermon_topic.strip(),
             current_mode="exposition",
+            sermon_arc="",
+            rhetorical_goal="",
         )
         self._session_start: float = time.monotonic()
         self._last_summary_time: float = 0.0
@@ -131,7 +145,7 @@ class TopicTracker:
         try:
             response = await self._client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=200,
+                max_tokens=300,
                 temperature=0,
                 system=(
                     "You summarize live Spanish sermon transcripts for a simultaneous interpreter. "
@@ -145,10 +159,16 @@ class TopicTracker:
                             f"- summary: 2-3 sentences on theological themes and current direction\n"
                             f"- key_themes: array of 2-4 short theme strings\n"
                             f"- illustration_subject: if the pastor is currently telling a personal "
-                            f"story or analogy, describe it in one sentence; otherwise null\n\n"
+                            f"story or analogy, describe it in one sentence; otherwise null\n"
+                            f"- sermon_arc: where the sermon is in its arc — one of: "
+                            f'"opening", "development", "climax", "application", "closing", "altar_call"\n'
+                            f"- rhetorical_goal: one sentence describing what the preacher is trying "
+                            f"to accomplish right now (e.g. 'establishing biblical authority for the main claim', "
+                            f"'moving congregation toward repentance', 'illustrating grace with a personal story')\n\n"
                             f"JSON schema: "
                             f'{{ "summary": "string", "key_themes": ["string"], '
-                            f'"illustration_subject": "string | null" }}\n\n'
+                            f'"illustration_subject": "string | null", '
+                            f'"sermon_arc": "string", "rhetorical_goal": "string" }}\n\n'
                             f"Transcript:{topic_hint}{mode_hint}\n{recent_text}"
                         ),
                     }
@@ -165,6 +185,8 @@ class TopicTracker:
                 current_mode=self._current_mode,
                 key_themes=parsed.get("key_themes", []),
                 illustration_subject=parsed.get("illustration_subject") or None,
+                sermon_arc=parsed.get("sermon_arc", ""),
+                rhetorical_goal=parsed.get("rhetorical_goal", ""),
             )
             self._context = new_context
             logger.info(

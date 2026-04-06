@@ -6,11 +6,13 @@ from typing import Callable, Awaitable
 logger = logging.getLogger(__name__)
 
 SENTENCE_ENDINGS = frozenset('.?!…;')
-MAX_WORDS = 40
+MAX_WORDS = 40              # at this word count, route through timer (completeness check still applies)
+ABSOLUTE_MAX_WORDS = 60     # unconditional flush — true last resort, no completeness check
+MIN_FLUSH_WORDS = 4         # below this word count, timer/UtteranceEnd extends instead of flushing
 FLUSH_DELAY_S = 3.5         # fallback timer: flush if no new fragment for this long
 FLUSH_DELAY_EXTENDED_S = 2.0  # each extension granted when tail looks incomplete
-MAX_EXTENSIONS = 2          # maximum timer extensions before flushing unconditionally
-UTTERANCE_END_GUARD_S = 1.0 # short hold when UtteranceEnd fires on an incomplete tail
+MAX_EXTENSIONS = 8          # hard cap on timer extensions (~19.5s total hold); MAX_WORDS is the other escape
+UTTERANCE_END_GUARD_S = 1.5 # hold when UtteranceEnd fires on an incomplete tail
 
 # Spanish words that, when they end the accumulated text, signal an incomplete
 # clause — a preposition, subordinating conjunction, article, relative pronoun,
@@ -38,11 +40,36 @@ _INCOMPLETE_TAIL = re.compile(
     # articles
     r'el|la|los|las|un|una|unos|unas|'
     # possessives
-    r'su|sus|mi|mis|tu|tus|nuestro|nuestra|nuestros|nuestras'
+    r'su|sus|mi|mis|tu|tus|nuestro|nuestra|nuestros|nuestras|'
+    # dangling copula/auxiliary — predicate object or complement not yet delivered
+    r'es|está|están|son|era|eran|fue|fueron|hay|había'
     r')'
     r')\s*$',
     re.IGNORECASE,
 )
+
+
+def _is_incomplete(text: str) -> bool:
+    """Return True if the text should not be flushed on a timer or UtteranceEnd yet.
+
+    Checks four conditions:
+    1. Too few words to be a meaningful standalone sentence (< MIN_FLUSH_WORDS).
+    2. Ends with a trailing comma — speaker is mid-list or mid-clause.
+    3. Ends with a clause-opening word (preposition, conjunction, article, dangling verb).
+    4. Contains an unclosed interrogative: ¿ opened but no ? following it.
+    """
+    stripped = text.strip()
+    if len(stripped.split()) < MIN_FLUSH_WORDS:
+        return True
+    # Trailing comma is always mid-thought: "Pero ella no entendía que yo hacía conferencias,"
+    if stripped.endswith(','):
+        return True
+    if _INCOMPLETE_TAIL.search(text):
+        return True
+    # Unclosed interrogative — a ¿ was opened but the sentence never closed with ?
+    if re.search(r'¿[^?]*$', text):
+        return True
+    return False
 
 
 class SentenceBuffer:
@@ -86,6 +113,9 @@ class SentenceBuffer:
         # Sermon-relative audio span of the current accumulated sentence
         self._audio_start: float | None = None
         self._audio_end: float = 0.0
+        # Metrics
+        self.structural_flush_block_count: int = 0  # times incomplete guard blocked a flush
+        self.forced_release_count: int = 0          # times ABSOLUTE_MAX_WORDS forced a flush
 
     def hold_next(self, reason: str, hold_secs: float = 3.0) -> None:
         """Request an extended delay before the next sentence is flushed.
@@ -110,7 +140,7 @@ class SentenceBuffer:
 
         combined = ' '.join(self._parts)
         if self._should_flush(combined):
-            await self._flush()
+            await self._flush("immediate_flush")
         else:
             self._timer = asyncio.create_task(self._delayed_flush())
 
@@ -119,40 +149,46 @@ class SentenceBuffer:
 
         UtteranceEnd is the strongest "speaker stopped" signal we have, but
         preachers frequently pause mid-clause for emphasis. If the accumulated
-        text ends with a clear incomplete-clause marker, we grant one short hold
-        (UTTERANCE_END_GUARD_S) to allow the next Deepgram final to arrive and
-        complete the thought. If the tail looks complete — or the guard has
-        already fired once — we flush unconditionally.
+        text is incomplete, always apply the guard — regardless of how many
+        extensions have already fired. Only flush immediately when the text is
+        structurally complete.
         """
         self._cancel_timer()
         if not self._parts:
             return
         combined = ' '.join(self._parts)
-        if self._extension_count == 0 and _INCOMPLETE_TAIL.search(combined):
+        if _is_incomplete(combined) and self._extension_count < MAX_EXTENSIONS:
             logger.debug(
-                "[sentence_buffer] UtteranceEnd soft guard — incomplete tail: %s", combined[:60]
+                "[sentence_buffer] UtteranceEnd soft guard — incomplete (ext %d): %s",
+                self._extension_count, combined[:60],
             )
             self._extension_count += 1
             self._timer = asyncio.create_task(self._utterance_end_guard())
         else:
-            logger.debug("[sentence_buffer] UtteranceEnd flush: %s", combined[:60])
-            await self._flush()
+            await self._flush("utterance_end")
 
     async def _utterance_end_guard(self):
         """Short hold after UtteranceEnd on an incomplete tail.
 
-        Waits UTTERANCE_END_GUARD_S for the next Deepgram final. If a new
-        fragment arrives (via add()), this task is cancelled and the buffer
-        continues normally. If nothing arrives, we flush unconditionally.
+        Waits UTTERANCE_END_GUARD_S for the next Deepgram final. If new content
+        arrives (via add()), this task is cancelled and the buffer continues
+        normally. If nothing arrives and the text is still incomplete, extend
+        again (up to MAX_EXTENSIONS). Only flush once the text is complete or
+        the hard cap is reached.
         """
         try:
             await asyncio.sleep(UTTERANCE_END_GUARD_S)
             if self._parts:
-                logger.debug(
-                    "[sentence_buffer] UtteranceEnd guard expired — flushing: %s",
-                    ' '.join(self._parts)[:60],
-                )
-                await self._flush()
+                combined = ' '.join(self._parts)
+                if _is_incomplete(combined) and self._extension_count < MAX_EXTENSIONS:
+                    logger.debug(
+                        "[sentence_buffer] UtteranceEnd guard re-extended (ext %d): %s",
+                        self._extension_count, combined[:60],
+                    )
+                    self._extension_count += 1
+                    self._timer = asyncio.create_task(self._utterance_end_guard())
+                else:
+                    await self._flush("utterance_end_guard")
         except asyncio.CancelledError:
             pass
 
@@ -160,13 +196,23 @@ class SentenceBuffer:
         """Flush any remaining buffered text on session close."""
         self._cancel_timer()
         if self._parts:
-            await self._flush()
+            await self._flush("session_close")
 
     def _should_flush(self, text: str) -> bool:
         stripped = text.strip()
         if not stripped:
             return False
-        return stripped[-1] in SENTENCE_ENDINGS or len(stripped.split()) >= MAX_WORDS
+        # Terminal punctuation: speaker explicitly ended the thought — always flush.
+        if stripped[-1] in SENTENCE_ENDINGS:
+            return True
+        # Absolute safety valve: unconditional flush at ABSOLUTE_MAX_WORDS regardless
+        # of completeness, to prevent runaway buffers.
+        if len(stripped.split()) >= ABSOLUTE_MAX_WORDS:
+            self.forced_release_count += 1
+            return True
+        # Between MAX_WORDS and ABSOLUTE_MAX_WORDS: don't flush immediately — let the
+        # timer fire so _is_incomplete() can gate the flush.
+        return False
 
     async def _delayed_flush(self):
         """Fallback timer flush. Consumes any pending discourse hold first, then
@@ -189,15 +235,16 @@ class SentenceBuffer:
             if not self._parts:
                 return
             combined = ' '.join(self._parts)
-            if self._extension_count < MAX_EXTENSIONS and _INCOMPLETE_TAIL.search(combined):
+            if self._extension_count < MAX_EXTENSIONS and _is_incomplete(combined):
                 self._extension_count += 1
+                self.structural_flush_block_count += 1
                 logger.debug(
                     "[sentence_buffer] Incomplete tail (extension %d/%d): %s",
                     self._extension_count, MAX_EXTENSIONS, combined[:60],
                 )
                 self._timer = asyncio.create_task(self._extended_flush())
             else:
-                await self._flush()
+                await self._flush("buffer_timer")
         except asyncio.CancelledError:
             pass
 
@@ -207,19 +254,20 @@ class SentenceBuffer:
             await asyncio.sleep(FLUSH_DELAY_EXTENDED_S)
             if self._parts:
                 combined = ' '.join(self._parts)
-                if self._extension_count < MAX_EXTENSIONS and _INCOMPLETE_TAIL.search(combined):
+                if self._extension_count < MAX_EXTENSIONS and _is_incomplete(combined):
                     self._extension_count += 1
+                    self.structural_flush_block_count += 1
                     logger.debug(
                         "[sentence_buffer] Incomplete tail (extension %d/%d): %s",
                         self._extension_count, MAX_EXTENSIONS, combined[:60],
                     )
                     self._timer = asyncio.create_task(self._extended_flush())
                 else:
-                    await self._flush()
+                    await self._flush("buffer_timer")
         except asyncio.CancelledError:
             pass
 
-    async def _flush(self):
+    async def _flush(self, reason: str = "unknown"):
         self._cancel_timer()
         if self._parts:
             sentence = ' '.join(self._parts)
@@ -232,7 +280,10 @@ class SentenceBuffer:
             # Do not reset _hold_secs/_hold_reason here — they are set by the session
             # AFTER _on_sentence returns, in response to the content of the sentence
             # just flushed. Resetting them here would clear them before they can be used.
-            logger.debug("[sentence_buffer] Flushing: %s", sentence[:60])
+            logger.info(
+                "[sentence_buffer] decision=%s words=%d text=%s",
+                reason, len(sentence.split()), sentence[:80],
+            )
             await self._on_sentence(sentence, audio_start, audio_end)
 
     def _cancel_timer(self):

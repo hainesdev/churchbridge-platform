@@ -70,7 +70,9 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
               initial={{ opacity: 0 }}
               animate={{ opacity: 1, transition: { duration: 0.3 } }}
               exit={{ opacity: 0, transition: { duration: 0.2 } }}
-              className="bg-black/70 px-4 py-2 rounded text-white text-2xl font-medium"
+              className={`bg-black/70 px-4 py-2 rounded text-2xl font-medium transition-opacity duration-300 ${
+                s.pendingCompletion ? 'text-white/50 italic' : 'text-white'
+              }`}
             >
               {s.english}
             </motion.div>
@@ -133,8 +135,12 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                 >
                   <p className="text-3xl font-semibold leading-snug">{s.spanish}</p>
                   <div className="flex items-baseline gap-3">
-                    <p className={`text-lg text-blue-300 leading-snug transition-colors duration-500 ${
-                      flashingId === s.id ? 'text-blue-100' : ''
+                    <p className={`text-lg leading-snug transition-all duration-500 ${
+                      s.pendingCompletion
+                        ? 'text-blue-300/50 italic'
+                        : flashingId === s.id
+                          ? 'text-blue-100'
+                          : 'text-blue-300'
                     }`}>{s.english}</p>
                     {s.verseDetected && (
                       <span className="text-amber-400 text-xs font-mono shrink-0">
@@ -177,8 +183,12 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                 className="space-y-1"
               >
                 <div className="flex items-baseline gap-3">
-                  <p className={`text-3xl font-semibold leading-snug transition-colors duration-[600ms] ${
-                    flashingId === s.id ? 'text-blue-200' : ''
+                  <p className={`text-3xl font-semibold leading-snug transition-all duration-[600ms] ${
+                    s.pendingCompletion
+                      ? 'text-white/40 italic'
+                      : flashingId === s.id
+                        ? 'text-blue-200'
+                        : ''
                   }`}>
                     {s.english}
                   </p>

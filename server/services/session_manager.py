@@ -52,6 +52,24 @@ _STT_SINGLE_REPEAT = re.compile(r'\b(\w)(?:\s+\1)+\b', re.IGNORECASE)
 # are always noise.
 _STT_WORD_REPEAT = re.compile(r'\b(\w{1,5})\s+\1\b', re.IGNORECASE)
 
+# "Santo" as STT noise: preaching-register exclamation misclassified as sentence start.
+# Patterns: "Santo tú...", "Santo él...", "Santo ella..." etc.
+# PRESERVE: "Espíritu Santo", "Padre Santo", "Dios Santo" — noun-adjective order is fine
+# because we only strip when "Santo" PRECEDES a personal pronoun.
+_STT_SANTO_PRONOUN = re.compile(
+    r'\bSanto\b\s+(?=(?:tú|él|ella|yo|usted|nosotros|nosotras|ellos|ellas|'
+    r'me|te|se|lo|la|le|les|nos)\b)',
+    re.IGNORECASE,
+)
+# "Santo" at the very start of a fragment when followed by content that is
+# clearly not a predicate of "Santo" (i.e. it's a noise prefix).
+# NOT stripped when followed by theological noun phrases like "Espíritu", "Padre", etc.
+_STT_SANTO_INITIAL = re.compile(
+    r'^Santo\s+(?!(?:Espíritu|Padre|Hijo|Tomás|Domingo|de\s+los|de\s+las|es\b|'
+    r'y\s+justo|y\s+poderoso|señor|dios))',
+    re.IGNORECASE,
+)
+
 # Pentecostés context normalization.
 # "Pentecostés" (the biblical feast) vs "Pentecostales" (the people/movement).
 # Two detection strategies — either is sufficient to trigger the rewrite:
@@ -96,8 +114,9 @@ def _clean_stt(text: str) -> str:
     1. Remove multi-char filler sounds (AAA, Uh, Mmm, Este...).
     2. Collapse repeated short function words ("que que" → "que").
     3. Collapse same-character stutters ("a a Cristo" → "a Cristo").
-    4. Context-aware Pentecostés normalization.
-    5. Normalize internal whitespace.
+    4. Remove "Santo" when used as sentence-initial noise before a pronoun.
+    5. Context-aware Pentecostés normalization.
+    6. Normalize internal whitespace.
 
     The original raw text is still broadcast as stt_final so the operator stream
     is unmodified; only the pipeline-facing text is cleaned.
@@ -107,6 +126,11 @@ def _clean_stt(text: str) -> str:
     # Keep the LAST instance of a stuttered single character so "A a Cristo" → "a Cristo"
     # (the article/preposition "a", not the filler "A").
     text = _STT_SINGLE_REPEAT.sub(lambda m: m.group(0).split()[-1], text)
+    # Strip "Santo" when it appears as STT noise before a personal pronoun
+    # ("Santo tú transmites" → "tú transmites") or as a bare sentence-initial exclamation.
+    # Must come before Pentecostés normalization so whitespace is clean.
+    text = _STT_SANTO_PRONOUN.sub('', text)
+    text = _STT_SANTO_INITIAL.sub('', text)
     text = _normalize_pentecostes(text)
     return ' '.join(text.split())
 
@@ -145,7 +169,9 @@ def _split_segments(text: str) -> list[str]:
         return parts
     merged: list[str] = [parts[0]]
     for part in parts[1:]:
-        if len(part.split()) < _MIN_SPLIT_WORDS:
+        # A part that opens its own question (¿) is a distinct interrogative — never
+        # merge it back even if it is short, to avoid nonsensical question chains.
+        if len(part.split()) < _MIN_SPLIT_WORDS and not part.lstrip().startswith('¿'):
             # Short answer or fragment — attach to the preceding sentence.
             merged[-1] = merged[-1] + ' ' + part
         else:
@@ -211,6 +237,8 @@ class ServiceSession:
             on_verse_suggestion=self._on_verse_suggestion,
             on_enrichment_settled=self._on_enrichment_settled,
             on_buffer_hold=self._on_buffer_hold,
+            on_caption_merge=self._on_caption_merge,
+            on_segment_metadata=self._on_segment_metadata,
             session_id=self._db_session_id,
             state_tracker=self._state_tracker,
         )
@@ -405,6 +433,38 @@ class ServiceSession:
             self._church_id, ts, [s["reference"] for s in suggestions],
         )
         await self._broadcast({"type": "verse_suggestion", "ts": ts, "suggestions": suggestions})
+
+    async def _on_caption_merge(self, absorb_ts: int, keep_ts: int, merged_spanish: str, merged_english: str):
+        """LLM signals that two segments should be merged into one display caption.
+
+        The chain is head-anchored: keep_ts is always the earliest visible segment
+        (the anchor); absorb_ts is the fragment being folded into it.
+        Broadcasts caption_merge so the client removes ts_absorb and updates ts_keep.
+        """
+        logger.info(
+            "[session:%s] Caption merge: keep=%d absorbs=%d",
+            self._church_id, keep_ts, absorb_ts,
+        )
+        await self._broadcast({
+            "type": "caption_merge",
+            "ts_keep": keep_ts,
+            "ts_absorb": absorb_ts,
+            "spanish": merged_spanish,
+            "english": merged_english,
+        })
+
+    async def _on_segment_metadata(self, ts: int, metadata: dict):
+        """Broadcast scaffolding metadata for a committed segment.
+
+        Carries translation_register, paragraph_break, and source_quality.
+        The frontend stores these for future display logic (e.g. register will
+        drive exact Bible verse text lookup once Bible versions are stored).
+        """
+        await self._broadcast({
+            "type": "segment_metadata",
+            "ts": ts,
+            **metadata,
+        })
 
     async def _on_mode_change(self, old_mode: str, new_mode: str, ts: int):
         """Fired when the settled sermon mode transitions."""

@@ -18,7 +18,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-MAX_ENRICHMENT_TOKENS = 900
+MAX_ENRICHMENT_TOKENS = 1100
+DEFERRED_RELEASE_S = 6.0    # seconds to wait before releasing a suppressed translation if no merge
 _VALID_SERMON_MODES = frozenset({
     "scripture", "exposition", "illustration", "application", "exhortation", "procedural"
 })
@@ -106,12 +107,6 @@ RULES:
    specific verse text. The word "Pentecostés" alone is never a citation of Acts 2.
    Never hallucinate — if uncertain return null.
 
-7. verse_suggestions: based on the theological theme of this sentence and sermon context, suggest 1–3
-   related Bible verses the congregation would find meaningful. Use NIV text for canonical_english.
-   NEVER suggest a verse already listed in [ALREADY SUGGESTED] or the current [ACTIVE PASSAGE].
-   Prefer thematic cross-references over the same book being expounded. Vary suggestions across sentences.
-   Return [] if the sentence is procedural or non-theological.
-
 8. sermon_mode: classify this sentence into exactly one of these modes:
    - "scripture":    pastor is directly reading or reciting Bible text verbatim
    - "exposition":   explaining, commenting on, or unpacking a biblical passage
@@ -124,13 +119,78 @@ RULES:
 9. Use English book names in all references (e.g. "John", "Romans", "Revelation").
 10. Infer chapter/verse from quoted text only when highly confident.
 
+11. continuation_required: true if the speaker's thought clearly requires more text to complete —
+    stronger and more forward-looking than thought_complete.
+    true: sentence ends mid-argument, introduces a list without completing it, ends with a
+    conjunction or subject pronoun that sets up a predicate not yet delivered
+    (e.g. "Porque anoche se acuerdan que él", "Si nosotros decimos que", "Y la razón es").
+    false: sentence is a complete unit, even if brief.
+
+12. merge_with_previous: true if this sentence should be combined with the immediately
+    preceding sentence into a single display caption. Any one criterion is sufficient:
+    - discourse_tag is "answer_to_question" AND previous was "rhetorical_question"
+    - discourse_tag is "scripture_quote" AND previous was "quote_introduction"
+    - previous [PREVIOUS SENTENCE DISCOURSE] had continuation_required: true AND
+      this sentence continues or resolves that incomplete thought
+    - previous [PREVIOUS SENTENCE DISCOURSE] had source_quality: "fragmented" AND
+      this sentence grammatically continues it (open clause, dangling copula, incomplete list)
+    - this sentence's source_quality is "fragmented" AND it attaches to the previous
+    - this sentence grammatically completes a dangling predicate from the previous sentence,
+      regardless of whether the previous call set continuation_required: true —
+      misclassification on the prior call is possible; judge structural continuation
+      from the Spanish text independently.
+      Examples: previous "Tiene peso, tiene significado, es" → current completes the predicate
+                previous "¿Cuántos de ustedes, los hermanos que" → current closes the question
+    - previous [PREVIOUS SENTENCE DISCOURSE] had display_ready: false AND this sentence
+      clearly resolves or continues the prior thought
+    All other cases → false.
+    When true, you MUST write improved_translation as a fluent English rendering of the COMPLETE
+    merged unit — the [PREVIOUS SENTENCE — PENDING MERGE] text PLUS the current sentence,
+    treated as a single utterance. Do not translate only the current sentence.
+    Example: if previous was "Tiene peso, tiene significado, es" and current is "el amor de Dios",
+    improved_translation must render "It has weight, it has meaning — it is the love of God."
+    The previous sentence's translation was suppressed awaiting this merge.
+
+13. paragraph_break: true if this sentence opens a new major section, topic shift, or
+    rhetorical phase. Triggers a visual separator on the display.
+    true: shift from exposition to illustration, new scripture passage announced,
+    transition from teaching to altar call, return from illustration to main point.
+    false: continues the current rhetorical thread.
+
+14. source_quality: assess the apparent quality of the input Spanish text:
+    "clean":      normal sermon speech, no obvious STT artifacts
+    "noisy":      contains apparent repetitions, garbled tokens, or incomplete phonemes
+    "fragmented": clearly an incomplete utterance, a mid-word cut, or structurally broken
+
+15. translation_register: the rendering register appropriate for this sentence:
+    "scripture":   verbatim Bible text — formal, present tense, liturgical cadence
+    "expository":  teaching or explanation — clear, accessible, present tense
+    "narrative":   personal story or illustration — past tense, conversational
+    "exhortation": direct appeal to the congregation — imperative, energetic
+
+16. display_ready: the authoritative emission control signal for this sentence.
+    Set to false when ANY of the following apply:
+    - thought_complete is false
+    - continuation_required is true
+    - source_quality is "fragmented"
+    - discourse_tag is "quote_introduction" (the quoted content has not arrived yet)
+    Set to true only when ALL of the above are absent.
+    When false, the translation is suppressed until a merge arrives or a fallback timeout fires.
+    Be accurate — this drives whether the caption appears on screen.
+
 JSON schema (return exactly this shape):
 {
   "improved_translation": "string",
   "discourse_tag": "statement" | "rhetorical_question" | "answer_to_question" | "quote_introduction" | "scripture_quote" | "transition" | "exhortation_appeal",
   "introduces_quote": true | false,
   "thought_complete": true | false,
+  "continuation_required": true | false,
+  "merge_with_previous": true | false,
+  "paragraph_break": true | false,
+  "source_quality": "clean" | "noisy" | "fragmented",
+  "translation_register": "scripture" | "expository" | "narrative" | "exhortation",
   "sermon_mode": "scripture" | "exposition" | "illustration" | "application" | "exhortation" | "procedural",
+  "display_ready": true | false,
   "verse_detected": {
     "book": "string",
     "chapter": integer,
@@ -140,16 +200,77 @@ JSON schema (return exactly this shape):
     "canonical_english": "string",
     "reference": "string",
     "confidence": "explicit" | "quoted"
-  } | null,
-  "verse_suggestions": [
-    {
-      "reference": "string",
-      "canonical_english": "string",
-      "relevance_note": "string"
-    }
-  ]
+  } | null
 }\
 """
+
+
+_VERSE_SUGGESTIONS_SYSTEM = """\
+You are a biblical reference assistant for a live Spanish sermon translation system.
+Given a sentence from a sermon, suggest 1-3 specifically relevant Bible verses for the congregation.
+
+STRICT RULES:
+- Return ONLY valid JSON: {"suggestions": [...]}. No prose, no markdown fences, no code blocks.
+- Return {"suggestions": []} for: procedural, transitional, logistical, or rhetorical filler sentences.
+- Return {"suggestions": []} for sentences with source_quality "fragmented" or "noisy".
+- Return {"suggestions": []} when the theological content is generic or no cross-reference adds real value.
+- NEVER suggest a verse in [ALREADY SUGGESTED] or matching [ACTIVE PASSAGE].
+- Prefer thematic cross-references over repeating the same book being expounded.
+- Each suggestion must be a SPECIFIC verse or short range, not a chapter or book.
+- Only suggest when you are confident the verse meaningfully illuminates THIS sentence.
+- Use NIV text for canonical_english.
+
+JSON schema: {"suggestions": [{"reference": "string", "canonical_english": "string", "relevance_note": "string"}]}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Translation normalization — applied post-LLM to improve natural English phrasing.
+# These are domain-specific substitutions that the LLM frequently gets wrong in a
+# live sermon context (e.g. "transmit" is technically correct for "transmitir" but
+# sounds robotic; "share" is the natural preaching-register equivalent).
+# ---------------------------------------------------------------------------
+_TRANSLATION_NORMALIZATION: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'\btransmit\b', re.IGNORECASE), 'share'),
+    (re.compile(r'\btransmits\b', re.IGNORECASE), 'shares'),
+    (re.compile(r'\btransmitting\b', re.IGNORECASE), 'sharing'),
+    (re.compile(r'\btransmitted\b', re.IGNORECASE), 'shared'),
+    (re.compile(r'\btransmission\b', re.IGNORECASE), 'sharing'),
+]
+
+
+def _normalize_translation(text: str) -> str:
+    """Apply domain normalization to an English translation for natural sermon register."""
+    for pattern, replacement in _TRANSLATION_NORMALIZATION:
+        # Preserve original case for sentence-initial words
+        def _replace(m: re.Match, repl: str = replacement) -> str:
+            orig = m.group(0)
+            if orig[0].isupper():
+                return repl[0].upper() + repl[1:]
+            return repl
+        text = pattern.sub(_replace, text)
+    return text
+
+
+def _translation_deviation_score(google: str, improved: str) -> float:
+    """Word-level Jaccard similarity between two translations.
+
+    Returns 0.0 (completely different) to 1.0 (identical).
+    Used to detect when LLM reconstruction diverges too far from the Google
+    baseline for noisy source text, flagging a reconstruction risk.
+    """
+    g_words = set(google.lower().split())
+    i_words = set(improved.lower().split())
+    if not g_words and not i_words:
+        return 1.0
+    union = g_words | i_words
+    intersection = g_words & i_words
+    return len(intersection) / len(union)
+
+
+# Threshold below which an improved translation is considered to diverge
+# significantly from the Google baseline when source_quality is "noisy".
+_RECONSTRUCTION_RISK_THRESHOLD = 0.35
 
 
 def _build_system_prompt(church_terms: dict[str, str]) -> str:
@@ -203,12 +324,29 @@ def _build_user_message(
         tag = prev_discourse.get("discourse_tag", "statement")
         introduces = prev_discourse.get("introduces_quote", False)
         complete = prev_discourse.get("thought_complete", True)
+        continuation = prev_discourse.get("continuation_required", False)
+        quality = prev_discourse.get("source_quality", "clean")
+        ready = prev_discourse.get("display_ready", True)
         parts.append(
             f"[PREVIOUS SENTENCE DISCOURSE]\n"
             f"discourse_tag: {tag}\n"
             f"introduces_quote: {str(introduces).lower()}\n"
-            f"thought_complete: {str(complete).lower()}"
+            f"thought_complete: {str(complete).lower()}\n"
+            f"continuation_required: {str(continuation).lower()}\n"
+            f"source_quality: {quality}\n"
+            f"display_ready: {str(ready).lower()}"
         )
+        # When the previous sentence was held (not display_ready), inject its text
+        # prominently so the model can write a correct merged improved_translation.
+        if not ready and sentence_history:
+            prev_sp, prev_en = sentence_history[-1]
+            parts.append(
+                f"[PREVIOUS SENTENCE — PENDING MERGE]\n"
+                f"  ES: {prev_sp}\n"
+                f"  EN: {prev_en}\n"
+                f"If merge_with_previous is true, improved_translation MUST cover both "
+                f"this previous sentence AND the current sentence as one complete unit."
+            )
 
     parts.append(f"[SOURCE — Spanish original]\n{spanish}")
     parts.append(f"[GOOGLE TRANSLATION — may need improvement]\n{google_english}")
@@ -241,6 +379,8 @@ class LLMEnrichmentService:
         on_verse_suggestion: Callable[[int, list[dict]], Awaitable[None]],
         on_enrichment_settled: Callable[[int], Awaitable[None]],
         on_buffer_hold: Callable[[str, float], Awaitable[None]] | None = None,
+        on_caption_merge: Callable[[int, int, str, str], Awaitable[None]] | None = None,
+        on_segment_metadata: Callable[[int, dict], Awaitable[None]] | None = None,
         session_id: int = 0,
         state_tracker: "SermonStateTracker | None" = None,
     ):
@@ -253,6 +393,8 @@ class LLMEnrichmentService:
         self._on_verse_suggestion = on_verse_suggestion
         self._on_enrichment_settled = on_enrichment_settled
         self._on_buffer_hold = on_buffer_hold
+        self._on_caption_merge = on_caption_merge
+        self._on_segment_metadata = on_segment_metadata
         self._session_id = session_id
         self._system_prompt = _build_system_prompt(church_terms)
         self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -262,17 +404,44 @@ class LLMEnrichmentService:
         # active passage, shown suggestions, or sermon mode signals.
         self._mutation_lock = asyncio.Lock()
 
-        # Rolling sentence context (last 3 sentences, Spanish + best English)
-        self._sentence_history: deque[tuple[str, str]] = deque(maxlen=3)
+        # Rolling sentence context (last 5 sentences, Spanish + best English)
+        self._sentence_history: deque[tuple[str, str]] = deque(maxlen=5)
         # Most recent explicit verse citation — injected into every subsequent prompt
         self._active_passage: dict | None = None
         # All references suggested this session — prevents repetition
         self._shown_suggestions: set[str] = set()
         # Discourse output of the previous enriched sentence — injected as forward context
         self._prev_discourse: dict | None = None
+        # Timestamp of the previously enriched sentence — used for caption_merge targeting
+        self._prev_sentence_ts: int | None = None
+        # Deferred translation updates: ts → (english, asyncio.Task)
+        # When display_ready is false, translation_update is held pending merge or timeout.
+        self._deferred_updates: dict[int, tuple[str, asyncio.Task]] = {}
+        # Chain-aware merge. Anchored to the EARLIEST visible segment so the caption
+        # stays at a stable screen position as fragments accumulate.
+        # {
+        #   "head_ts": int,   # oldest visible segment (ts_keep in every merge)
+        #   "tail_ts": int,   # most recently absorbed fragment (used to detect chain extension)
+        #   "spanish": str,   # full accumulated chain Spanish
+        #   "length": int,
+        # }
+        self._merge_chain_head: dict | None = None
 
         # Verse scratch pad — accumulates detections for temporal range consolidation
         self._verse_scratch: list[VerseScratchEntry] = []
+
+        # Metrics counters — accessible for logging/monitoring
+        self.metrics: dict[str, int] = {
+            "noisy_input_detected": 0,
+            "reconstruction_risk": 0,
+            "structural_flush_block": 0,
+            "forced_release": 0,
+            "verse_suggestion_triggered": 0,
+            "verse_suggestion_gated": 0,
+            "parse_retry_success": 0,
+            "parse_failed": 0,
+            "merge_chain_max_length": 0,
+        }
 
     def enrich(
         self,
@@ -341,11 +510,30 @@ class LLMEnrichmentService:
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
 
+        result = None
         try:
             result = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning("[enrichment:%s] Could not parse JSON for ts=%d: %.120s", self._church_id, ts, raw)
-            return
+            # Retry: extract first {...} JSON block from the response
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
+            if m:
+                try:
+                    result = json.loads(m.group(0))
+                    async with self._mutation_lock:
+                        self.metrics["parse_retry_success"] += 1
+                    logger.info(
+                        "[enrichment:%s] JSON extracted via retry for ts=%d", self._church_id, ts
+                    )
+                except json.JSONDecodeError:
+                    pass
+            if result is None:
+                async with self._mutation_lock:
+                    self.metrics["parse_failed"] += 1
+                logger.warning(
+                    "[enrichment:%s] Could not parse JSON for ts=%d: %.120s",
+                    self._church_id, ts, raw,
+                )
+                return
 
         if not isinstance(result, dict):
             logger.warning("[enrichment:%s] Expected JSON object for ts=%d, got %s", self._church_id, ts, type(result).__name__)
@@ -360,26 +548,68 @@ class LLMEnrichmentService:
             discourse_tag = result.get("discourse_tag", "statement")
             introduces_quote = bool(result.get("introduces_quote", False))
             thought_complete = bool(result.get("thought_complete", True))
+            continuation_required = bool(result.get("continuation_required", False))
+            merge_with_previous = bool(result.get("merge_with_previous", False))
+            paragraph_break = bool(result.get("paragraph_break", False))
+            source_quality = result.get("source_quality", "clean")
+            if source_quality not in ("clean", "noisy", "fragmented"):
+                source_quality = "clean"
+            translation_register = result.get("translation_register", "expository")
+            if translation_register not in ("scripture", "expository", "narrative", "exhortation"):
+                translation_register = "expository"
+
+            # display_ready: always computed deterministically from the structural signals.
+            # The LLM's field is read but can only make it MORE restrictive (false), never relax it.
+            # This prevents cases where the LLM returns display_ready=true despite
+            # continuation_required=true or source_quality="fragmented".
+            display_ready = (
+                thought_complete
+                and not continuation_required
+                and source_quality != "fragmented"
+                and discourse_tag != "quote_introduction"
+            )
+            display_ready_from_llm = result.get("display_ready")
+            if isinstance(display_ready_from_llm, bool) and not display_ready_from_llm:
+                # LLM says not ready even though heuristic says ready — trust the LLM restriction
+                display_ready = False
+
             logger.info(
-                "[enrichment:%s] Discourse ts=%d: tag=%s introduces_quote=%s complete=%s",
-                self._church_id, ts, discourse_tag, introduces_quote, thought_complete,
+                "[enrichment:%s] Discourse ts=%d: tag=%s introduces_quote=%s "
+                "complete=%s continuation=%s merge=%s break=%s quality=%s "
+                "register=%s display_ready=%s",
+                self._church_id, ts, discourse_tag, introduces_quote,
+                thought_complete, continuation_required, merge_with_previous,
+                paragraph_break, source_quality, translation_register, display_ready,
             )
             # Store for injection into the next sentence's prompt
             self._prev_discourse = {
                 "discourse_tag": discourse_tag,
                 "introduces_quote": introduces_quote,
                 "thought_complete": thought_complete,
+                "continuation_required": continuation_required,
+                "source_quality": source_quality,
+                "display_ready": display_ready,
             }
 
             # Feedback hold: if this sentence was incomplete, ask the buffer to
             # hold the next sentence longer so its continuation can accumulate.
-            # This is a forward correction — it can't un-flush the current sentence
-            # but prevents the same pattern from repeating on the next boundary.
-            if not thought_complete and self._on_buffer_hold:
+            # continuation_required takes precedence (stronger signal); fall back
+            # to thought_complete. This is a forward correction — it can't un-flush
+            # the current sentence but prevents the same pattern on the next boundary.
+            if (continuation_required or not thought_complete) and self._on_buffer_hold:
+                hold_secs = 4.5 if continuation_required else 3.5
+                reason = "continuation_required" if continuation_required else "incomplete_thought"
                 try:
-                    await self._on_buffer_hold("incomplete_thought", 3.5)
+                    await self._on_buffer_hold(reason, hold_secs)
                 except Exception as e:
                     logger.warning("[enrichment:%s] on_buffer_hold failed: %s", self._church_id, e)
+
+            # Hold longer when audio is fragmented — the speaker may have been cut mid-word.
+            if source_quality == "fragmented" and self._on_buffer_hold:
+                try:
+                    await self._on_buffer_hold("fragmented_audio", 3.0)
+                except Exception as e:
+                    logger.warning("[enrichment:%s] on_buffer_hold (fragmented) failed: %s", self._church_id, e)
 
             # Also hold for quote introductions detected by the LLM (catches cases
             # the synchronous regex in _on_sentence may have missed).
@@ -397,29 +627,187 @@ class LLMEnrichmentService:
             if self._state_tracker:
                 await self._state_tracker.add_signal(sermon_mode, ts)
 
+            # Track noisy input
+            if source_quality == "noisy":
+                self.metrics["noisy_input_detected"] += 1
+
             # --- Translation improvement ---
             improved = result.get("improved_translation", "").strip()
-            if improved and improved != google_english:
-                logger.info(
-                    "[enrichment:%s] Translation improved ts=%d:\n  google: %s\n     llm: %s",
-                    self._church_id, ts, google_english[:80], improved[:80],
-                )
-                try:
-                    await self._on_translation_update(ts, improved)
-                except Exception as e:
-                    logger.warning("[enrichment:%s] on_translation_update failed: %s", self._church_id, e)
-            else:
-                logger.info("[enrichment:%s] Translation accepted ts=%d — no change", self._church_id, ts)
+            # Apply domain normalization for natural sermon English ("transmit" → "share", etc.)
+            if improved:
+                improved = _normalize_translation(improved)
 
-            # Signal settled in both cases so the correction guard fires correctly
+            # Reconstruction risk guard: if source is noisy and the LLM's translation
+            # diverges significantly from the Google baseline, the LLM may have hallucinated
+            # meaning. In that case, fall back to the Google translation to be conservative.
+            reconstruction_risk = False
+            if source_quality == "noisy" and improved and improved != google_english:
+                deviation = _translation_deviation_score(google_english, improved)
+                if deviation < _RECONSTRUCTION_RISK_THRESHOLD:
+                    reconstruction_risk = True
+                    self.metrics["reconstruction_risk"] += 1
+                    logger.warning(
+                        "[enrichment:%s] reconstruction_risk=true ts=%d "
+                        "deviation_score=%.2f\n  google: %s\n     llm: %s",
+                        self._church_id, ts, deviation,
+                        google_english[:80], improved[:80],
+                    )
+                    # Fall back to Google to avoid emitting hallucinated content.
+                    # The noisy flag will also suppress this sentence until a merge.
+                    improved = google_english
+
+            best_english = improved if (improved and improved != google_english) else google_english
+            # Apply normalization to the final best_english so the domain map is
+            # always applied regardless of whether the LLM improved the translation.
+            best_english = _normalize_translation(best_english)
+
+            if display_ready:
+                # Sentence is finalised — emit translation update immediately.
+                if improved and improved != google_english:
+                    logger.info(
+                        "[enrichment:%s] decision=immediate_translation_update ts=%d:\n"
+                        "  google: %s\n     llm: %s",
+                        self._church_id, ts, google_english[:80], improved[:80],
+                    )
+                    try:
+                        await self._on_translation_update(ts, improved)
+                    except Exception as e:
+                        logger.warning("[enrichment:%s] on_translation_update failed: %s", self._church_id, e)
+                else:
+                    logger.info(
+                        "[enrichment:%s] decision=immediate_translation_update ts=%d — no change",
+                        self._church_id, ts,
+                    )
+            else:
+                # Sentence is not display_ready — suppress translation update and defer.
+                # The deferred release fires after DEFERRED_RELEASE_S if no merge arrives.
+                defer_task = asyncio.create_task(
+                    self._deferred_translation_release(ts, best_english, google_english)
+                )
+                self._deferred_updates[ts] = (best_english, defer_task)
+                logger.info(
+                    "[enrichment:%s] decision=suppressed_translation_update ts=%d "
+                    "(display_ready=false continuation=%s quality=%s)",
+                    self._church_id, ts, continuation_required, source_quality,
+                )
+
+            # Signal enrichment settled immediately in all cases so Google correction guard fires.
             try:
                 await self._on_enrichment_settled(ts)
             except Exception as e:
                 logger.warning("[enrichment:%s] on_enrichment_settled failed: %s", self._church_id, e)
 
             # Append to sentence history using the best available translation
-            best_english = improved if (improved and improved != google_english) else google_english
             self._sentence_history.append((spanish, best_english))
+
+            # --- Caption merge (head-anchored chain) ---
+            # The chain is always anchored to the EARLIEST visible segment (head_ts = ts_keep).
+            # Every subsequent fragment is absorbed INTO the head so the caption stays at a
+            # stable screen position as the chain grows.
+            #
+            # on_caption_merge(absorb_ts, keep_ts, ...) → ts_absorb=absorb_ts, ts_keep=keep_ts
+            prev_ts = self._prev_sentence_ts
+            if merge_with_previous and prev_ts is not None and self._on_caption_merge:
+                hist = list(self._sentence_history)
+
+                chain = self._merge_chain_head
+                if chain is not None and prev_ts == chain["tail_ts"]:
+                    # Extending an active chain — absorb current ts into the head anchor.
+                    chain_spanish = chain["spanish"] + " " + spanish
+                    chain_len = chain["length"] + 1
+                    head_ts = chain["head_ts"]
+
+                    # Cancel deferred update for the fragment being absorbed (current ts).
+                    if ts in self._deferred_updates:
+                        _, dt = self._deferred_updates.pop(ts)
+                        dt.cancel()
+                        logger.info(
+                            "[enrichment:%s] decision=merge_cancelled_deferred_update absorbed=%d",
+                            self._church_id, ts,
+                        )
+
+                    self._merge_chain_head = {
+                        "head_ts": head_ts,
+                        "tail_ts": ts,
+                        "spanish": chain_spanish,
+                        "length": chain_len,
+                    }
+                    if chain_len > self.metrics["merge_chain_max_length"]:
+                        self.metrics["merge_chain_max_length"] = chain_len
+                    logger.info(
+                        "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
+                        "chain_len=%d",
+                        self._church_id, ts, head_ts, chain_len,
+                    )
+                    try:
+                        await self._on_caption_merge(ts, head_ts, chain_spanish, best_english)
+                    except Exception as e:
+                        logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+
+                else:
+                    # Starting a new chain — prev_ts becomes the head anchor; current ts absorbed.
+                    prev_spanish = hist[-2][0] if len(hist) >= 2 else spanish
+                    chain_spanish = prev_spanish + " " + spanish
+
+                    # Cancel deferreds for both the head (prev_ts) and the absorbed sentence (ts).
+                    for cancel_ts in (prev_ts, ts):
+                        if cancel_ts in self._deferred_updates:
+                            _, dt = self._deferred_updates.pop(cancel_ts)
+                            dt.cancel()
+                            logger.info(
+                                "[enrichment:%s] decision=merge_cancelled_deferred_update "
+                                "cancelled=%d",
+                                self._church_id, cancel_ts,
+                            )
+
+                    self._merge_chain_head = {
+                        "head_ts": prev_ts,
+                        "tail_ts": ts,
+                        "spanish": chain_spanish,
+                        "length": 2,
+                    }
+                    logger.info(
+                        "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
+                        "chain_len=2",
+                        self._church_id, ts, prev_ts,
+                    )
+                    try:
+                        await self._on_caption_merge(ts, prev_ts, chain_spanish, best_english)
+                    except Exception as e:
+                        logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+
+            else:
+                # No merge — reset chain.
+                if self._merge_chain_head is not None:
+                    logger.debug(
+                        "[enrichment:%s] Chain closed at ts=%d (display_ready=%s, merge=%s)",
+                        self._church_id, ts, display_ready, merge_with_previous,
+                    )
+                self._merge_chain_head = None
+
+            # --- Segment metadata ---
+            # pending_completion signals that this segment may be updated or merged.
+            # The client can dim/italicise it until a translation_update or caption_merge arrives.
+            pending_completion = not display_ready
+            if self._on_segment_metadata:
+                metadata = {
+                    "translation_register": translation_register,
+                    "paragraph_break": paragraph_break,
+                    "source_quality": source_quality,
+                    "pending_completion": pending_completion,
+                }
+                try:
+                    await self._on_segment_metadata(ts, metadata)
+                except Exception as e:
+                    logger.warning("[enrichment:%s] on_segment_metadata failed: %s", self._church_id, e)
+
+            # Advance prev_sentence_ts for the next enrichment's merge targeting
+            self._prev_sentence_ts = ts
+
+            # --- Verse suggestions (scheduled outside mutation lock) ---
+            # Capture context snapshots now while under the lock.
+            _vs_active = self._active_passage
+            _vs_shown = set(self._shown_suggestions)
 
             # --- Verse detection ---
             verse = result.get("verse_detected")
@@ -455,52 +843,30 @@ class LLMEnrichmentService:
             else:
                 logger.info("[enrichment:%s] No verse detected ts=%d", self._church_id, ts)
 
-            # --- Verse suggestions ---
-            suggestions = result.get("verse_suggestions", [])
-            if isinstance(suggestions, list):
-                # Gate: suppress suggestions during narrative/exhortation/procedural modes
-                if self._state_tracker and not self._should_suggest():
-                    logger.info(
-                        "[enrichment:%s] Suggestions suppressed ts=%d — mode=%s",
-                        self._church_id, ts, self._state_tracker.settled_mode,
-                    )
-                    suggestions = []
-
-                active_ref = (self._active_passage or {}).get("reference")
-                valid = []
-                suppressed = []
-                for s in suggestions:
-                    if not _is_valid_suggestion(s):
-                        continue
-                    if s["reference"] in self._shown_suggestions:
-                        suppressed.append((s["reference"], "already shown"))
-                    elif s["reference"] == active_ref:
-                        suppressed.append((s["reference"], "active passage"))
-                    else:
-                        valid.append(s)
-
-                if suppressed:
-                    logger.debug(
-                        "[enrichment:%s] Suggestions suppressed ts=%d: %s",
-                        self._church_id, ts,
-                        ", ".join(f"{ref} ({reason})" for ref, reason in suppressed),
-                    )
-
-                if valid:
-                    for s in valid:
-                        self._shown_suggestions.add(s["reference"])
-                    logger.info(
-                        "[enrichment:%s] Verse suggestions ts=%d: %s",
-                        self._church_id, ts,
-                        [(s["reference"], s["relevance_note"][:50]) for s in valid],
-                    )
-                    try:
-                        await self._on_verse_suggestion(ts, valid)
-                        await save_verse_suggestions(self._session_id, ts, valid)
-                    except Exception as e:
-                        logger.warning("[enrichment:%s] on_verse_suggestion failed: %s", self._church_id, e)
-                else:
-                    logger.info("[enrichment:%s] No verse suggestions ts=%d", self._church_id, ts)
+        # --- Verse suggestions (separate async call, outside mutation lock) ---
+        # Runs as a fire-and-forget task so it cannot delay structural decisions.
+        # Uses only the context snapshots captured inside the lock above.
+        _suggest_eligible = (
+            self._should_suggest()
+            and display_ready
+            and self._should_generate_verse_suggestions(
+                spanish, source_quality, discourse_tag, _vs_active
+            )
+        )
+        async with self._mutation_lock:
+            if _suggest_eligible:
+                self.metrics["verse_suggestion_triggered"] += 1
+            else:
+                self.metrics["verse_suggestion_gated"] += 1
+        if _suggest_eligible:
+            suggest_task = asyncio.create_task(
+                self._run_verse_suggestions(
+                    spanish, google_english, ts,
+                    topic_context, _vs_active, _vs_shown,
+                )
+            )
+            self._tasks = [t for t in self._tasks if not t.done()]
+            self._tasks.append(suggest_task)
 
     def _should_suggest(self) -> bool:
         """Return True when the current sermon mode warrants verse suggestions."""
@@ -509,6 +875,157 @@ class LLMEnrichmentService:
         return self._state_tracker.settled_mode not in (
             "illustration", "exhortation", "procedural"
         )
+
+    def _should_generate_verse_suggestions(
+        self,
+        spanish: str,
+        source_quality: str,
+        discourse_tag: str,
+        active_passage: dict | None,
+    ) -> bool:
+        """Additional content-level gate for verse suggestions.
+
+        Only generates suggestions when there is meaningful, clean theological
+        content to cross-reference. Prevents over-triggering on noise, short
+        fragments, and casual filler sentences.
+
+        Gates:
+        - Noisy or fragmented source: skip (system prompt also says this, but
+          avoid the API call entirely).
+        - Short fragments (< 7 words): skip unless an active passage is in progress.
+        - Procedural or transitional discourse: skip.
+        - Casual exhortation filler without a supporting active passage: skip.
+        """
+        if source_quality in ("noisy", "fragmented"):
+            return False
+        word_count = len(spanish.split())
+        if word_count < 7 and active_passage is None:
+            return False
+        if discourse_tag in ("transition", "quote_introduction"):
+            return False
+        # Exhortation-only filler without an active passage context is too generic
+        if discourse_tag == "exhortation_appeal" and active_passage is None and word_count < 12:
+            return False
+        return True
+
+    async def _deferred_translation_release(
+        self, ts: int, english: str, google_english: str
+    ) -> None:
+        """Fallback: release a suppressed translation after DEFERRED_RELEASE_S if no merge arrived.
+
+        Called when display_ready was false. If caption_merge fires first, this task
+        is cancelled. If no merge arrives within the timeout, the best available
+        translation is emitted so the caption is not permanently blank.
+        """
+        try:
+            await asyncio.sleep(DEFERRED_RELEASE_S)
+            if ts in self._deferred_updates:
+                del self._deferred_updates[ts]
+                logger.info(
+                    "[enrichment:%s] decision=deferred_translation_released ts=%d "
+                    "(no merge in %.1fs)",
+                    self._church_id, ts, DEFERRED_RELEASE_S,
+                )
+                if english and english != google_english:
+                    try:
+                        await self._on_translation_update(ts, english)
+                    except Exception as e:
+                        logger.warning(
+                            "[enrichment:%s] deferred translation_update failed ts=%d: %s",
+                            self._church_id, ts, e,
+                        )
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_verse_suggestions(
+        self,
+        spanish: str,
+        google_english: str,
+        ts: int,
+        topic_context: str,
+        active_passage: dict | None,
+        shown: set[str],
+    ) -> None:
+        """Separate lightweight async call for verse suggestions.
+
+        Runs after (and independent of) the main enrichment call so it cannot
+        compete with structural decisions for prompt attention or cause delays.
+        """
+        parts: list[str] = []
+        if topic_context:
+            parts.append(f"[SERMON CONTEXT]\n{topic_context}")
+        if active_passage:
+            parts.append(
+                f"[ACTIVE PASSAGE]\n"
+                f"{active_passage['reference']} — {active_passage['canonical_english']}"
+            )
+        if shown:
+            parts.append(f"[ALREADY SUGGESTED]\n{', '.join(sorted(shown))}")
+        parts.append(f"[SOURCE]\n{spanish}")
+        parts.append(f"[TRANSLATION]\n{google_english}")
+        user_msg = "\n\n".join(parts)
+
+        try:
+            response = await self._client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=400,
+                temperature=0,
+                system=_VERSE_SUGGESTIONS_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = response.content[0].text.strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[enrichment:%s] Verse suggestions call failed ts=%d: %s",
+                self._church_id, ts, e,
+            )
+            return
+
+        suggestions = _extract_suggestions(raw, self._church_id, ts)
+        if suggestions is None:
+            return
+
+        async with self._mutation_lock:
+            active_ref = (self._active_passage or {}).get("reference")
+            valid = []
+            suppressed = []
+            for s in suggestions:
+                if not _is_valid_suggestion(s):
+                    continue
+                if s["reference"] in self._shown_suggestions:
+                    suppressed.append((s["reference"], "already shown"))
+                elif s["reference"] == active_ref:
+                    suppressed.append((s["reference"], "active passage"))
+                else:
+                    valid.append(s)
+
+            if suppressed:
+                logger.debug(
+                    "[enrichment:%s] Suggestions suppressed ts=%d: %s",
+                    self._church_id, ts,
+                    ", ".join(f"{ref} ({reason})" for ref, reason in suppressed),
+                )
+
+            if valid:
+                for s in valid:
+                    self._shown_suggestions.add(s["reference"])
+                logger.info(
+                    "[enrichment:%s] Verse suggestions ts=%d: %s",
+                    self._church_id, ts,
+                    [(s["reference"], s["relevance_note"][:50]) for s in valid],
+                )
+                try:
+                    await self._on_verse_suggestion(ts, valid)
+                    await save_verse_suggestions(self._session_id, ts, valid)
+                except Exception as e:
+                    logger.warning(
+                        "[enrichment:%s] on_verse_suggestion failed ts=%d: %s",
+                        self._church_id, ts, e,
+                    )
+            else:
+                logger.info("[enrichment:%s] No verse suggestions ts=%d", self._church_id, ts)
 
     # --- Verse scratch pad ---
 
@@ -625,6 +1142,10 @@ class LLMEnrichmentService:
     async def close(self) -> None:
         # Flush any pending verse range before shutting down
         await self._flush_scratch("session close")
+        # Cancel deferred translation updates
+        for _, (_, defer_task) in list(self._deferred_updates.items()):
+            defer_task.cancel()
+        self._deferred_updates.clear()
         for task in self._tasks:
             if not task.done():
                 task.cancel()
@@ -715,3 +1236,56 @@ def _is_valid_suggestion(s: dict) -> bool:
         and isinstance(s.get("canonical_english"), str) and s["canonical_english"]
         and isinstance(s.get("relevance_note"), str)
     )
+
+
+def _extract_suggestions(raw: str, church_id: str, ts: int) -> list[dict] | None:
+    """Parse the verse suggestions response.
+
+    Expects {"suggestions": [...]} but falls back to a bare array for robustness.
+    Strips markdown fences, then attempts JSON extraction via regex if direct parse fails.
+    Returns None on unrecoverable parse failure (caller should skip the call).
+    Returns an empty list if the model returned a valid empty response.
+    """
+    # Strip markdown fences
+    text = raw
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL).strip()
+
+    # Attempt 1: direct parse
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "suggestions" in parsed:
+            result = parsed["suggestions"]
+            if isinstance(result, list):
+                return result
+        if isinstance(parsed, list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: extract first JSON object containing "suggestions"
+    m = re.search(r'\{[^{}]*"suggestions"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
+    if m:
+        try:
+            parsed = json.loads(m.group(0))
+            result = parsed.get("suggestions", [])
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    # Attempt 3: extract bare JSON array
+    m = re.search(r'\[.*?\]', text, re.DOTALL)
+    if m:
+        try:
+            result = json.loads(m.group(0))
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning(
+        "[enrichment:%s] Verse suggestions parse failed ts=%d: %.80s",
+        church_id, ts, raw,
+    )
+    return None
