@@ -98,12 +98,39 @@ _PENTECOSTES_DISCOURSE = re.compile(
 
 
 def _normalize_pentecostes(text: str) -> str:
-    """Rewrite 'Pentecostés' to 'Pentecostales' when context signals people/movement."""
+    """Rewrite or remove 'Pentecostés' based on structural context.
+
+    Three strategies applied in order:
+    1. Direct possessive/copula prefix → rewrite to 'Pentecostales'
+    2. Discourse context markers → rewrite to 'Pentecostales'
+    3. Remaining isolated 'Pentecostés' with no structural anchor → remove as STT noise
+       (e.g. "Pentecostés comunión unos con otros" → "comunión unos con otros")
+
+    Whitelist (never removed):
+    - Preceded by a preposition/article: "de Pentecostés", "en Pentecostés", "el día de Pentecostés"
+    - Followed by a copula/verb making it the grammatical subject: "Pentecostés fue cuando..."
+    """
     # Strategy 1: direct prefix match
     text = _PENTECOSTES_PEOPLE.sub(lambda m: m.group(1) + ' Pentecostales', text)
     # Strategy 2: discourse context — if ANY discourse marker co-occurs with Pentecostés
     if _PENTECOSTES_RE.search(text) and _PENTECOSTES_DISCOURSE.search(text):
         text = _PENTECOSTES_RE.sub('Pentecostales', text)
+    # Strategy 3: remove remaining isolated noise instances
+    if _PENTECOSTES_RE.search(text):
+        def _remove_noise(m: re.Match) -> str:
+            start = m.start()
+            before = text[max(0, start - 10):start]
+            after = text[m.end():].lstrip()
+            # Protected: preceded by preposition/article
+            if re.search(r'\b(?:de|en|el|la|los|las|del|durante|desde)\s*$', before, re.IGNORECASE):
+                return m.group(0)
+            # Protected: followed by copula or verb making Pentecostés the subject
+            if re.match(r'\b(?:es\b|era\b|fue\b|son\b|eran\b|fueron\b|será\b|ha\b|han\b|'
+                        r'significa|representa|se\b|celebra|ocurrió)', after, re.IGNORECASE):
+                return m.group(0)
+            # Noise — remove
+            return ''
+        text = _PENTECOSTES_RE.sub(_remove_noise, text)
     return text
 
 
@@ -115,7 +142,7 @@ def _clean_stt(text: str) -> str:
     2. Collapse repeated short function words ("que que" → "que").
     3. Collapse same-character stutters ("a a Cristo" → "a Cristo").
     4. Remove "Santo" when used as sentence-initial noise before a pronoun.
-    5. Context-aware Pentecostés normalization.
+    5. Context-aware Pentecostés normalization/removal.
     6. Normalize internal whitespace.
 
     The original raw text is still broadcast as stt_final so the operator stream
@@ -202,6 +229,8 @@ class ServiceSession:
         # ts values for which LLM enrichment has completed — used to suppress
         # stale Google dual-pass corrections that arrive after the LLM has settled.
         self._enrichment_settled: set[int] = set()
+        # Session-level STT noise removal counter (Pentecostés, Santo, etc.)
+        self._stt_noise_removed_count: int = 0
 
     async def start(self, sample_rate: int, sermon_topic: str = ""):
         self._sample_rate = sample_rate
@@ -295,6 +324,12 @@ class ServiceSession:
         await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
         # Clean noise artifacts before segmentation; broadcast keeps the raw text.
         clean = _clean_stt(text)
+        if clean != text:
+            self._stt_noise_removed_count += 1
+            logger.debug(
+                "[session:%s] STT noise removed (count=%d): %r → %r",
+                self._church_id, self._stt_noise_removed_count, text[:60], clean[:60],
+            )
         if not clean:
             return
         if self._translation:

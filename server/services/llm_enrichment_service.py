@@ -65,6 +65,23 @@ RULES:
    When [PREVIOUS SENTENCE DISCOURSE] shows introduces_quote: true, the current sentence is quoted
    scripture. Use formal, present-tense, verbatim-cadence register in the translation.
 
+   SCRIPTURE FIDELITY: When translation_register is "scripture" or discourse_tag is "scripture_quote",
+   minimize stylistic rewriting. Prioritize accuracy over polish. Preserve the cadence and phrasing
+   of the original. Do NOT paraphrase, expand, or modernize. A slightly wooden but faithful rendering
+   is preferable to a smooth but approximate one.
+
+   CONDITIONAL CLAUSE INTEGRITY: When the source contains "Si..." (if...) constructions, ensure the
+   English conditional is structurally complete — the "if" clause must have a matching consequence.
+   If the source only contains the protasis (the "if" part) with no apodosis (the consequence),
+   set thought_complete: false and continuation_required: true. Do NOT fabricate a consequence.
+
+   SCRIPTURE SPEAKER ATTRIBUTION: When introducing a scripture quote, translate speaker introductions
+   naturally: "Juan dice" → "John says", never "Pentecostal John" or "John comes and says".
+   Any word that is clearly a STT noise prefix before a speaker name should be silently dropped.
+
+   LONG SENTENCE HANDLING: When [LONG SENTENCE] is flagged, prioritize structural accuracy over
+   polish. Preserve all clause relationships. Do not truncate or summarize.
+
 3. discourse_tag: classify the rhetorical function of this sentence. Choose exactly one:
    - "statement":          a declarative theological claim or exposition ("God is light")
    - "rhetorical_question": a question the preacher asks but answers themselves ("Who is he?")
@@ -143,6 +160,9 @@ RULES:
                 previous "¿Cuántos de ustedes, los hermanos que" → current closes the question
     - previous [PREVIOUS SENTENCE DISCOURSE] had display_ready: false AND this sentence
       clearly resolves or continues the prior thought
+    - this sentence is a SHORT FRAGMENT (≤ 3 words, e.g. "Jesucristo.", "la luz.", "el amor.")
+      AND the previous sentence is a scripture quote, quote introduction, or scripture context —
+      the fragment is the conclusion of the quote and should not float as a standalone caption.
     All other cases → false.
     When true, you MUST write improved_translation as a fluent English rendering of the COMPLETE
     merged unit — the [PREVIOUS SENTENCE — PENDING MERGE] text PLUS the current sentence,
@@ -239,6 +259,67 @@ _TRANSLATION_NORMALIZATION: list[tuple[re.Pattern, str]] = [
 ]
 
 
+def _scripture_speaker_normalization(text: str) -> str:
+    """Fix awkward scripture-speaker constructions from STT artifact translations.
+
+    Handles patterns produced when STT noise ("Pentecostés") precedes a speaker
+    name, causing Google to generate constructions like "Pentecostal John comes
+    and says" instead of "John says".
+
+    Rules:
+    - "[Name] comes and says" → "[Name] says"
+    - "Pentecostal [Name] [verb]" → "[Name] [verb]"  (misplaced Pentecostal prefix)
+    - "[Name] comes to say" → "[Name] says"
+    """
+    # "John comes and says" / "Peter comes and says" → "John says"
+    text = re.sub(
+        r'\b(\w+)\s+comes\s+and\s+says\b',
+        r'\1 says',
+        text, flags=re.IGNORECASE,
+    )
+    # "Pentecostal John" when Pentecostal is clearly a misplaced prefix before a name+verb
+    text = re.sub(
+        r'\bPentecostal\s+(?=[A-Z][a-z]+\s+(?:says|writes|declares|states|tells|warns|teaches)\b)',
+        '',
+        text, flags=re.IGNORECASE,
+    )
+    # "[Name] comes to say" → "[Name] says"
+    text = re.sub(
+        r'\b(\w+)\s+comes\s+to\s+say\b',
+        r'\1 says',
+        text, flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _if_clause_validator(text: str) -> str:
+    """Detect and flag logically broken conditional constructions.
+
+    Currently logs a warning for audit but does not auto-correct, since
+    auto-correction would risk silently losing theological content. The
+    merge_with_previous LLM logic is the primary fix path.
+
+    Detects: "If we say that we have [X], I am [Y]."
+    where the subject shifts between protasis and apodosis — a sign that
+    two independent fragments were incorrectly merged at the buffer level.
+    """
+    # Subject-shift pattern: "If [pronoun1] ..., [pronoun2] ..."
+    # where pronoun1 ≠ pronoun2 (e.g. "we" → "I")
+    m = re.match(
+        r'^If\s+(\w+)\b.+?,\s*(I|you|he|she|they|we)\b',
+        text, re.IGNORECASE,
+    )
+    if m:
+        subj1 = m.group(1).lower()
+        subj2 = m.group(2).lower()
+        if subj1 != subj2 and subj1 not in ('we', subj2):
+            logger.debug(
+                "[translation] Possible subject-shift conditional: subject '%s' → '%s' in: %s",
+                subj1, subj2, text[:80],
+            )
+    return text  # no auto-correction — LLM handles the merge
+
+
 def _normalize_translation(text: str) -> str:
     """Apply domain normalization to an English translation for natural sermon register."""
     for pattern, replacement in _TRANSLATION_NORMALIZATION:
@@ -249,6 +330,8 @@ def _normalize_translation(text: str) -> str:
                 return repl[0].upper() + repl[1:]
             return repl
         text = pattern.sub(_replace, text)
+    text = _scripture_speaker_normalization(text)
+    text = _if_clause_validator(text)
     return text
 
 
@@ -348,6 +431,15 @@ def _build_user_message(
                 f"this previous sentence AND the current sentence as one complete unit."
             )
 
+    word_count = len(spanish.split())
+    if word_count > 25:
+        parts.append(
+            f"[LONG SENTENCE — {word_count} words]\n"
+            f"This is a long sentence ({word_count} words). "
+            f"Prioritize structural accuracy. Preserve all clause relationships. "
+            f"Do not truncate or summarize. Prefer coherent segmentation over polish."
+        )
+
     parts.append(f"[SOURCE — Spanish original]\n{spanish}")
     parts.append(f"[GOOGLE TRANSLATION — may need improvement]\n{google_english}")
     return "\n\n".join(parts)
@@ -441,6 +533,11 @@ class LLMEnrichmentService:
             "parse_retry_success": 0,
             "parse_failed": 0,
             "merge_chain_max_length": 0,
+            # Precision-phase metrics (added for noise/structure improvements)
+            "stt_noise_removed_count": 0,       # incremented per STT final where noise was stripped
+            "conditional_flush_block_count": 0, # conditional-clause holds (mirror of sentence_buffer)
+            "fragment_merge_count": 0,          # times a fragment was merged into a chain
+            "long_sentence_handled_count": 0,   # sentences > 25 words sent to LLM
         }
 
     def enrich(
@@ -631,6 +728,10 @@ class LLMEnrichmentService:
             if source_quality == "noisy":
                 self.metrics["noisy_input_detected"] += 1
 
+            # Track long sentence handling
+            if len(spanish.split()) > 25:
+                self.metrics["long_sentence_handled_count"] += 1
+
             # --- Translation improvement ---
             improved = result.get("improved_translation", "").strip()
             # Apply domain normalization for natural sermon English ("transmit" → "share", etc.)
@@ -708,6 +809,7 @@ class LLMEnrichmentService:
             # on_caption_merge(absorb_ts, keep_ts, ...) → ts_absorb=absorb_ts, ts_keep=keep_ts
             prev_ts = self._prev_sentence_ts
             if merge_with_previous and prev_ts is not None and self._on_caption_merge:
+                self.metrics["fragment_merge_count"] += 1
                 hist = list(self._sentence_history)
 
                 chain = self._merge_chain_head

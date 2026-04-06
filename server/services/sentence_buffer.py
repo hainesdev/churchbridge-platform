@@ -49,14 +49,47 @@ _INCOMPLETE_TAIL = re.compile(
 )
 
 
+def _is_conditional_incomplete(text: str) -> bool:
+    """Return True if text opens a conditional clause ('Si...') that has no apodosis.
+
+    Catches:  "Si decimos que tenemos como Jesucristo"  → incomplete (no resolution)
+    Allows:   "Si tienes fe, todo es posible."           → complete (comma + apodosis)
+              "Si buscas a Dios, entonces lo encontrarás." → complete (entonces)
+              "Si nosotros decimos la verdad."            → complete (verb closes)
+    """
+    stripped = text.strip().rstrip('.')
+    if not re.match(r'^Si\s+', stripped, re.IGNORECASE):
+        return False
+    # Explicit resolution markers — apodosis present
+    if re.search(r'\b(?:entonces|por\s+eso|pues\s+bien|por\s+tanto|así\s+que)\b',
+                 stripped, re.IGNORECASE):
+        return False
+    # Comma with at least 3 words of content after it — protasis/apodosis split present
+    if ',' in stripped:
+        after_comma = stripped.split(',', 1)[1].strip()
+        if len(after_comma.split()) >= 3:
+            return False
+    # Sentence ends with a noun/proper noun and the conditional verb is still "que" +
+    # another subordinator — predicate resolution hasn't arrived
+    # Heuristic: "Si ... que ..." ending with a noun is still open
+    if re.search(r'\bque\b.*\b[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+$', stripped):
+        return True
+    # Short conditional without a clear predicate resolution — hold
+    words = stripped.split()
+    if len(words) <= 10:
+        return True
+    return False
+
+
 def _is_incomplete(text: str) -> bool:
     """Return True if the text should not be flushed on a timer or UtteranceEnd yet.
 
-    Checks four conditions:
+    Checks five conditions:
     1. Too few words to be a meaningful standalone sentence (< MIN_FLUSH_WORDS).
     2. Ends with a trailing comma — speaker is mid-list or mid-clause.
     3. Ends with a clause-opening word (preposition, conjunction, article, dangling verb).
     4. Contains an unclosed interrogative: ¿ opened but no ? following it.
+    5. Opens a conditional clause ('Si...') with no apodosis resolution.
     """
     stripped = text.strip()
     if len(stripped.split()) < MIN_FLUSH_WORDS:
@@ -68,6 +101,9 @@ def _is_incomplete(text: str) -> bool:
         return True
     # Unclosed interrogative — a ¿ was opened but the sentence never closed with ?
     if re.search(r'¿[^?]*$', text):
+        return True
+    # Conditional clause without apodosis — "Si decimos que tenemos como Jesucristo"
+    if _is_conditional_incomplete(text):
         return True
     return False
 
@@ -114,8 +150,9 @@ class SentenceBuffer:
         self._audio_start: float | None = None
         self._audio_end: float = 0.0
         # Metrics
-        self.structural_flush_block_count: int = 0  # times incomplete guard blocked a flush
-        self.forced_release_count: int = 0          # times ABSOLUTE_MAX_WORDS forced a flush
+        self.structural_flush_block_count: int = 0   # times incomplete guard blocked a flush
+        self.forced_release_count: int = 0           # times ABSOLUTE_MAX_WORDS forced a flush
+        self.conditional_flush_block_count: int = 0  # times conditional-clause guard specifically blocked
 
     def hold_next(self, reason: str, hold_secs: float = 3.0) -> None:
         """Request an extended delay before the next sentence is flushed.
@@ -238,6 +275,8 @@ class SentenceBuffer:
             if self._extension_count < MAX_EXTENSIONS and _is_incomplete(combined):
                 self._extension_count += 1
                 self.structural_flush_block_count += 1
+                if _is_conditional_incomplete(combined):
+                    self.conditional_flush_block_count += 1
                 logger.debug(
                     "[sentence_buffer] Incomplete tail (extension %d/%d): %s",
                     self._extension_count, MAX_EXTENSIONS, combined[:60],
@@ -257,6 +296,8 @@ class SentenceBuffer:
                 if self._extension_count < MAX_EXTENSIONS and _is_incomplete(combined):
                     self._extension_count += 1
                     self.structural_flush_block_count += 1
+                    if _is_conditional_incomplete(combined):
+                        self.conditional_flush_block_count += 1
                     logger.debug(
                         "[sentence_buffer] Incomplete tail (extension %d/%d): %s",
                         self._extension_count, MAX_EXTENSIONS, combined[:60],
