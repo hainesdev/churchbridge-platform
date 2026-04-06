@@ -29,15 +29,57 @@ logger = logging.getLogger(__name__)
 # This avoids splitting on verse numbers ("Juan 3:16") and abbreviations ("cap.").
 _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ¿¡"])')
 
-# Strips common STT noise artifacts before translation — repeated filler sounds
-# and stuttered single letters that slip through Deepgram and pollute translation.
-# Applied to the text passed to Google and the sentence buffer; the original
-# raw text is still broadcast as stt_final so the stream display stays unmodified.
-_STT_NOISE = re.compile(
-    r'\b(A{2,}|M{2,}|Uh+|Um+|Eh+|Este+|Eeh+|Mmm+)\b'   # multi-char fillers
-    r'|(?<!\w)(\b\w\b\s+){2,}(?=\b\w{2,}\b)',            # repeated single chars: "a a Cristo"
-    re.IGNORECASE,
-)
+# Minimum word count for a split fragment to stand alone. Parts shorter than
+# this are merged back into the preceding fragment — keeps Q&A pairs together:
+# "¿Quién es él? Jesucristo." stays as one entry rather than splitting off the answer.
+_MIN_SPLIT_WORDS = 5
+
+# --- STT noise cleanup (applied before translation; raw text is still broadcast) ---
+
+# Multi-character filler sounds: "AAA", "Mmm", "Uh", "Um", "Eh", "Este", "Eeh"
+_STT_FILLER = re.compile(r'\b(?:A{2,}|M{2,}|Uh+|Um+|Eh+|Eeh+|Mmm+|Este+)\b', re.IGNORECASE)
+
+# Same single character repeated (stutter): "a a Cristo" → "a Cristo"
+# Only matches when the SAME character appears 2+ times — avoids removing valid
+# Spanish sequences like "y a la fe" (different single-char words).
+_STT_SINGLE_REPEAT = re.compile(r'\b(\w)\s+\1(?:\s+\1)*\b', re.IGNORECASE)
+
+
+def _clean_stt(text: str) -> str:
+    """Normalize STT output before translation and sentence buffering.
+
+    Three passes, each targeted:
+    1. Remove filler sounds (AAA, Uh, Mmm, Este...).
+    2. Collapse same-character stutters ("a a Cristo" → "a Cristo").
+    3. Normalize internal whitespace introduced by removals.
+
+    The original raw text is still broadcast as stt_final; this cleaned version
+    is what reaches Google Translate and the SentenceBuffer.
+    """
+    text = _STT_FILLER.sub('', text)
+    text = _STT_SINGLE_REPEAT.sub(r'\1', text)
+    return ' '.join(text.split())
+
+
+def _split_segments(text: str) -> list[str]:
+    """Split a Deepgram final at internal sentence boundaries, then merge back
+    any trailing fragment that is too short to stand alone.
+
+    This keeps rhetorical Q&A pairs together — "¿Quién es él? Jesucristo." is
+    one sentence for LLM and buffer purposes, while a longer follow-on sentence
+    like "Y no hay tinieblas en él." correctly splits off as its own entry.
+    """
+    parts = _SENTENCE_SPLIT.split(text)
+    if len(parts) == 1:
+        return parts
+    merged: list[str] = [parts[0]]
+    for part in parts[1:]:
+        if len(part.split()) < _MIN_SPLIT_WORDS:
+            # Short answer or fragment — attach to the preceding sentence.
+            merged[-1] = merged[-1] + ' ' + part
+        else:
+            merged.append(part)
+    return merged
 
 
 class ServiceSession:
@@ -151,14 +193,14 @@ class ServiceSession:
     async def _on_final(self, text: str, audio_start: float, audio_end: float):
         logger.info("[session:%s] STT final: %s", self._church_id, text)
         await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
-        # Strip noise artifacts before translation; broadcast keeps the raw text.
-        clean = _STT_NOISE.sub('', text).strip()
+        # Clean noise artifacts before translation; broadcast keeps the raw text.
+        clean = _clean_stt(text)
         if not clean:
             return
         if self._translation:
             await self._translation.translate_fragment(clean)
         if self._sentence_buffer:
-            parts = _SENTENCE_SPLIT.split(clean)
+            parts = _split_segments(clean)
             if len(parts) == 1:
                 await self._sentence_buffer.add(clean, audio_start, audio_end)
             else:

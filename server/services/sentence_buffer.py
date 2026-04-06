@@ -7,21 +7,26 @@ logger = logging.getLogger(__name__)
 
 SENTENCE_ENDINGS = frozenset('.?!…;')
 MAX_WORDS = 40
-FLUSH_DELAY_S = 3.5       # fallback timer: flush if no new fragment for this long
-FLUSH_DELAY_EXTENDED_S = 2.0  # one-time extension granted when tail looks incomplete
+FLUSH_DELAY_S = 3.5         # fallback timer: flush if no new fragment for this long
+FLUSH_DELAY_EXTENDED_S = 2.0  # each extension granted when tail looks incomplete
+MAX_EXTENSIONS = 2          # maximum timer extensions before flushing unconditionally
+UTTERANCE_END_GUARD_S = 1.0 # short hold when UtteranceEnd fires on an incomplete tail
 
 # Spanish words that, when they end the accumulated text, signal an incomplete
-# clause — a preposition, subordinating conjunction, article, or possessive that
-# makes it clear the speaker hasn't finished the thought yet.
-# Only used in the fallback timer path; UtteranceEnd flushes unconditionally.
+# clause — a preposition, subordinating conjunction, article, relative pronoun,
+# or possessive that makes it clear the speaker hasn't finished the thought yet.
+# Used in both the fallback timer path and the UtteranceEnd soft guard.
 _INCOMPLETE_TAIL = re.compile(
     r'\b('
     # subordinating conjunctions
     r'que|porque|cuando|si|aunque|mientras|como|ya\s+que|para\s+que|'
-    # coordinating (at end without punctuation they're clearly incomplete)
-    r'y|o|ni|'
+    r'dado\s+que|a\s+menos\s+que|con\s+tal\s+que|'
+    # adversative / additive conjunctions at sentence end signal continuation
+    r'pero|sino|más|pues|ni|y|o|'
+    # relative pronouns / adverbs
+    r'quien|quienes|cual|cuales|donde|cuanto|'
     # prepositions
-    r'de|en|con|por|para|a|al|del|ante|bajo|hacia|hasta|sin|sobre|tras|'
+    r'de|en|con|por|para|a|al|del|lo|ante|bajo|hacia|hasta|sin|sobre|tras|'
     # articles
     r'el|la|los|las|un|una|unos|unas|'
     # possessives
@@ -58,7 +63,7 @@ class SentenceBuffer:
         self._on_sentence = on_sentence
         self._parts: list[str] = []
         self._timer: asyncio.Task | None = None
-        self._timer_extended: bool = False
+        self._extension_count: int = 0  # number of timer extensions granted so far
         # Sermon-relative audio span of the current accumulated sentence
         self._audio_start: float | None = None
         self._audio_end: float = 0.0
@@ -78,16 +83,46 @@ class SentenceBuffer:
             self._timer = asyncio.create_task(self._delayed_flush())
 
     async def utterance_end(self):
-        """Hard flush triggered by Deepgram's UtteranceEnd VAD event.
+        """Flush triggered by Deepgram's UtteranceEnd VAD event.
 
-        Called when Deepgram detects the speaker has stopped. Flushes
-        unconditionally — this is a higher-quality signal than the fallback timer
-        so we trust it regardless of whether the text looks complete.
+        UtteranceEnd is the strongest "speaker stopped" signal we have, but
+        preachers frequently pause mid-clause for emphasis. If the accumulated
+        text ends with a clear incomplete-clause marker, we grant one short hold
+        (UTTERANCE_END_GUARD_S) to allow the next Deepgram final to arrive and
+        complete the thought. If the tail looks complete — or the guard has
+        already fired once — we flush unconditionally.
         """
         self._cancel_timer()
-        if self._parts:
-            logger.debug("[sentence_buffer] UtteranceEnd flush: %s", ' '.join(self._parts)[:60])
+        if not self._parts:
+            return
+        combined = ' '.join(self._parts)
+        if self._extension_count == 0 and _INCOMPLETE_TAIL.search(combined):
+            logger.debug(
+                "[sentence_buffer] UtteranceEnd soft guard — incomplete tail: %s", combined[:60]
+            )
+            self._extension_count += 1
+            self._timer = asyncio.create_task(self._utterance_end_guard())
+        else:
+            logger.debug("[sentence_buffer] UtteranceEnd flush: %s", combined[:60])
             await self._flush()
+
+    async def _utterance_end_guard(self):
+        """Short hold after UtteranceEnd on an incomplete tail.
+
+        Waits UTTERANCE_END_GUARD_S for the next Deepgram final. If a new
+        fragment arrives (via add()), this task is cancelled and the buffer
+        continues normally. If nothing arrives, we flush unconditionally.
+        """
+        try:
+            await asyncio.sleep(UTTERANCE_END_GUARD_S)
+            if self._parts:
+                logger.debug(
+                    "[sentence_buffer] UtteranceEnd guard expired — flushing: %s",
+                    ' '.join(self._parts)[:60],
+                )
+                await self._flush()
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self):
         """Flush any remaining buffered text on session close."""
@@ -102,22 +137,42 @@ class SentenceBuffer:
         return stripped[-1] in SENTENCE_ENDINGS or len(stripped.split()) >= MAX_WORDS
 
     async def _delayed_flush(self):
-        """Fallback timer flush. Extends once if the tail looks like an incomplete clause."""
+        """Fallback timer flush. Extends up to MAX_EXTENSIONS times when the tail
+        looks like an incomplete clause. Each extension gives the speaker another
+        FLUSH_DELAY_EXTENDED_S to complete the thought before we flush anyway.
+        """
         try:
             await asyncio.sleep(FLUSH_DELAY_S)
             if not self._parts:
                 return
             combined = ' '.join(self._parts)
-            if not self._timer_extended and _INCOMPLETE_TAIL.search(combined):
-                # The text ends mid-clause. Grant one extension — Deepgram's UtteranceEnd
-                # should arrive before this fires if the speaker is just pausing.
+            if self._extension_count < MAX_EXTENSIONS and _INCOMPLETE_TAIL.search(combined):
+                self._extension_count += 1
                 logger.debug(
-                    "[sentence_buffer] Incomplete tail detected, extending timer: %s", combined[:60]
+                    "[sentence_buffer] Incomplete tail (extension %d/%d): %s",
+                    self._extension_count, MAX_EXTENSIONS, combined[:60],
                 )
-                self._timer_extended = True
-                self._timer = asyncio.create_task(self._delayed_flush())
+                self._timer = asyncio.create_task(self._extended_flush())
             else:
                 await self._flush()
+        except asyncio.CancelledError:
+            pass
+
+    async def _extended_flush(self):
+        """Second (and subsequent) timer after an incomplete-tail extension."""
+        try:
+            await asyncio.sleep(FLUSH_DELAY_EXTENDED_S)
+            if self._parts:
+                combined = ' '.join(self._parts)
+                if self._extension_count < MAX_EXTENSIONS and _INCOMPLETE_TAIL.search(combined):
+                    self._extension_count += 1
+                    logger.debug(
+                        "[sentence_buffer] Incomplete tail (extension %d/%d): %s",
+                        self._extension_count, MAX_EXTENSIONS, combined[:60],
+                    )
+                    self._timer = asyncio.create_task(self._extended_flush())
+                else:
+                    await self._flush()
         except asyncio.CancelledError:
             pass
 
@@ -130,7 +185,7 @@ class SentenceBuffer:
             self._parts = []
             self._audio_start = None
             self._audio_end = 0.0
-            self._timer_extended = False
+            self._extension_count = 0
             logger.debug("[sentence_buffer] Flushing: %s", sentence[:60])
             await self._on_sentence(sentence, audio_start, audio_end)
 
