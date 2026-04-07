@@ -495,6 +495,11 @@ class LLMEnrichmentService:
         # out of order (due to variable API latency) don't corrupt sentence history,
         # active passage, shown suggestions, or sermon mode signals.
         self._mutation_lock = asyncio.Lock()
+        # Preserve sentence application order even when API responses complete out
+        # of order. Calls may remain concurrent; only the state-application phase
+        # waits for its turn.
+        self._apply_condition = asyncio.Condition()
+        self._scheduled_ts: deque[int] = deque()
 
         # Rolling sentence context (last 5 sentences, Spanish + best English)
         self._sentence_history: deque[tuple[str, str]] = deque(maxlen=5)
@@ -549,12 +554,30 @@ class LLMEnrichmentService:
         audio_end: float = 0.0,
     ) -> asyncio.Task:
         """Schedule enrichment as a fire-and-forget task. Does not block."""
+        self._scheduled_ts.append(ts)
         task = asyncio.create_task(
             self._run_enrichment(spanish, google_english, ts, audio_start, audio_end)
         )
         self._tasks = [t for t in self._tasks if not t.done()]
         self._tasks.append(task)
         return task
+
+    async def _wait_for_apply_turn(self, ts: int) -> None:
+        async with self._apply_condition:
+            await self._apply_condition.wait_for(
+                lambda: self._scheduled_ts and self._scheduled_ts[0] == ts
+            )
+
+    async def _finish_apply_turn(self, ts: int) -> None:
+        async with self._apply_condition:
+            if self._scheduled_ts and self._scheduled_ts[0] == ts:
+                self._scheduled_ts.popleft()
+            else:
+                try:
+                    self._scheduled_ts.remove(ts)
+                except ValueError:
+                    pass
+            self._apply_condition.notify_all()
 
     async def _run_enrichment(
         self,
@@ -602,6 +625,8 @@ class LLMEnrichmentService:
             raise
         except Exception as e:
             logger.warning("[enrichment:%s] Claude call failed for ts=%d: %s", self._church_id, ts, e)
+            await self._wait_for_apply_turn(ts)
+            await self._finish_apply_turn(ts)
             return
 
         if raw.startswith("```"):
@@ -630,11 +655,17 @@ class LLMEnrichmentService:
                     "[enrichment:%s] Could not parse JSON for ts=%d: %.120s",
                     self._church_id, ts, raw,
                 )
+                await self._wait_for_apply_turn(ts)
+                await self._finish_apply_turn(ts)
                 return
 
         if not isinstance(result, dict):
             logger.warning("[enrichment:%s] Expected JSON object for ts=%d, got %s", self._church_id, ts, type(result).__name__)
+            await self._wait_for_apply_turn(ts)
+            await self._finish_apply_turn(ts)
             return
+
+        await self._wait_for_apply_turn(ts)
 
         # Acquire the mutation lock before touching any shared state.
         # Concurrent enrichment tasks complete in arbitrary order due to variable
@@ -945,6 +976,8 @@ class LLMEnrichmentService:
             else:
                 logger.info("[enrichment:%s] No verse detected ts=%d", self._church_id, ts)
 
+        await self._finish_apply_turn(ts)
+
         # --- Verse suggestions (separate async call, outside mutation lock) ---
         # Runs as a fire-and-forget task so it cannot delay structural decisions.
         # Uses only the context snapshots captured inside the lock above.
@@ -1028,7 +1061,10 @@ class LLMEnrichmentService:
                     "(no merge in %.1fs)",
                     self._church_id, ts, DEFERRED_RELEASE_S,
                 )
-                if english and english != google_english:
+                # Always emit a release event when we time out a deferred caption,
+                # even if the text matches Google's original output. The client
+                # uses this event to clear pending-completion UI state.
+                if english:
                     try:
                         await self._on_translation_update(ts, english)
                     except Exception as e:

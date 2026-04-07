@@ -48,9 +48,13 @@ class DeepgramSession:
         self._task: asyncio.Task | None = None
         # Sermon-relative timestamp normalization
         self._stream_offset: float = 0.0
-        self._last_audio_end: float = 0.0
+        # High-water mark within the CURRENT websocket stream only.
+        # This must stay stream-relative so reconnect offset accumulation does
+        # not double-count prior reconnects.
+        self._last_stream_audio_end: float = 0.0
 
     async def start(self, glossary: dict[str, int], sample_rate: int = 16000):
+        self._api_key = os.environ["DEEPGRAM_API_KEY"]  # fail fast at session start
         self._stop_event = asyncio.Event()
         ready: asyncio.Event = asyncio.Event()
 
@@ -82,14 +86,13 @@ class DeepgramSession:
             params.append(("keyterms", term))
 
         url = f"{DEEPGRAM_WS_URL}?{urlencode(params)}"
-        api_key = os.environ["DEEPGRAM_API_KEY"]
         first_connect = True
 
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(
                     url,
-                    additional_headers={"Authorization": f"Token {api_key}"},
+                    additional_headers={"Authorization": f"Token {self._api_key}"},
                     ping_interval=10,
                     ping_timeout=5,
                 ) as ws:
@@ -114,7 +117,8 @@ class DeepgramSession:
                     "[deepgram] Connection dropped for church %s — reconnecting (offset was %.1fs)",
                     self._church_id, self._stream_offset,
                 )
-                self._stream_offset += self._last_audio_end
+                self._stream_offset += self._last_stream_audio_end
+                self._last_stream_audio_end = 0.0
                 self._ws = None
                 await asyncio.sleep(RECONNECT_DELAY_S)
 
@@ -128,7 +132,8 @@ class DeepgramSession:
                     "[deepgram] Connection error for church %s: %s — retrying in %.1fs",
                     self._church_id, e, RECONNECT_ERROR_S,
                 )
-                self._stream_offset += self._last_audio_end
+                self._stream_offset += self._last_stream_audio_end
+                self._last_stream_audio_end = 0.0
                 self._ws = None
                 await asyncio.sleep(RECONNECT_ERROR_S)
 
@@ -197,9 +202,10 @@ class DeepgramSession:
             # so values remain monotonically increasing across reconnects.
             raw_start: float = msg.get("start", 0.0)
             duration: float = msg.get("duration", 0.0)
+            raw_end = raw_start + duration
             audio_start = raw_start + self._stream_offset
-            audio_end   = audio_start + duration
-            self._last_audio_end = audio_end  # advance high-water mark for next reconnect
+            audio_end = raw_end + self._stream_offset
+            self._last_stream_audio_end = max(self._last_stream_audio_end, raw_end)
 
             is_final = msg.get("is_final", False)
             if is_final:

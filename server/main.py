@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     await broadcaster.connect()
     session_manager = SessionManager(broadcaster)
     stream.set_session_manager(session_manager)
+    services.set_session_manager(session_manager)
     display.set_broadcaster(broadcaster)
     listen.set_broadcaster(broadcaster)
     yield
@@ -59,4 +60,4 @@ app.include_router(services.router)
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "redis": broadcaster._available}
+    return {"ok": True, "redis": broadcaster.available}
