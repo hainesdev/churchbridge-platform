@@ -42,9 +42,9 @@ server\.venv\Scripts\python.exe -m pytest tests\server -q
 
 Latest verified result in this workspace:
 
-- `tests/server/test_pipeline_regressions.py`: `6 passed`
+- `tests/server/test_pipeline_regressions.py`: `7 passed`
 - `tests/server/test_precision_phase.py`: `39 passed`
-- `tests/server`: `99 passed`
+- `tests/server`: `100 passed`
 
 Benchmark/evaluation test suites:
 
