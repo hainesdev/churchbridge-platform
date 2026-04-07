@@ -6,6 +6,11 @@ from tests.benchmark.scorecard import (
     _translation_latencies,
     scorecard_from_file,
 )
+from tests.benchmark.trajectory import (
+    _trend_label,
+    _clip_duration_regime_changed,
+    LOWER_IS_BETTER,
+)
 
 
 RUN_FIXTURE = Path("tests/benchmark/results/1/pipeline/2026-04-07T15-30-27Z.json")
@@ -45,3 +50,66 @@ def test_scorecard_from_real_run_populates_latency_and_clears_false_ordering():
     assert scorecard["behavioral"]["out_of_order_event_count"] == 0
     assert scorecard["latency"]["avg_translation_latency_s"] == 0.287
     assert scorecard["latency"]["avg_llm_correction_latency_s"] == 3.706
+
+
+# ---------------------------------------------------------------------------
+# Trajectory: LOWER_IS_BETTER completeness
+# ---------------------------------------------------------------------------
+
+class TestLowerIsBetterCompleteness:
+    def test_time_to_first_translation_in_lower_is_better(self):
+        """A faster first translation should be treated as an improvement."""
+        assert "time_to_first_translation_s" in LOWER_IS_BETTER
+
+    def test_time_to_first_committed_sentence_in_lower_is_better(self):
+        """A faster first committed sentence should be treated as an improvement."""
+        assert "time_to_first_committed_sentence_s" in LOWER_IS_BETTER
+
+    def test_time_to_first_llm_correction_in_lower_is_better(self):
+        """A faster first LLM correction should be treated as an improvement."""
+        assert "time_to_first_llm_correction_s" in LOWER_IS_BETTER
+
+    def test_decreasing_time_to_first_translation_labeled_improved(self):
+        """Values decreasing over 3 runs → improved (lower latency is better)."""
+        values = [8.64, 8.594, 8.359]
+        assert _trend_label(values, "time_to_first_translation_s") == "improved"
+
+    def test_increasing_time_to_first_translation_labeled_regressed(self):
+        """Values increasing over 3 runs → regressed (higher latency is worse)."""
+        values = [8.0, 8.3, 9.1]
+        assert _trend_label(values, "time_to_first_translation_s") == "regressed"
+
+    def test_decreasing_wer_labeled_improved(self):
+        """Confirming that wer_committed_pct remains in LOWER_IS_BETTER."""
+        values = [20.0, 18.0, 15.0]
+        assert _trend_label(values, "wer_committed_pct") == "improved"
+
+
+# ---------------------------------------------------------------------------
+# Trajectory: clip duration regime change detection
+# ---------------------------------------------------------------------------
+
+class TestClipDurationRegimeChange:
+    def test_no_change_when_durations_consistent(self):
+        """Same clip duration across runs → no regime change."""
+        assert not _clip_duration_regime_changed([85.0, 85.0, 85.0])
+
+    def test_detects_large_drop_from_85s_to_30s(self):
+        """30s clip after two 85s clips is a >40% change → regime change."""
+        assert _clip_duration_regime_changed([85.0, 85.0, 30.0])
+
+    def test_no_false_positive_for_small_variation(self):
+        """Small variation (28s, 30s, 32s clips) is within threshold."""
+        assert not _clip_duration_regime_changed([28.0, 30.0, 32.0])
+
+    def test_single_run_never_triggers(self):
+        """With only one run there's nothing to compare against."""
+        assert not _clip_duration_regime_changed([85.0])
+
+    def test_none_values_skipped(self):
+        """None entries (missing clip_duration_s) are ignored."""
+        assert not _clip_duration_regime_changed([85.0, None, 85.0])
+
+    def test_detects_large_increase(self):
+        """Large increase in clip duration also counts as a regime change."""
+        assert _clip_duration_regime_changed([30.0, 30.0, 85.0])
