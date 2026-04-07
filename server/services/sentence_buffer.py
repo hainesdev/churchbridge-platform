@@ -163,8 +163,9 @@ class SentenceBuffer:
         Multiple calls keep the maximum, not the sum — one hold at a time.
         Has no effect on punctuation-triggered or UtteranceEnd flushes.
         """
-        self._hold_secs = max(self._hold_secs, hold_secs)
-        self._hold_reason = reason
+        if hold_secs > self._hold_secs:
+            self._hold_secs = hold_secs
+            self._hold_reason = reason
         logger.debug("[sentence_buffer] Hold queued: %s (%.1fs)", reason, hold_secs)
 
     async def add(self, text: str, audio_start: float = 0.0, audio_end: float = 0.0):
