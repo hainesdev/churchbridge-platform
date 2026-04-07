@@ -28,6 +28,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import numpy as np
@@ -116,6 +117,17 @@ def resolve_run_namespace(audio_dir: str, start_offset_s: float, church_id: str 
     audio_name = Path(audio_dir).name.replace(" ", "_")
     offset_ms = int(round(start_offset_s * 1000))
     return f"pipeline_test_{audio_name}_{offset_ms}"
+
+
+def generate_run_id(audio_dir: str, start_offset_s: float) -> str:
+    """
+    Create a traceable run id that stays distinct across parallel staggered
+    captures, even when separate processes start within the same microsecond.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    audio_name = Path(audio_dir).name.replace(" ", "_")
+    offset_ms = int(round(start_offset_s * 1000))
+    return f"{timestamp}-{audio_name}-{offset_ms}-{uuid4().hex[:8]}"
 
 
 def get_git_commit() -> str:
@@ -386,7 +398,7 @@ async def main() -> None:
                         help="Skip LLM interpretation (deterministic evaluation only)")
     args = parser.parse_args()
 
-    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    run_id = generate_run_id(args.audio_dir, args.start_offset)
     audio_dir = ROOT / args.audio_dir
     duration_s = resolve_duration(args.duration, args.allow_long_duration)
     start_offset_s = args.start_offset

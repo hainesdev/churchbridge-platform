@@ -52,18 +52,19 @@ Important:
 
 | Set | Status |
 |---|---|
-| `tests/audio/1` | 2 staggered runs captured/evaluated at offsets `0s` and `30s`, each with `--duration 5` |
-| `tests/audio/2` | 2 staggered runs captured/evaluated at offsets `0s` and `30s`, each with `--duration 5` |
+| `tests/audio/1` | 3 staggered runs captured/evaluated at offsets `0s`, `30s`, and `60s`, each with `--duration 5` |
+| `tests/audio/2` | 3 staggered runs captured/evaluated at offsets `0s`, `30s`, and `60s`, each with `--duration 5` |
 
 The staggered lane is a fresh regime. Its histories were intentionally reset so
 old 85-second and 30-second legacy runs do not pollute trend analysis.
 
 Current staggered action:
-- `collect_more_runs`
+- mixed by set: `collect_more_runs` for `tests/audio/1`, `promote` for `tests/audio/2`
 
 Why:
-- Each staggered set still has only 2 comparable runs.
-- Trend labels unlock at 3 runs per set.
+- Both sets now have 3 comparable runs, so trend labels are available.
+- The staggered report summarizes all sets in the regime, but its top-level action still reflects the most recently evaluated set.
+- Review both per-set trajectories before acting on the report headline.
 
 ---
 
@@ -100,6 +101,17 @@ These are no longer open issues:
 
 2. `avg_translation_latency_s` and `avg_llm_correction_latency_s` now resolve
    correctly from raw event logs.
+
+3. `client_visible_rewrite_count` now counts only actual text rewrites, not all
+   correction events.
+
+4. Parallel staggered captures now generate unique `run_id` values across sets.
+
+5. The staggered regime report now summarizes all evaluated sets under the
+   regime root instead of only the last set processed.
+
+6. Session-close flushes now drain queued translation and enrichment work before
+   shutdown, so short benchmark windows do not lose downstream events.
 
 Do not reopen those as active benchmark bugs unless new evidence appears.
 
@@ -158,13 +170,15 @@ Primary files:
 
 ## Recommended Next Step
 
-Run one more staggered offset for each audio set so both sets reach 3 runs.
+Use the regenerated staggered trajectories and report to choose one confirmed
+pipeline or evaluation issue, then follow
+`SELF_IMPROVEMENT_LOOP_RUNBOOK.md` end to end:
 
-Suggested next offsets:
-- `tests/audio/1` at `60s`
-- `tests/audio/2` at `60s`
-
-Keep them at `--duration 5` unless you intentionally want a different regime.
+- baseline the narrowest relevant test suite
+- make one small verified fix
+- rerun `tests/benchmark -q`
+- rerun `tests/server -q`
+- rerun a short live verification clip if the fix affects shutdown, ordering, or delayed emission behavior
 
 ---
 

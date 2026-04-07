@@ -42,8 +42,19 @@ server\.venv\Scripts\python.exe -m pytest tests\server -q
 
 Latest verified result in this workspace:
 
-- `tests/server/test_pipeline_regressions.py`: `4 passed`
-- `tests/server`: `97 passed`
+- `tests/server/test_pipeline_regressions.py`: `6 passed`
+- `tests/server/test_precision_phase.py`: `39 passed`
+- `tests/server`: `99 passed`
+
+Benchmark/evaluation test suites:
+
+```powershell
+server\.venv\Scripts\python.exe -m pytest tests\benchmark -q
+```
+
+Latest verified benchmark/evaluation result in this workspace:
+
+- `tests/benchmark`: `13 passed`
 
 ## Pipeline Benchmark
 
@@ -121,6 +132,9 @@ server\.venv\Scripts\python.exe tests\benchmark\evaluate_captured_runs.py `
   --results-root tests/benchmark/results/staggered
 ```
 
+For the exact clean-rerun procedure and next-loop workflow, see
+`SELF_IMPROVEMENT_LOOP_RUNBOOK.md`.
+
 ### Explicit Long Run
 
 Use a longer clip only when you intentionally want deeper benchmark coverage:
@@ -150,8 +164,8 @@ Current verified state:
   - `tests/audio/1` has 3 runs
   - `tests/audio/2` has 3 runs
 - Staggered lane:
-  - `tests/audio/1` has 2 evaluated 5-second runs at offsets `0s` and `30s`
-  - `tests/audio/2` has 2 evaluated 5-second runs at offsets `0s` and `30s`
+  - `tests/audio/1` has 3 evaluated 5-second runs at offsets `0s`, `30s`, and `60s`
+  - `tests/audio/2` has 3 evaluated 5-second runs at offsets `0s`, `30s`, and `60s`
 
 ## Troubleshooting
 
@@ -211,5 +225,7 @@ Then prepend that folder to `PATH` before running the benchmark.
 - The pipeline benchmark is not part of pytest and takes about the clip duration plus pipeline drain time.
 - Routine live runs are capped at 30 seconds unless `--allow-long-duration` is passed.
 - Parallel staggered capture is safe only in `--capture-only` mode with distinct `--port` values, followed by sequential evaluation.
+- The runner now includes audio/set context plus a unique suffix in `run_id`, so parallel staggered captures do not collide across sets.
+- Session-close flushes now drain queued translation/enrichment work before shutdown, so short capture windows can still emit final translation updates.
 - Use explicit short durations for staggered coverage windows so the harness does not benchmark a full sermon by mistake.
 - Interrupting the benchmark can leave background Python processes behind; clean them up before retrying.

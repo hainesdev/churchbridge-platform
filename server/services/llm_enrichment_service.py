@@ -1297,9 +1297,7 @@ class LLMEnrichmentService:
         for _, (_, defer_task) in list(self._deferred_updates.items()):
             defer_task.cancel()
         self._deferred_updates.clear()
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
+        self._tasks = [task for task in self._tasks if not task.done()]
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()

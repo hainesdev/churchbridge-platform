@@ -27,6 +27,7 @@ class SlowFakeGoogleTranslateService(GoogleTranslateService):
         self._context = deque(maxlen=2)
         self._active_task = None
         self._fragment_task = None
+        self._sentence_tasks = []
         self._sentence_lock = asyncio.Lock()
         self._fragment_context = []
         self._http = None
@@ -45,6 +46,35 @@ class SlowFakeGoogleTranslateService(GoogleTranslateService):
 
     async def close(self):
         pass
+
+
+class _NoopHttpClient:
+    async def aclose(self):
+        return None
+
+
+class ControlledGoogleTranslateService(GoogleTranslateService):
+    def __init__(self, responses: list[str], delay_s: float, **kwargs):
+        self._api_key = "FAKE_KEY"
+        self._context = deque(maxlen=2)
+        self._active_task = None
+        self._fragment_task = None
+        self._sentence_tasks = []
+        self._sentence_lock = asyncio.Lock()
+        self._fragment_context = []
+        self._http = _NoopHttpClient()
+        self._responses = list(responses)
+        self._call_count = 0
+        self._delay_s = delay_s
+        self._on_translation = kwargs["on_translation"]
+        self._on_correction = kwargs["on_correction"]
+        self._on_interim_translation = kwargs.get("on_interim_translation", lambda *a: None)
+
+    async def _call_api(self, html_body: str) -> str:
+        await asyncio.sleep(self._delay_s)
+        result = self._responses[self._call_count % len(self._responses)]
+        self._call_count += 1
+        return result
 
 
 class StubTopicTracker:
@@ -137,6 +167,29 @@ class TestGoogleSentenceConcurrency:
             assert translations == [
                 (1000, "uno", "First"),
                 (2000, "dos", "Second"),
+            ]
+
+        run(run_())
+
+    def test_close_waits_for_in_flight_sentence_translation(self):
+        async def run_():
+            translations = []
+
+            async def on_translation(spanish, english, ts):
+                translations.append((ts, spanish, english))
+
+            svc = ControlledGoogleTranslateService(
+                responses=["<p>First</p>"],
+                delay_s=0.05,
+                on_translation=on_translation,
+                on_correction=lambda *args: None,
+            )
+
+            await svc.translate("uno", ts=1000)
+            await svc.close()
+
+            assert translations == [
+                (1000, "uno", "First"),
             ]
 
         run(run_())
@@ -262,5 +315,42 @@ class TestDeferredRelease:
             await asyncio.wait_for(task, timeout=7.5)
 
             assert updates == [(123, "Same text")]
+
+        run(run_())
+
+
+class TestEnrichmentCloseDrain:
+    def test_close_waits_for_in_flight_enrichment_task(self):
+        async def run_():
+            updates = []
+            settled = []
+
+            async def on_translation_update(ts, english):
+                updates.append((ts, english))
+
+            async def on_enrichment_settled(ts):
+                settled.append(ts)
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=on_enrichment_settled,
+                state_tracker=StubStateTracker(),
+            )
+            service._client = FakeAnthropicClient({
+                "primero": (0.05, make_json_result("Better First")),
+            })
+            service._should_generate_verse_suggestions = lambda *args: False
+
+            service.enrich("primero", "First", 1000)
+            await service.close()
+
+            assert updates == [(1000, "Better First")]
+            assert settled == [1000]
 
         run(run_())
