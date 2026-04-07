@@ -120,6 +120,13 @@ After editing:
 2. rerun `tests\server -q`
 3. run the benchmark only when the change affects live pipeline behavior enough to justify it
 
+For parallel benchmark collection, use the staggered regime:
+
+- capture with `tests/benchmark/run_pipeline_test.py` in `--capture-only` mode
+- use explicit short durations and start offsets
+- assign distinct `--port` values per live run
+- evaluate afterward with `tests/benchmark/evaluate_captured_runs.py`
+
 If counts change and the testing runbook lists verified totals, update `TESTING_AND_BENCHMARKS.md`.
 
 ### 7. Update GitHub

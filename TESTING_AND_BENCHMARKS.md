@@ -49,11 +49,11 @@ Latest verified result in this workspace:
 
 This benchmark exercises the live server pipeline end to end:
 
-- Starts `uvicorn` on port `8799`
+- Starts `uvicorn` on a caller-selected port
 - Streams clipped sermon audio through the WebSocket pipeline
 - Captures display events
 - Computes WER against the paired SRT
-- Writes a full run JSON plus summary history
+- Writes a full run JSON and, unless `--capture-only` is used, updates history/evaluation artifacts
 
 ### Prerequisites
 
@@ -81,12 +81,54 @@ $env:PYTHONIOENCODING='utf-8'
 server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py --duration 5
 ```
 
-### Full 85-Second Run
+### Standard Live Run
 
 ```powershell
 $env:PATH='C:\Users\Dan\Desktop\Projects\Transcribe Video\ffmpeg;' + $env:PATH
 $env:PYTHONIOENCODING='utf-8'
-server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py --duration 85
+server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py
+```
+
+This now uses the default 30-second clip so routine live evaluation stays fast.
+
+### New Staggered Regime
+
+Use a fresh results root so staggered offset runs do not mix with the legacy
+history:
+
+```powershell
+$env:PATH='C:\Users\Dan\Desktop\Projects\Transcribe Video\ffmpeg;' + $env:PATH
+$env:PYTHONIOENCODING='utf-8'
+server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py `
+  --audio-dir tests/audio/1 `
+  --start-offset 30 `
+  --port 8801 `
+  --results-root tests/benchmark/results/staggered `
+  --capture-only
+```
+
+Capture staggered runs in parallel with:
+
+- distinct `--port` values
+- distinct `--church-id` values or the default generated namespace
+- explicit short durations such as `--duration 5`
+- `--capture-only`
+
+After the captures finish, evaluate them sequentially:
+
+```powershell
+server\.venv\Scripts\python.exe tests\benchmark\evaluate_captured_runs.py `
+  --results-root tests/benchmark/results/staggered
+```
+
+### Explicit Long Run
+
+Use a longer clip only when you intentionally want deeper benchmark coverage:
+
+```powershell
+$env:PATH='C:\Users\Dan\Desktop\Projects\Transcribe Video\ffmpeg;' + $env:PATH
+$env:PYTHONIOENCODING='utf-8'
+server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py --duration 85 --allow-long-duration
 ```
 
 ### Benchmark Output
@@ -96,37 +138,33 @@ For `--audio-dir tests/audio/1`, results are written to:
 - `tests/benchmark/results/1/pipeline/history.json`
 - `tests/benchmark/results/1/pipeline/<run_id>.json`
 
-Latest verified benchmark run:
+For the staggered regime, results are written under:
 
-- Run id: `2026-04-07T15-30-27Z`
-- File: `tests/benchmark/results/1/pipeline/2026-04-07T15-30-27Z.json`
-- Raw WER: `12.94%`
-- Committed WER: `14.93%`
-- Committed sentences: `15`
-- Translations: `15`
-- LLM corrections: `9`
-- Verse events: `13`
-- Wall time: `105.8s`
+- `tests/benchmark/results/staggered/<audio_dir>/pipeline/`
+- `tests/benchmark/results/staggered/cycle_log.json`
+- `tests/benchmark/results/staggered/SELF_IMPROVEMENT_REPORT.md`
 
-Prior baseline already on disk:
+Current verified state:
 
-- Run id: `2026-04-07T13-41-01Z`
-- File: `tests/benchmark/results/1/pipeline/2026-04-07T13-41-01Z.json`
-- Raw WER: `12.44%`
-- Committed WER: `14.43%`
+- Legacy lane:
+  - `tests/audio/1` has 3 runs
+  - `tests/audio/2` has 3 runs
+- Staggered lane:
+  - `tests/audio/1` has 2 evaluated 5-second runs at offsets `0s` and `30s`
+  - `tests/audio/2` has 2 evaluated 5-second runs at offsets `0s` and `30s`
 
 ## Troubleshooting
 
-### Port 8799 Already In Use
+### Port Already In Use
 
-The benchmark starts its own server on port `8799`. If a previous run was interrupted, clean up orphaned benchmark and `uvicorn` processes before retrying:
+The benchmark starts its own server on the requested `--port`. If a previous run was interrupted, clean up orphaned benchmark and `uvicorn` processes before retrying:
 
 ```powershell
 Get-CimInstance Win32_Process |
   Where-Object {
     $_.Name -like 'python*' -and (
       $_.CommandLine -like '*tests\\benchmark\\run_pipeline_test.py*' -or
-      $_.CommandLine -like '*-m uvicorn server.main:app*8799*'
+      $_.CommandLine -like '*-m uvicorn server.main:app*88*'
     )
   } |
   Select-Object ProcessId, CommandLine
@@ -139,7 +177,7 @@ $targets = Get-CimInstance Win32_Process |
   Where-Object {
     $_.Name -like 'python*' -and (
       $_.CommandLine -like '*tests\\benchmark\\run_pipeline_test.py*' -or
-      $_.CommandLine -like '*-m uvicorn server.main:app*8799*'
+      $_.CommandLine -like '*-m uvicorn server.main:app*88*'
     )
   } |
   Select-Object -ExpandProperty ProcessId
@@ -152,10 +190,10 @@ if ($targets) {
 Confirm the port is clear:
 
 ```powershell
-netstat -ano | Select-String ':8799'
+netstat -ano | Select-String ':8801'
 ```
 
-No `LISTENING` entry means the benchmark can start fresh. `TIME_WAIT` entries after shutdown are normal.
+No `LISTENING` entry on the port you plan to use means the benchmark can start fresh. `TIME_WAIT` entries after shutdown are normal.
 
 ### FFmpeg Not Found
 
@@ -171,4 +209,7 @@ Then prepend that folder to `PATH` before running the benchmark.
 
 - The pytest suites under `tests/server` do not require Redis or the live benchmark server.
 - The pipeline benchmark is not part of pytest and takes about the clip duration plus pipeline drain time.
+- Routine live runs are capped at 30 seconds unless `--allow-long-duration` is passed.
+- Parallel staggered capture is safe only in `--capture-only` mode with distinct `--port` values, followed by sequential evaluation.
+- Use explicit short durations for staggered coverage windows so the harness does not benchmark a full sermon by mistake.
 - Interrupting the benchmark can leave background Python processes behind; clean them up before retrying.

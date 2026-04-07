@@ -1,213 +1,176 @@
 # Review Instructions — Closed-Loop Evaluation System
 
-**Status:** Merged to `main` at commit `2bc0f44` (2026-04-07)  
-**PR:** hainesdev/churchbridge-ai#1 (closed)  
-**For:** Any agent picking up this work — read this before touching the evaluation loop.
+**Status:** Main contains the original evaluation loop plus the staggered benchmark regime added on 2026-04-07.  
+**For:** Any agent picking up benchmark or self-improvement work.
 
 ---
 
-## What Is in Main
+## What Is In Main
 
-A closed-loop benchmark evaluation system on top of the existing pipeline
-benchmark runner. Six Python modules, two planning documents, one generated
-handoff document, and a second benchmark audio set.
+The repository now has two benchmark workflows:
+
+1. **Legacy live benchmark lane**
+   - Results root: `tests/benchmark/results/`
+   - Typical use: single-run/manual evaluation
+   - Shared report: `SELF_IMPROVEMENT_REPORT.md`
+
+2. **Staggered benchmark lane**
+   - Results root: `tests/benchmark/results/staggered/`
+   - Typical use: short offset windows, parallel capture, sequential evaluation
+   - Regime-local report: `tests/benchmark/results/staggered/SELF_IMPROVEMENT_REPORT.md`
 
 ### Evaluation modules (`tests/benchmark/`)
 
 | File | Role |
 |---|---|
-| `scorecard.py` | Normalises a pipeline run JSON into a canonical scorecard: accuracy, latency, behavioral integrity |
-| `trajectory.py` | Rolling stats (3/5/10-run windows), trend labels, confidence per metric |
-| `review.py` | Deterministic 4-section markdown review — exactly one action recommendation via tier-priority rules |
-| `llm_interpret.py` | Claude Opus 4.6 pattern analysis — interprets artifacts, proposes one targeted fix per cycle |
-| `cycle_log.py` | Append-only `results/cycle_log.json` — the system's memory across all improvement cycles |
-| `orchestrator.py` | Wires all six stages, writes `SELF_IMPROVEMENT_REPORT.md` as the agent handoff document |
-
-### Planning documents (repo root)
-
-| File | Role |
-|---|---|
-| `AUTONOMOUS_EVALUATION_PLAN.md` | Design specification for the multi-cycle evaluation loop — the authoritative intent document |
-| `SELF_IMPROVEMENT_DIRECTIVE.md` | Single-cycle improvement workflow that the evaluation loop extends |
-| `SELF_IMPROVEMENT_REPORT.md` | Auto-generated handoff doc — regenerated after every benchmark run |
-
-### Modified file
-
-`tests/benchmark/run_pipeline_test.py` — calls `orchestrator.run_evaluation_cycle()`
-after each benchmark run. `--no-llm` flag added. File writes fixed to UTF-8.
-
-### Artifact layout (runtime, gitignored)
-
-```
-tests/benchmark/results/
-  cycle_log.json                          <- append-only cycle memory
-  <audio_dir_name>/pipeline/
-    <run_id>.json                         <- full run
-    history.json                          <- summary rows
-    scorecards/<run_id>.json              <- canonical scorecard
-    trajectory.json                       <- rolling stats
-    reviews/<run_id>.md                   <- markdown review
-SELF_IMPROVEMENT_REPORT.md               <- agent handoff (repo root, committed)
-```
+| `scorecard.py` | Normalizes a pipeline run JSON into a canonical scorecard |
+| `trajectory.py` | Rolling stats, trend labels, confidence per metric |
+| `review.py` | Deterministic markdown review with one action recommendation |
+| `llm_interpret.py` | Interprets artifacts after deterministic review |
+| `cycle_log.py` | Append-only cycle memory, now parameterized per results root |
+| `orchestrator.py` | Runs scorecard -> trajectory -> review -> LLM -> cycle log -> report |
+| `storage.py` | Shared helpers for results roots, pipeline directories, report/cycle-log paths |
+| `evaluate_captured_runs.py` | Sequential evaluator for previously captured staggered runs |
+| `run_pipeline_test.py` | Live benchmark runner with `--start-offset`, `--port`, `--church-id`, `--results-root`, and `--capture-only` |
 
 ---
 
-## Current System State
+## Current State
 
-| Item | Value |
+### Legacy lane (`tests/benchmark/results/`)
+
+| Set | Status |
 |---|---|
-| Benchmark set 1 (`tests/audio/1`) | 2 runs completed |
-| Benchmark set 2 (`tests/audio/2`) | 0 runs — audio file present, never benchmarked |
-| Current action | `collect_more_runs` — need 1 more run on set 1 to unlock trend labels |
-| `out_of_order_event_count` | 23–25 per run — Tier-1 metric, flagged as known issue below |
-| `avg_translation_latency_s` | `None` both runs — known issue below |
-| LLM interpreter | Not yet exercised against real data (skipped while action = `collect_more_runs`) |
+| `tests/audio/1` | 3 runs recorded; latest review action is `investigate` |
+| `tests/audio/2` | 3 runs recorded; latest review action is `promote` |
 
-**The system unlocks progressively:**
-- 3 runs → trend labels resolve from `insufficient_data`
-- 5 runs → medium-window comparisons valid
-- 5+ runs with sustained Tier-2 regression → `propose_directive_update` eligible
+Important:
+- The shared root-level `SELF_IMPROVEMENT_REPORT.md` reflects only the most recently evaluated legacy run.
+- Do not assume that file summarizes both audio sets at once.
+
+### Staggered lane (`tests/benchmark/results/staggered/`)
+
+| Set | Status |
+|---|---|
+| `tests/audio/1` | 2 staggered runs captured/evaluated at offsets `0s` and `30s`, each with `--duration 5` |
+| `tests/audio/2` | 2 staggered runs captured/evaluated at offsets `0s` and `30s`, each with `--duration 5` |
+
+The staggered lane is a fresh regime. Its histories were intentionally reset so
+old 85-second and 30-second legacy runs do not pollute trend analysis.
+
+Current staggered action:
+- `collect_more_runs`
+
+Why:
+- Each staggered set still has only 2 comparable runs.
+- Trend labels unlock at 3 runs per set.
 
 ---
 
 ## Design Principles — Do Not Break These
 
-These rules are load-bearing. Any future change to the evaluation loop must
-preserve them.
+1. **Deterministic code decides, LLM interprets.**
+   `review.py` chooses the action label first. `llm_interpret.py` cannot override it.
 
-1. **Deterministic code decides, LLM interprets.** `review.py` sets the action
-   label via tier-priority rules. `llm_interpret.py` runs after and cannot
-   change it. Order in `orchestrator.run_evaluation_cycle()`:
-   scorecard → trajectory → review → LLM → cycle log → report.
+2. **Parallel capture must not mean parallel evaluation.**
+   Staggered live runs may be captured in parallel only in `--capture-only` mode.
+   Evaluation must run afterward, sequentially, via `evaluate_captured_runs.py`.
 
-2. **LLM does not call the API when action is `collect_more_runs`.** The
-   early-return block in `llm_interpret.interpret_run()` returns a canned stub
-   without making a network call.
+3. **Do not mix regimes.**
+   Legacy runs and staggered runs are not directly comparable. Keep their
+   histories, cycle logs, and reports separate.
 
-3. **Directive changes require 5+ runs of sustained evidence.** The
-   `propose_directive_update` action fires only when a Tier-2 metric regresses
-   across the long window (`n >= 5` in `trajectory.py`). Do not lower this threshold.
+4. **Directive changes still require 5+ runs of sustained evidence.**
+   Do not lower the threshold for `propose_directive_update`.
 
-4. **`cycle_log.json` is append-only.** `cycle_log.record_cycle()` always
-   appends. It never overwrites or mutates prior entries.
+5. **Cycle logs are append-only.**
+   If a staggered regime needs a clean slate, reset the results root before
+   running it. Do not edit prior cycle entries in place.
 
-5. **All file I/O uses explicit `encoding="utf-8"`.** Every `write_text` and
-   `read_text` in all six modules specifies encoding. Reads use a fallback
-   (utf-8 → latin-1) to handle the two legacy run JSONs that predate this work.
-
-6. **`SELF_IMPROVEMENT_REPORT.md` is overwritten on every run, not appended.**
+6. **All file I/O uses explicit UTF-8.**
 
 ---
 
-## Known Issues (open — not yet fixed)
+## Important Fixes Already Landed
 
-### 1. `out_of_order_event_count` is inflated
+These are no longer open issues:
 
-Current value: 23–25 per run. The metric looks alarming but is misleading.
+1. `out_of_order_event_count` false positives were fixed in `scorecard.py`.
+   Ordering now checks committed `final_spanish` events only.
 
-`_check_ts_ordering` in `scorecard.py` counts any decrease in the `ts` field
-across all messages sorted by `_elapsed_s`. The problem: LLM correction events
-(`translation_update`) share the same `ts` as their paired translation (they
-reference the same sentence) but arrive later. When sorted by `_elapsed_s`,
-their identical `ts` causes the sequence to appear to jump backward.
+2. `avg_translation_latency_s` and `avg_llm_correction_latency_s` now resolve
+   correctly from raw event logs.
 
-**Fix needed:** Restrict ordering checks to `final_spanish` events only, or
-compare `_elapsed_s` instead of `ts`. This is a scorecard-level change in
-`scorecard.py:_check_ts_ordering`.
-
-### 2. `avg_translation_latency_s` and `avg_llm_correction_latency_s` are always `None`
-
-The pairing functions `_translation_latencies` and `_correction_latencies` in
-`scorecard.py` match committed sentences to translations by `ts`. The matching
-works, but the `committed_msgs` list (sourced from `all_messages`) does not
-carry the `_elapsed_s` field because `final_spanish` events in `all_messages`
-store it as `_elapsed_s` while the pairing expects it on the `committed_msgs`
-entry directly. Re-check against the actual event log schema before fixing.
+Do not reopen those as active benchmark bugs unless new evidence appears.
 
 ---
 
-## Verification Steps
+## Standard Staggered Workflow
 
-Run from the project root using `server/.venv/Scripts/python.exe`.
-
-### Smoke-test orchestrator (no API call)
+### 1. Reset the staggered regime if you want a fresh comparable batch
 
 ```powershell
-server\.venv\Scripts\python.exe tests\benchmark\orchestrator.py `
-  tests\benchmark\results\1\pipeline\2026-04-07T15-30-27Z.json --no-llm
+if (Test-Path tests\benchmark\results\staggered) {
+  Remove-Item tests\benchmark\results\staggered -Recurse -Force
+}
+New-Item -ItemType Directory -Path tests\benchmark\results\staggered | Out-Null
 ```
 
-Expected: prints cycle header, scorecard/trajectory/review paths, "LLM interpreter
-skipped", cycle log count increments, `Action: COLLECT_MORE_RUNS`, exit 0.
+### 2. Capture short windows in parallel
 
-### Verify action decision logic
+Use:
+- distinct `--port` values
+- either distinct `--church-id` values or the generated default
+- `--capture-only`
+- explicit short durations such as `--duration 5`
+
+Example:
 
 ```powershell
-server\.venv\Scripts\python.exe -c "
-import json, sys
-sys.path.insert(0, '.')
-from tests.benchmark.scorecard import scorecard_from_file
-from tests.benchmark.trajectory import compute_trajectory
-from tests.benchmark.review import _action_recommendation, _flat
-from pathlib import Path
-sc = scorecard_from_file(Path('tests/benchmark/results/1/pipeline/2026-04-07T15-30-27Z.json'))
-traj = json.loads(Path('tests/benchmark/results/1/pipeline/trajectory.json').read_text(encoding='utf-8'))
-action, reasons = _action_recommendation(sc, traj, _flat(sc))
-print('Action:', action)
-# Expected: collect_more_runs
-"
+$env:PATH='C:\Users\Dan\Desktop\Projects\Transcribe Video\ffmpeg;' + $env:PATH
+$env:PYTHONIOENCODING='utf-8'
+
+server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py `
+  --audio-dir tests/audio/1 `
+  --duration 5 `
+  --start-offset 60 `
+  --port 8805 `
+  --results-root tests/benchmark/results/staggered `
+  --capture-only
 ```
 
-### Verify LLM short-circuit (no API call)
+### 3. Evaluate captured runs sequentially
 
 ```powershell
-server\.venv\Scripts\python.exe -c "
-import sys; sys.path.insert(0, '.')
-from tests.benchmark.llm_interpret import interpret_run
-r = interpret_run({}, {'n_runs': 2}, {}, '', [], 'collect_more_runs')
-print(r['confidence'], r['proposed_change']['type'])
-# Expected: low none
-"
+server\.venv\Scripts\python.exe tests\benchmark\evaluate_captured_runs.py `
+  --results-root tests/benchmark/results/staggered
 ```
 
-### Run server test suite
+### 4. Only then review trajectory/review/report artifacts
 
-```powershell
-server\.venv\Scripts\python.exe -m pytest tests\server -q
-```
+Primary files:
+- `tests/benchmark/results/staggered/<audio_dir>/pipeline/history.json`
+- `tests/benchmark/results/staggered/<audio_dir>/pipeline/trajectory.json`
+- `tests/benchmark/results/staggered/<audio_dir>/pipeline/reviews/<run_id>.md`
+- `tests/benchmark/results/staggered/SELF_IMPROVEMENT_REPORT.md`
 
 ---
 
-## Next Steps
+## Recommended Next Step
 
-In priority order:
+Run one more staggered offset for each audio set so both sets reach 3 runs.
 
-1. **Run benchmark on `tests/audio/2`** — the audio is present but never benchmarked.
-   This gives the system a second independent trajectory and brings set 1 closer
-   to the 3-run minimum for trend labels.
+Suggested next offsets:
+- `tests/audio/1` at `60s`
+- `tests/audio/2` at `60s`
 
-   ```powershell
-   server\.venv\Scripts\python.exe tests\benchmark\run_pipeline_test.py --audio-dir tests/audio/2
-   ```
-
-2. **Run benchmark on `tests/audio/1` again** — one more run brings set 1 to 3,
-   which unlocks `improved`/`regressed`/`flat` labels and the first real LLM
-   interpretation cycle.
-
-3. **Fix `out_of_order_event_count`** — see Known Issues #1. Fix in
-   `scorecard.py:_check_ts_ordering` before the metric misleads the LLM interpreter.
-
-4. **Investigate `avg_translation_latency_s`** — see Known Issues #2. Confirm
-   the pairing logic against the actual event log schema for a recent run.
-
-5. **Expand `DIRECTIVE.md` benchmark history table** — the table at the bottom of
-   `DIRECTIVE.md` is still empty. Populate it with the two existing run results.
+Keep them at `--duration 5` unless you intentionally want a different regime.
 
 ---
 
 ## Reference Documents
 
-- `AUTONOMOUS_EVALUATION_PLAN.md` — authoritative design spec for this system
-- `SELF_IMPROVEMENT_DIRECTIVE.md` — single-cycle improvement workflow
-- `DIRECTIVE.md` — production pipeline architecture
-- `TESTING_AND_BENCHMARKS.md` — approved test commands and verified suite counts
+- `AUTONOMOUS_EVALUATION_PLAN.md`
+- `SELF_IMPROVEMENT_DIRECTIVE.md`
+- `DIRECTIVE.md`
+- `TESTING_AND_BENCHMARKS.md`
