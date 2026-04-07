@@ -330,6 +330,7 @@ class TestHoldNext:
             buf.hold_next("reason_b", hold_secs=2.0)
             buf.hold_next("reason_c", hold_secs=0.5)
             assert buf._hold_secs == 2.0  # maximum wins
+            assert buf._hold_reason == "reason_b"  # reason tracks the winning hold
 
         asyncio.run(run())
 
