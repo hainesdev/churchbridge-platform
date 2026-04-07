@@ -101,6 +101,16 @@ These are no longer open issues:
 2. `avg_translation_latency_s` and `avg_llm_correction_latency_s` now resolve
    correctly from raw event logs.
 
+3. `time_to_first_translation_s`, `time_to_first_committed_sentence_s`, and
+   `time_to_first_llm_correction_s` were missing from `LOWER_IS_BETTER` in
+   `trajectory.py`. Decreasing latency was incorrectly labeled `regressed`.
+   Fixed in PR #2.
+
+4. Clip-duration regime change detection added to `trajectory.py`. When
+   `clip_duration_s` changes by >40% across runs, WER and sentence-count
+   metrics are marked `noisy` to prevent measurement-regime artifacts from
+   triggering false `investigate` actions. Fixed in PR #2.
+
 Do not reopen those as active benchmark bugs unless new evidence appears.
 
 ---

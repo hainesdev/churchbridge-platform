@@ -44,6 +44,7 @@ Latest verified result in this workspace:
 
 - `tests/server/test_pipeline_regressions.py`: `4 passed`
 - `tests/server`: `97 passed`
+- `tests/benchmark/test_scorecard.py` + `test_run_pipeline_test.py`: `21 passed`
 
 ## Pipeline Benchmark
 
