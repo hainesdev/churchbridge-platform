@@ -127,6 +127,11 @@ These are no longer open issues:
    for flag names the pipeline never emits. Fixed to use `pending_completion`
    and `caption_merge` events.
 
+10. `stale_correction_suppression_count` in `scorecard.py` was always 0 because
+    `session_manager._on_correction` suppressed stale corrections silently (log only)
+    without broadcasting a `correction_suppressed` event. Fixed to broadcast
+    `{"type": "correction_suppressed", "ts": ts}` when suppressing.
+
 Do not reopen those as active benchmark bugs unless new evidence appears.
 
 ---
