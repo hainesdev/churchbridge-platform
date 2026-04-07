@@ -63,6 +63,9 @@ LOWER_IS_BETTER = {
     "wer_committed_deletions",
     "wer_committed_insertions",
     "wall_time_s",
+    "time_to_first_translation_s",
+    "time_to_first_committed_sentence_s",
+    "time_to_first_llm_correction_s",
     "avg_translation_latency_s",
     "avg_llm_correction_latency_s",
     "deferred_release_count",
@@ -76,6 +79,22 @@ LOWER_IS_BETTER = {
     "mode_flip_count",
     "display_ready_violation_count",
 }
+
+# Metrics whose trend labels are unreliable when clip_duration_s changes significantly
+# across runs. WER variance grows sharply with fewer committed sentences (shorter clips
+# produce fewer reference words, so each error has proportionally more impact).
+_CLIP_SENSITIVE_METRICS = {
+    "wer_committed_pct",
+    "wer_raw_pct",
+    "committed_sentence_count",
+    "translation_count",
+    "llm_correction_count",
+    "verse_event_count",
+}
+
+# If the latest run's clip_duration_s differs from the prior runs' mean by more than
+# this fraction, WER and count metrics are marked "noisy" regardless of trend direction.
+_CLIP_DURATION_CHANGE_THRESHOLD = 0.40
 
 # Tier classification for each metric key (used by reviewer)
 TIER = {
@@ -193,13 +212,39 @@ def _extract_series(scorecards: list[dict]) -> dict[str, list[float | None]]:
     """
     Build {metric_key: [value, ...]} time series from an ordered list of scorecards.
     Flattens accuracy, latency, and behavioral sub-dicts.
+    Also surfaces clip_duration_s from the scorecard top level so the trajectory
+    can detect regime changes across runs.
     """
     series: dict[str, list[float | None]] = {}
     for sc in scorecards:
         for group in ("accuracy", "latency", "behavioral"):
             for k, v in sc.get(group, {}).items():
                 series.setdefault(k, []).append(v if isinstance(v, (int, float)) else None)
+        # Expose clip_duration_s at the top level so compute_trajectory can detect
+        # when the benchmark regime changed (different clip length across runs).
+        cd = sc.get("clip_duration_s")
+        series.setdefault("clip_duration_s", []).append(
+            cd if isinstance(cd, (int, float)) else None
+        )
     return series
+
+
+def _clip_duration_regime_changed(clip_durations: list[float | None]) -> bool:
+    """Return True if the latest run's clip duration differs substantially from prior runs.
+
+    A 'substantial' change is defined as the latest value deviating from the prior
+    runs' mean by more than _CLIP_DURATION_CHANGE_THRESHOLD (default 40%).
+    When this is true, WER and sentence-count metrics should not be compared
+    directly against earlier runs — they're not measuring the same thing.
+    """
+    clean = [v for v in clip_durations if v is not None]
+    if len(clean) < 2:
+        return False
+    latest = clean[-1]
+    prior_mean = mean(clean[:-1])
+    if prior_mean == 0:
+        return False
+    return abs(latest - prior_mean) / prior_mean > _CLIP_DURATION_CHANGE_THRESHOLD
 
 
 # ── Per-set trajectory ─────────────────────────────────────────────────────────
@@ -217,16 +262,28 @@ def compute_trajectory(pipeline_dir: Path) -> dict:
 
     series  = _extract_series(scorecards)
 
+    # Detect clip-duration regime change before computing metric trends.
+    # When the latest run used a significantly different clip duration, WER and
+    # sentence-count metrics are not directly comparable to prior runs.
+    clip_regime_changed = _clip_duration_regime_changed(series.get("clip_duration_s", []))
+
     metrics: dict[str, Any] = {}
     for key, values in series.items():
         current  = values[-1] if values else None
         previous = values[-2] if len(values) >= 2 else None
 
+        trend = _trend_label(values, key)
+        # If the clip duration changed substantially, override trend labels for
+        # metrics that scale with clip length. Marking them "noisy" prevents the
+        # review from treating measurement-regime artifacts as real regressions.
+        if clip_regime_changed and key in _CLIP_SENSITIVE_METRICS:
+            trend = "noisy"
+
         entry: dict[str, Any] = {
             "tier":           TIER.get(key),
             "current":        current,
             "delta_vs_prev":  _delta(current, previous),
-            "trend":          _trend_label(values, key),
+            "trend":          trend,
             "short":          _window_stats(values, SHORT_WINDOW),
             "medium":         _window_stats(values, MEDIUM_WINDOW),
             "long":           _window_stats(values, LONG_WINDOW),
@@ -255,9 +312,10 @@ def compute_trajectory(pipeline_dir: Path) -> dict:
         confidence = "stable" if noisy_count <= 2 else "volatile"
 
     trajectory = {
-        "audio_dir":   pipeline_dir.parent.name,
-        "n_runs":      n_runs,
-        "run_ids":     run_ids,
+        "audio_dir":          pipeline_dir.parent.name,
+        "n_runs":             n_runs,
+        "run_ids":            run_ids,
+        "clip_regime_changed": clip_regime_changed,
         "confidence":  confidence,
         "metrics":     metrics,
     }

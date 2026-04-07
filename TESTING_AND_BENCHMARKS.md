@@ -54,7 +54,7 @@ server\.venv\Scripts\python.exe -m pytest tests\benchmark -q
 
 Latest verified benchmark/evaluation result in this workspace:
 
-- `tests/benchmark`: `13 passed`
+- `tests/benchmark`: `17 passed`
 
 ## Pipeline Benchmark
 

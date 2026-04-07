@@ -113,6 +113,20 @@ These are no longer open issues:
 6. Session-close flushes now drain queued translation and enrichment work before
    shutdown, so short benchmark windows do not lose downstream events.
 
+7. `time_to_first_translation_s`, `time_to_first_committed_sentence_s`, and
+   `time_to_first_llm_correction_s` were missing from `LOWER_IS_BETTER` in
+   `trajectory.py`. Decreasing latency was incorrectly labeled `regressed`.
+
+8. Clip-duration regime change detection added to `trajectory.py`. When
+   `clip_duration_s` changes by >40% across runs, WER and sentence-count
+   metrics are marked `noisy` to prevent measurement-regime artifacts from
+   triggering false `investigate` actions.
+
+9. `deferred_release_count`, `deferred_release_timeout_count`, and
+   `caption_merge_count` in `scorecard.py` were always 0 because they looked
+   for flag names the pipeline never emits. Fixed to use `pending_completion`
+   and `caption_merge` events.
+
 Do not reopen those as active benchmark bugs unless new evidence appears.
 
 ---
