@@ -211,17 +211,32 @@ def build_scorecard(result: dict) -> dict:
     trans_lat_pairs  = _translation_latencies(committed_msgs, translation_msgs)
     corr_lat_pairs   = _correction_latencies(translation_msgs, correction_msgs)
 
-    # deferred_release events are segment_metadata entries with a deferred flag
-    deferred_releases  = [m for m in seg_metadata if m.get("deferred")]
-    deferred_timeouts  = [m for m in seg_metadata if m.get("deferred_timeout")]
+    # deferred releases: sentences suppressed because display_ready=false.
+    # The pipeline emits pending_completion=True in segment_metadata for these.
+    deferred_pending_ts = {
+        m.get("ts") for m in seg_metadata if m.get("pending_completion")
+    }
+
+    # deferred timeouts: suppressed sentences where the 6-second timeout fired.
+    # Identified by a translation_update arriving for the ts without a prior
+    # caption_merge absorbing it (when a merge absorbs the ts, the deferred
+    # task is cancelled and no translation_update is emitted for that ts).
+    caption_merge_absorbed_ts = {
+        m.get("ts_absorb") for m in all_msgs if m.get("type") == "caption_merge"
+    }
+    correction_ts = {m.get("ts") for m in correction_msgs}
+    deferred_timeout_ts = {
+        ts for ts in deferred_pending_ts
+        if ts in correction_ts and ts not in caption_merge_absorbed_ts
+    }
 
     # stale correction suppression — look for suppressed events in all_messages
     stale_suppressions = len([
         m for m in all_msgs if m.get("type") == "correction_suppressed"
     ])
 
-    # caption merges — segment_metadata entries that carry a merged flag
-    caption_merges = len([m for m in seg_metadata if m.get("merged")])
+    # caption merges — caption_merge events in all_messages
+    caption_merges = len([m for m in all_msgs if m.get("type") == "caption_merge"])
 
     latency: dict[str, Any] = {
         "wall_time_s":                       result.get("wall_time_s"),
@@ -231,8 +246,8 @@ def build_scorecard(result: dict) -> dict:
         "time_to_first_llm_correction_s":    time_to_first_correction,
         "avg_translation_latency_s":         _avg_latency(trans_lat_pairs),
         "avg_llm_correction_latency_s":      _avg_latency(corr_lat_pairs),
-        "deferred_release_count":            len(deferred_releases),
-        "deferred_release_timeout_count":    len(deferred_timeouts),
+        "deferred_release_count":            len(deferred_pending_ts),
+        "deferred_release_timeout_count":    len(deferred_timeout_ts),
         "stale_correction_suppression_count": stale_suppressions,
         "caption_merge_count":               caption_merges,
     }
