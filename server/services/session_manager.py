@@ -46,11 +46,16 @@ _STT_FILLER = re.compile(r'\b(?:A{2,}|M{2,}|Uh+|Um+|Eh+|Eeh+|Mmm+|Este+)\b', re.
 # "y a la fe" (different single-char words in sequence).
 _STT_SINGLE_REPEAT = re.compile(r'\b(\w)(?:\s+\1)+\b', re.IGNORECASE)
 
-# Repeated content word (stutter): "que que" → "que", "el el" → "el"
-# Limited to short words (≤ 5 chars) to avoid collapsing intentional emphasis
-# like "muy muy" (very very) in longer words — but short function word repeats
-# are always noise.
-_STT_WORD_REPEAT = re.compile(r'\b(\w{1,5})\s+\1\b', re.IGNORECASE)
+# Repeated function word (stutter): "que que" → "que", "el el" → "el"
+# Uses an explicit allowlist of Spanish function words — prepositions, articles,
+# conjunctions, and relative pronouns — rather than a character-count heuristic.
+# This protects deliberate emphasis repetition of lexical words ("muy muy",
+# "bien bien", "más más") which are common in Pentecostal preaching register.
+_STT_WORD_REPEAT = re.compile(
+    r'\b(que|el|la|los|las|un|una|de|en|con|por|para|a|al|del|'
+    r'y|o|ni|si|pero|como|cuando|donde|quien|cual|ya)\s+\1\b',
+    re.IGNORECASE,
+)
 
 # "Santo" as STT noise: preaching-register exclamation misclassified as sentence start.
 # Patterns: "Santo tú...", "Santo él...", "Santo ella..." etc.
@@ -389,6 +394,9 @@ class ServiceSession:
             stale = [k for k in self._pending_audio_timing if k < cutoff]
             for k in stale:
                 del self._pending_audio_timing[k]
+            stale_settled = [k for k in self._enrichment_settled if k < cutoff]
+            for k in stale_settled:
+                self._enrichment_settled.discard(k)
             await self._translation.translate(text, ts)
 
     # --- Google Translation callbacks ---
@@ -520,6 +528,29 @@ class ServiceSession:
         })
 
     # --- Helpers ---
+
+    def get_stats(self) -> dict:
+        """Return operational metrics for this session. Used by the stats endpoint."""
+        return {
+            "sentence_buffer": {
+                "structural_flush_block_count": (
+                    self._sentence_buffer.structural_flush_block_count
+                    if self._sentence_buffer else 0
+                ),
+                "forced_release_count": (
+                    self._sentence_buffer.forced_release_count
+                    if self._sentence_buffer else 0
+                ),
+                "conditional_flush_block_count": (
+                    self._sentence_buffer.conditional_flush_block_count
+                    if self._sentence_buffer else 0
+                ),
+            },
+            "enrichment": dict(self._enrichment.metrics) if self._enrichment else {},
+            "stt_noise_removed_count": self._stt_noise_removed_count,
+            "_enrichment_settled_size": len(self._enrichment_settled),
+            "session_id": self._db_session_id,
+        }
 
     async def _broadcast(self, event: dict):
         await self._broadcaster.publish(self._church_id, event)

@@ -142,6 +142,7 @@ class TopicTracker:
         topic_hint = f' The sermon topic is: "{self._sermon_topic}".' if self._sermon_topic else ""
         mode_hint = f" The current sermon mode appears to be: {self._current_mode}."
 
+        response = None
         try:
             response = await self._client.messages.create(
                 model=ANTHROPIC_MODEL,
@@ -195,7 +196,7 @@ class TopicTracker:
             )
         except (json.JSONDecodeError, KeyError):
             # Graceful fallback: store the raw text as a plain summary
-            raw_text = response.content[0].text.strip() if 'response' in dir() else ""
+            raw_text = response.content[0].text.strip() if response is not None else ""
             if raw_text:
                 self._context = SermonContext(
                     summary=raw_text[:300],
