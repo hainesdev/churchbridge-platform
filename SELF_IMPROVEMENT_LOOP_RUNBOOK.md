@@ -92,6 +92,17 @@ Notes:
 - Keep `--capture-only` on for parallel capture.
 - The runner now generates unique `run_id`s even when separate processes start at nearly the same moment.
 
+**Important — Claude Code bash environment:** When running captures from Claude Code's
+bash tool (not a native PowerShell terminal), Python's subprocess cannot see PATH
+overrides set with bash's inline `PATH=` prefix. Wrap each capture command with
+`powershell -NoProfile -Command` so ffmpeg is visible to pydub:
+
+```bash
+powershell -NoProfile -Command "\$env:PATH='C:\\Users\\Dan\\Desktop\\Projects\\Transcribe Video\\ffmpeg;' + \$env:PATH; \$env:PYTHONIOENCODING='utf-8'; server\\.venv\\Scripts\\python.exe tests\\benchmark\\run_pipeline_test.py --audio-dir tests/audio/1 --duration 5 --start-offset 0 --port 8801 --church-id staggered-1-0 --results-root tests/benchmark/results/staggered --capture-only"
+```
+
+Repeat for each of the 6 runs with the appropriate `--start-offset`, `--port`, and `--church-id` values. Background them with the Bash tool's `run_in_background` parameter to run all 6 in parallel.
+
 ## Part 3: Evaluate The Captured Runs Sequentially
 
 ```powershell
@@ -166,6 +177,9 @@ Recent examples of valid benchmark-loop fixes in this repo:
 - unique run identifiers for parallel captures
 - staggered regime report aggregation across sets
 - graceful shutdown draining of translation/enrichment tasks after `session_close`
+- `deferred_release_count`, `deferred_release_timeout_count`, `caption_merge_count` — were always 0 because scorecard used wrong field names; fixed to use `pending_completion` and `caption_merge` events
+- trajectory `LOWER_IS_BETTER` missing latency metrics — decreasing latency was labelled `regressed`; fixed
+- clip-duration regime change detection — prevents false regressions when benchmark window length changes
 
 ## Part 7: Test After Editing
 
@@ -218,9 +232,9 @@ current.
 
 ## Current Known Good Validation Snapshot
 
-At the time this runbook was written:
+Last verified: 2026-04-07
 
-- `tests/benchmark`: `13 passed`
+- `tests/benchmark`: `29 passed`
 - `tests/server/test_pipeline_regressions.py`: `6 passed`
 - `tests/server/test_precision_phase.py`: `39 passed`
 - `tests/server`: `99 passed`
