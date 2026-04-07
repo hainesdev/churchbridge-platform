@@ -319,6 +319,38 @@ class TestDeferredRelease:
         run(run_())
 
 
+class TestCorrectionSuppressedEvent:
+    def test_suppressed_correction_broadcasts_correction_suppressed_event(self):
+        """_on_correction must emit correction_suppressed when enrichment has already
+        settled for the same ts, so scorecard.stale_correction_suppression_count is
+        non-zero and the metric is not silently stuck at 0."""
+        async def run_():
+            events = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._enrichment_settled = {1000}
+
+            # ts=1000 is settled → should emit correction_suppressed
+            await session._on_correction(1000, "Late Google correction")
+            # ts=2000 is not settled → should emit normal correction
+            await session._on_correction(2000, "Normal correction")
+
+            assert events == [
+                {"type": "correction_suppressed", "ts": 1000},
+                {"type": "correction", "ts": 2000, "english": "Normal correction"},
+            ]
+
+        run(run_())
+
+
 class TestEnrichmentCloseDrain:
     def test_close_waits_for_in_flight_enrichment_task(self):
         async def run_():
