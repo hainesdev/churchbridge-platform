@@ -51,13 +51,22 @@ def _avg_latency(pairs: list[tuple[float, float]]) -> float | None:
     return round(sum(lags) / len(lags), 3)
 
 
-def _check_ts_ordering(messages: list[dict]) -> int:
+def _event_elapsed(message: dict) -> float | None:
+    """Read elapsed seconds from either normalized layer rows or raw event rows."""
+    elapsed = message.get("_elapsed_s")
+    if elapsed is None:
+        elapsed = message.get("elapsed_s")
+    return elapsed
+
+
+def _check_ts_ordering(committed_sentences: list[dict]) -> int:
     """
-    Count display events whose ts field is strictly less than the previous
+    Count committed sentences whose ts field is strictly less than the previous
     committed-sentence ts — a proxy for out-of-order delivery.
-    Only checks messages that carry a ts field.
+    Restricting this to final_spanish events avoids false positives from
+    downstream updates that intentionally reuse an earlier sentence ts.
     """
-    ts_seq = [m["ts"] for m in messages if "ts" in m]
+    ts_seq = [m["ts"] for m in committed_sentences if "ts" in m]
     violations = sum(1 for i in range(1, len(ts_seq)) if ts_seq[i] < ts_seq[i - 1])
     return violations
 
@@ -87,13 +96,14 @@ def _translation_latencies(
     pairs: list[tuple[float, float]] = []
     for c in committed:
         c_ts = c.get("ts")
-        c_elapsed = c.get("_elapsed_s")
+        c_elapsed = _event_elapsed(c)
         if c_ts is None or c_elapsed is None:
             continue
         # find the translation with the matching ts (same sentence ts)
         match = next((t for t in translations if t.get("ts") == c_ts), None)
-        if match and match.get("elapsed_s") is not None:
-            pairs.append((c_elapsed, match["elapsed_s"]))
+        match_elapsed = _event_elapsed(match) if match else None
+        if match_elapsed is not None:
+            pairs.append((c_elapsed, match_elapsed))
     return pairs
 
 
@@ -107,12 +117,13 @@ def _correction_latencies(
     pairs: list[tuple[float, float]] = []
     for t in translations:
         t_ts = t.get("ts")
-        t_elapsed = t.get("elapsed_s")
+        t_elapsed = _event_elapsed(t)
         if t_ts is None or t_elapsed is None:
             continue
         match = next((c for c in corrections if c.get("ts") == t_ts), None)
-        if match and match.get("elapsed_s") is not None:
-            pairs.append((t_elapsed, match["elapsed_s"]))
+        match_elapsed = _event_elapsed(match) if match else None
+        if match_elapsed is not None:
+            pairs.append((t_elapsed, match_elapsed))
     return pairs
 
 
@@ -203,7 +214,7 @@ def build_scorecard(result: dict) -> dict:
 
     # ── C. Behavioral Integrity ────────────────────────────────────────────────
 
-    out_of_order   = _check_ts_ordering(all_msgs)
+    out_of_order   = _check_ts_ordering(committed_msgs)
     duplicate_commits = _detect_duplicate_commits(committed_msgs)
 
     # orphan corrections — corrections whose ts doesn't match any translation
