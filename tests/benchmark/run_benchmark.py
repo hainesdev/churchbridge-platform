@@ -50,15 +50,32 @@ GOOGLE_TRANSLATE_URL   = "https://translation.googleapis.com/language/translate/
 
 # Deepgram parameters — mirrors the streaming session as closely as possible
 # so benchmark WER reflects real production conditions.
-DEEPGRAM_PARAMS = {
-    "model":        "nova-3",
-    "language":     "es",
-    "smart_format": "true",
-    "punctuate":    "true",
-    "paragraphs":   "true",
-    "utterances":   "true",
-    "diarize":      "false",
-}
+#
+# keyterms are injected as repeated query parameters (list of tuples, not a dict)
+# to match the production streaming session. The default glossary terms here
+# mirror server/db/glossary.py DEFAULT_GLOSSARY so benchmark scores are
+# comparable to live performance.
+_DEEPGRAM_BASE_PARAMS = [
+    ("model",        "nova-3"),
+    ("language",     "es"),
+    ("smart_format", "true"),
+    ("punctuate",    "true"),
+    ("paragraphs",   "true"),
+    ("utterances",   "true"),
+    ("diarize",      "false"),
+]
+
+_DEFAULT_KEYTERMS = [
+    "Jesucristo",
+    "Espíritu Santo",
+    "Pentecostés",
+    "evangelio",
+    "salvación",
+    "alabanza",
+    "adoración",
+]
+
+DEEPGRAM_PARAMS = _DEEPGRAM_BASE_PARAMS + [("keyterms", t) for t in _DEFAULT_KEYTERMS]
 
 
 # ── SRT parsing ───────────────────────────────────────────────────────────────
@@ -347,6 +364,7 @@ async def main():
 
     # ── 2. Deepgram transcription (cached) ────────────────────────────────────
     print_divider("Deepgram Transcription")
+    print(f"  Keyterms  : {', '.join(_DEFAULT_KEYTERMS)}")
     if cache_path.exists() and not args.retranscribe:
         print(f"  Using cached response: {cache_path}")
         with open(cache_path) as f:
@@ -404,7 +422,8 @@ async def main():
         "audio_file": str(audio_path.name),
         "srt_file":   str(srt_path.name),
         "deepgram": {
-            "params":           DEEPGRAM_PARAMS,
+            "params":           dict(_DEEPGRAM_BASE_PARAMS),
+            "keyterms":         _DEFAULT_KEYTERMS,
             "word_count":       len(dg_words),
             "avg_confidence":   avg_conf,
             "utterance_count":  len(utterances),

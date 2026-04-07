@@ -21,7 +21,7 @@ async def listen_ws(
     """Mobile listener WebSocket. Forwards only translation events (English only)."""
     await ws.accept()
 
-    if _broadcaster._available:
+    if _broadcaster.available:
         try:
             async for payload in _broadcaster.subscribe(church_id):
                 msg = json.loads(payload)
