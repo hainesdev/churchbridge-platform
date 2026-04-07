@@ -431,6 +431,7 @@ class ServiceSession:
                 "[session:%s] Correction suppressed ts=%d — enrichment already settled",
                 self._church_id, ts,
             )
+            await self._broadcast({"type": "correction_suppressed", "ts": ts})
             return
         await self._broadcast({"type": "correction", "ts": ts, "english": english})
 
