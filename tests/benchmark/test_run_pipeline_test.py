@@ -1,6 +1,7 @@
 from tests.benchmark.run_pipeline_test import (
     DEFAULT_DURATION_S,
     filter_srt,
+    generate_run_id,
     resolve_duration,
     resolve_run_namespace,
 )
@@ -42,3 +43,12 @@ def test_resolve_run_namespace_uses_audio_name_and_offset_when_unspecified():
 
 def test_resolve_run_namespace_preserves_explicit_church_id():
     assert resolve_run_namespace("tests/audio/1", 0.0, "bench-a") == "bench-a"
+
+
+def test_generate_run_id_includes_audio_context_and_unique_suffix():
+    first = generate_run_id("tests/audio/1", 30.0)
+    second = generate_run_id("tests/audio/2", 30.0)
+
+    assert "-1-30000-" in first
+    assert "-2-30000-" in second
+    assert first != second

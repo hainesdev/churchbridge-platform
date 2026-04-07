@@ -165,6 +165,38 @@ def run_evaluation_cycle(
     }
 
 
+# ── Report helpers ─────────────────────────────────────────────────────────────
+
+def _report_benchmark_sections(
+    current_audio_dir_name: str,
+    current_trajectory: dict,
+    report_path: Path | None,
+) -> list[tuple[str, dict]]:
+    """
+    For the staggered regime, summarize every benchmark set under the results
+    root so the report reflects the whole comparable batch. Legacy reports keep
+    the historical single-set behavior.
+    """
+    target_report = report_path or REPORT_PATH
+    results_root = target_report.parent
+
+    if results_root.name != "staggered":
+        return [(current_audio_dir_name, current_trajectory)]
+
+    sections: list[tuple[str, dict]] = []
+    for candidate in sorted(results_root.iterdir()):
+        trajectory_path = candidate / "pipeline" / "trajectory.json"
+        if not trajectory_path.exists():
+            continue
+        sections.append((candidate.name, load_json_with_fallback(trajectory_path)))
+
+    if not sections:
+        return [(current_audio_dir_name, current_trajectory)]
+
+    sections.sort(key=lambda item: (item[0] != current_audio_dir_name, item[0]))
+    return sections
+
+
 # ── SELF_IMPROVEMENT_REPORT.md ─────────────────────────────────────────────────
 
 def _write_report(
@@ -228,33 +260,58 @@ def _write_report(
         f"",
         f"---",
         f"",
-        f"## Benchmark Set: {audio_dir_name}",
-        f"",
-        f"**Runs in history:** {trajectory.get('n_runs', 0)}  "
-        f"(confidence: {trajectory.get('confidence', 'unknown')})",
-        f"",
     ]
 
-    # Key metric snapshot
-    metrics = trajectory.get("metrics", {})
+    benchmark_sections = _report_benchmark_sections(
+        audio_dir_name, trajectory, report_path
+    )
     snapshot_keys = [
         "wer_committed_pct", "wer_raw_pct",
         "out_of_order_event_count", "orphan_correction_count",
         "fragment_leak_count", "duplicate_commit_count",
         "time_to_first_translation_s", "wall_time_s",
     ]
-    lines += ["**Key Metrics (current run):**", ""]
-    for k in snapshot_keys:
-        entry   = metrics.get(k, {})
-        current = entry.get("current")
-        trend   = entry.get("trend", "n/a")
-        delta   = entry.get("delta_vs_prev")
-        suffix  = "%" if "pct" in k else ("s" if k.endswith("_s") else "")
-        if current is not None:
-            sign = "+" if (delta or 0) >= 0 else ""
-            d_str = f"{sign}{delta:.2f}{suffix}" if delta is not None else "n/a"
-            lines.append(f"- `{k}`: {current}{suffix}  (d:{d_str}, {trend})")
-    lines += ["", "---", ""]
+
+    if len(benchmark_sections) == 1:
+        lines += [
+            f"## Benchmark Set: {benchmark_sections[0][0]}",
+            f"",
+        ]
+    else:
+        lines += [
+            "## Benchmark Sets",
+            "",
+        ]
+
+    for index, (section_name, section_trajectory) in enumerate(benchmark_sections):
+        metrics = section_trajectory.get("metrics", {})
+        if len(benchmark_sections) > 1:
+            lines += [
+                f"### Set {section_name}",
+                "",
+            ]
+        lines += [
+            f"**Runs in history:** {section_trajectory.get('n_runs', 0)}  "
+            f"(confidence: {section_trajectory.get('confidence', 'unknown')})",
+            "",
+            "**Key Metrics (current run):**",
+            "",
+        ]
+        for k in snapshot_keys:
+            entry   = metrics.get(k, {})
+            current = entry.get("current")
+            trend   = entry.get("trend", "n/a")
+            delta   = entry.get("delta_vs_prev")
+            suffix  = "%" if "pct" in k else ("s" if k.endswith("_s") else "")
+            if current is not None:
+                sign = "+" if (delta or 0) >= 0 else ""
+                d_str = f"{sign}{delta:.2f}{suffix}" if delta is not None else "n/a"
+                lines.append(f"- `{k}`: {current}{suffix}  (d:{d_str}, {trend})")
+        lines.append("")
+        if index != len(benchmark_sections) - 1:
+            lines += ["---", ""]
+
+    lines += ["---", ""]
 
     # LLM analysis section
     if llm_analysis:

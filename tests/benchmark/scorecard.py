@@ -127,6 +127,31 @@ def _correction_latencies(
     return pairs
 
 
+def _count_client_visible_rewrites(
+    translations: list[dict], corrections: list[dict]
+) -> int:
+    """
+    Count only downstream correction events that actually rewrite an existing
+    translation. Matching ts is required, and identical English text is not a
+    user-visible rewrite.
+    """
+    translation_by_ts = {
+        t.get("ts"): (t.get("english") or "").strip()
+        for t in translations
+        if t.get("ts") is not None
+    }
+    rewrites = 0
+    for correction in corrections:
+        ts = correction.get("ts")
+        if ts not in translation_by_ts:
+            continue
+        original = translation_by_ts[ts]
+        updated = (correction.get("english") or "").strip()
+        if updated and updated != original:
+            rewrites += 1
+    return rewrites
+
+
 # ── Core builder ───────────────────────────────────────────────────────────────
 
 def build_scorecard(result: dict) -> dict:
@@ -234,7 +259,9 @@ def build_scorecard(result: dict) -> dict:
     # client-visible rewrites — corrections that differ from the original
     # translation for the same ts (already covered by llm_correction_count,
     # but here we distinguish rewrites from additions)
-    client_visible_rewrites = len(correction_msgs)
+    client_visible_rewrites = _count_client_visible_rewrites(
+        translation_msgs, correction_msgs
+    )
 
     behavioral: dict[str, Any] = {
         "out_of_order_event_count":       out_of_order,

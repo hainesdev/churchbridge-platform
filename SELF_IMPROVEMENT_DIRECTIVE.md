@@ -6,6 +6,8 @@ system behavior.
 
 It is meant to be used alongside [DIRECTIVE.md](C:\Users\Dan\Desktop\Projects\churchbridge-ai\DIRECTIVE.md)
 and [TESTING_AND_BENCHMARKS.md](C:\Users\Dan\Desktop\Projects\churchbridge-ai\TESTING_AND_BENCHMARKS.md).
+For the exact staggered benchmark rerun procedure used in this workspace, also read
+[SELF_IMPROVEMENT_LOOP_RUNBOOK.md](C:\Users\Dan\Desktop\Projects\churchbridge-ai\SELF_IMPROVEMENT_LOOP_RUNBOOK.md).
 
 ## Mission
 
@@ -37,6 +39,7 @@ Always read:
 
 - `DIRECTIVE.md`
 - `TESTING_AND_BENCHMARKS.md`
+- `SELF_IMPROVEMENT_LOOP_RUNBOOK.md` when you need to regenerate the fresh staggered benchmark batch
 
 Use `DIRECTIVE.md` to understand:
 

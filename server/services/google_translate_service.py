@@ -78,6 +78,7 @@ class GoogleTranslateService:
         self._context: deque[tuple[str, str, int]] = deque(maxlen=CONTEXT_WINDOW)
         self._active_task: asyncio.Task | None = None
         self._fragment_task: asyncio.Task | None = None
+        self._sentence_tasks: list[asyncio.Task] = []
         # Accurate sentence translations must commit in order so later sentences
         # cannot cancel or overtake earlier committed captions.
         self._sentence_lock = asyncio.Lock()
@@ -90,8 +91,22 @@ class GoogleTranslateService:
         self._http = httpx.AsyncClient(timeout=10.0)
 
     async def close(self):
-        """Release the shared HTTP client. Call from ServiceSession.close()."""
+        """Drain queued work, then release the shared HTTP client."""
+        await self.wait_for_idle()
         await self._http.aclose()
+
+    async def wait_for_idle(self):
+        """Wait for any in-flight fragment or sentence translation work to finish."""
+        tasks: list[asyncio.Task] = []
+        if self._fragment_task and not self._fragment_task.done():
+            tasks.append(self._fragment_task)
+        sentence_tasks = getattr(self, "_sentence_tasks", [])
+        sentence_tasks = [t for t in sentence_tasks if not t.done()]
+        self._sentence_tasks = sentence_tasks
+        tasks.extend(sentence_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._sentence_tasks.clear()
 
     async def translate_fragment(self, spanish: str):
         """Fast track: translate one STT final. Uses all prior fragments in the
@@ -127,6 +142,8 @@ class GoogleTranslateService:
         self._fragment_task = None
         self._fragment_context = []
         self._active_task = asyncio.create_task(self._do_translate(spanish, ts))
+        self._sentence_tasks = [t for t in getattr(self, "_sentence_tasks", []) if not t.done()]
+        self._sentence_tasks.append(self._active_task)
 
     async def _do_translate(self, spanish: str, ts: int):
         async with self._sentence_lock:
