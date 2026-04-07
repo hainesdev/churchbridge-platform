@@ -17,6 +17,7 @@ from server.services.sentence_buffer import (
     SentenceBuffer,
     FLUSH_DELAY_S,
     FLUSH_DELAY_EXTENDED_S,
+    MAX_WORDS,
     ABSOLUTE_MAX_WORDS,
     MAX_EXTENSIONS,
     MIN_FLUSH_WORDS,
@@ -162,6 +163,31 @@ class TestImmediateFlush:
 # ---------------------------------------------------------------------------
 
 class TestTimerFlush:
+    def test_max_words_complete_text_flushes_without_waiting_full_delay(self):
+        async def run():
+            col = Collector()
+            buf = make_buffer(col)
+            text = " ".join(["palabra"] * MAX_WORDS)
+            await buf.add(text)
+            await asyncio.wait_for(_wait_for_flush(col), timeout=1.0)
+            assert col.texts == [text]
+
+        asyncio.run(run())
+
+    def test_max_words_incomplete_text_enters_guarded_extension(self):
+        async def run():
+            col = Collector()
+            buf = make_buffer(col)
+            text = " ".join(["palabra"] * (MAX_WORDS - 1) + ["de"])
+            await buf.add(text)
+            await asyncio.sleep(0.2)
+            assert col.calls == []
+            assert buf.structural_flush_block_count >= 1
+            await buf.add("Dios.")
+            assert len(col.calls) == 1
+
+        asyncio.run(run())
+
     def test_complete_text_flushes_after_delay(self):
         async def run():
             col = Collector()
