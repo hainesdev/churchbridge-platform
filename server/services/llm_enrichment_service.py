@@ -587,15 +587,30 @@ class LLMEnrichmentService:
         audio_start: float,
         audio_end: float,
     ) -> None:
+        # topic_context is from TopicTracker (updated on an independent schedule,
+        # not affected by enrichment apply ordering — snapshot early is fine).
         topic_context = self._topic_tracker.get_context()
-        # Snapshot mutable state before the await so concurrent tasks don't interfere
-        history = list(self._sentence_history)
-        active_passage = self._active_passage
-        shown = set(self._shown_suggestions)
-        prev_discourse = self._prev_discourse
-        current_mode_label = (
-            self._state_tracker.get_context_label() if self._state_tracker else ""
-        )
+
+        # Wait for our apply turn before snapshotting shared enrichment state.
+        # This guarantees that prev_discourse, sentence_history, and active_passage
+        # reflect the fully-settled result from the immediately preceding sentence,
+        # enabling correct merge decisions (e.g. "answer_to_question" after a
+        # "rhetorical_question") even when consecutive sentences arrive rapidly.
+        # API calls therefore run sequentially for adjacent sentences, but since
+        # the sentence buffer holds sentences for ≥3.5s, only very rapid bursts
+        # (Q&A pairs flushed within ~700ms of each other) notice any difference.
+        await self._wait_for_apply_turn(ts)
+
+        # Snapshot mutable enrichment state under the mutation lock so concurrent
+        # verse-suggestion tasks cannot race against our reads.
+        async with self._mutation_lock:
+            history = list(self._sentence_history)
+            active_passage = self._active_passage
+            shown = set(self._shown_suggestions)
+            prev_discourse = self._prev_discourse
+            current_mode_label = (
+                self._state_tracker.get_context_label() if self._state_tracker else ""
+            )
 
         logger.debug(
             "[enrichment:%s] Enriching ts=%d at audio=%.1f–%.1fs | "
@@ -622,10 +637,10 @@ class LLMEnrichmentService:
             )
             raw = response.content[0].text.strip()
         except asyncio.CancelledError:
+            await self._finish_apply_turn(ts)
             raise
         except Exception as e:
             logger.warning("[enrichment:%s] Claude call failed for ts=%d: %s", self._church_id, ts, e)
-            await self._wait_for_apply_turn(ts)
             await self._finish_apply_turn(ts)
             return
 
@@ -655,17 +670,15 @@ class LLMEnrichmentService:
                     "[enrichment:%s] Could not parse JSON for ts=%d: %.120s",
                     self._church_id, ts, raw,
                 )
-                await self._wait_for_apply_turn(ts)
                 await self._finish_apply_turn(ts)
                 return
 
         if not isinstance(result, dict):
             logger.warning("[enrichment:%s] Expected JSON object for ts=%d, got %s", self._church_id, ts, type(result).__name__)
-            await self._wait_for_apply_turn(ts)
             await self._finish_apply_turn(ts)
             return
 
-        await self._wait_for_apply_turn(ts)
+        # (apply turn already acquired above — proceed directly to state mutation)
 
         # Acquire the mutation lock before touching any shared state.
         # Concurrent enrichment tasks complete in arbitrary order due to variable
