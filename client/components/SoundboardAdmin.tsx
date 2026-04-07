@@ -96,7 +96,9 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
 
       const ctx = new AudioContext();
       ctxRef.current = ctx;
-      sampleRateRef.current = ctx.sampleRate;
+      // Worklet downsamples to 16 kHz before posting chunks; advertise that rate
+      // so the server's resample_float32_to_pcm16 hits the fast no-op path.
+      sampleRateRef.current = 16000;
 
       await ctx.audioWorklet.addModule('/worklets/recorder-worklet.js');
       const source = ctx.createMediaStreamSource(mediaStream);

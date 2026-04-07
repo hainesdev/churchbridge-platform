@@ -13,14 +13,16 @@ import os
 # Allow imports from the server package without installing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+import asyncio
 import pytest
-from server.services.session_manager import _clean_stt, _normalize_pentecostes
+from server.services.session_manager import _clean_stt, _normalize_pentecostes, _split_segments
 from server.services.sentence_buffer import _is_incomplete, _is_conditional_incomplete
 from server.services.llm_enrichment_service import (
     _normalize_translation,
     _scripture_speaker_normalization,
     _if_clause_validator,
 )
+from server.services.google_translate_service import GoogleTranslateService
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +205,211 @@ class TestNormalizeTranslationIntegration:
     def test_pentecostal_prefix_cleaned(self):
         result = _normalize_translation("Pentecostal John says we must repent")
         assert "Pentecostal John" not in result
+
+
+# ---------------------------------------------------------------------------
+# _split_segments — internal sentence splitting with short-fragment merging
+# ---------------------------------------------------------------------------
+
+class TestSplitSegments:
+    """_split_segments splits at sentence boundaries and merges short trailing
+    fragments back into the preceding sentence."""
+
+    def test_single_sentence_returns_one_part(self):
+        result = _split_segments("Dios es amor y su gracia es eterna.")
+        assert result == ["Dios es amor y su gracia es eterna."]
+
+    def test_two_complete_sentences_split(self):
+        result = _split_segments("Dios es luz. Y en él no hay tinieblas.")
+        assert len(result) == 2
+        assert result[0] == "Dios es luz."
+        assert result[1] == "Y en él no hay tinieblas."
+
+    def test_short_answer_fragment_merges_back(self):
+        """'¿Quién es él? Jesucristo.' — answer is < MIN_SPLIT_WORDS, merges."""
+        result = _split_segments("¿Quién es él? Jesucristo.")
+        assert len(result) == 1
+        assert "Jesucristo" in result[0]
+        assert "¿Quién es él?" in result[0]
+
+    def test_question_fragment_not_merged(self):
+        """Fragment starting with ¿ is a new interrogative — never merged back."""
+        result = _split_segments("Él es la luz. ¿Y tú?")
+        assert len(result) == 2
+        assert result[1].startswith("¿")
+
+    def test_verse_number_does_not_split(self):
+        """'Juan 3:16' contains no sentence-ending punctuation — not split."""
+        result = _split_segments("vamos a Juan 3:16 que dice que Dios amó al mundo")
+        assert len(result) == 1
+
+    def test_three_part_short_middle_merges_into_preceding(self):
+        """Three sentences where the middle is short: middle merges into first."""
+        # Build a case: long sentence, then short answer, then another full sentence
+        text = "Y no hay tinieblas en él. Ninguna. Porque él es completamente puro y santo."
+        result = _split_segments(text)
+        # "Ninguna." is short — merges into "Y no hay tinieblas en él."
+        assert len(result) == 2
+        assert "Ninguna" in result[0]
+        assert "completamente puro" in result[1]
+
+    def test_long_second_sentence_does_not_merge(self):
+        """A properly long second sentence stands on its own."""
+        result = _split_segments(
+            "Dios es luz. Y en él no hay absolutamente ninguna tiniebla ni oscuridad."
+        )
+        assert len(result) == 2
+
+    def test_no_split_on_abbreviation_period(self):
+        """Abbreviation followed by lowercase should not split."""
+        # The regex splits only before uppercase — so "cap. siguiente" should not split
+        result = _split_segments("en el cap. siguiente vemos que Dios habló a Moisés")
+        assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Dual-pass correction — GoogleTranslateService
+# ---------------------------------------------------------------------------
+
+class FakeGoogleTranslateService(GoogleTranslateService):
+    """Subclass that replaces _call_api with controllable canned responses."""
+
+    def __init__(self, responses: list[str], **kwargs):
+        # Bypass __init__ env var requirement by patching key directly
+        self._api_key = "FAKE_KEY"
+        self._context = __import__('collections').deque(maxlen=2)
+        self._active_task = None
+        self._fragment_task = None
+        self._sentence_lock = asyncio.Lock()
+        self._fragment_context = []
+        self._http = None
+        self._responses = list(responses)
+        self._call_count = 0
+        # Store callbacks
+        self._on_translation = kwargs["on_translation"]
+        self._on_correction = kwargs["on_correction"]
+        self._on_interim_translation = kwargs.get("on_interim_translation", lambda *a: None)
+
+    async def _call_api(self, html_body: str) -> str:
+        result = self._responses[self._call_count % len(self._responses)]
+        self._call_count += 1
+        return result
+
+    async def close(self):
+        pass
+
+
+class TestDualPassCorrection:
+    """Dual-pass correction fires when the retranslated prior sentence differs."""
+
+    def _make_p(self, *texts):
+        """Wrap texts in <p> tags as Google would return."""
+        return "".join(f"<p>{t}</p>" for t in texts)
+
+    def test_correction_fires_when_prior_differs(self):
+        async def run():
+            corrections = []
+            translations = []
+
+            async def on_translation(spanish, english, ts):
+                translations.append((spanish, english, ts))
+
+            async def on_correction(ts, english):
+                corrections.append((ts, english))
+
+            # First call: translate sentence 1 → "God is light"
+            svc = FakeGoogleTranslateService(
+                responses=[
+                    self._make_p("God is light"),       # sentence 1 (no prior)
+                    self._make_p("In him is light", "And we walk together"),  # sentence 2 with correction
+                ],
+                on_translation=on_translation,
+                on_correction=on_correction,
+            )
+            await svc.translate("Dios es luz.", ts=1000)
+            await asyncio.sleep(0.05)
+            assert translations[0][1] == "God is light"
+            assert corrections == []  # no prior to correct
+
+            # Second call: returns corrected prior + current
+            await svc.translate("Y caminamos juntos.", ts=2000)
+            await asyncio.sleep(0.05)
+            assert len(corrections) == 1
+            assert corrections[0][0] == 1000          # prior ts
+            assert corrections[0][1] == "In him is light"  # corrected prior
+            assert translations[1][1] == "And we walk together"
+
+        asyncio.run(run())
+
+    def test_no_correction_when_prior_unchanged(self):
+        async def run():
+            corrections = []
+            translations = []
+
+            async def on_translation(spanish, english, ts):
+                translations.append((spanish, english, ts))
+
+            async def on_correction(ts, english):
+                corrections.append((ts, english))
+
+            svc = FakeGoogleTranslateService(
+                responses=[
+                    self._make_p("God is light"),
+                    self._make_p("God is light", "And we walk together"),  # prior unchanged
+                ],
+                on_translation=on_translation,
+                on_correction=on_correction,
+            )
+            await svc.translate("Dios es luz.", ts=1000)
+            await asyncio.sleep(0.05)
+            await svc.translate("Y caminamos juntos.", ts=2000)
+            await asyncio.sleep(0.05)
+            assert corrections == []  # prior text identical — no correction
+
+        asyncio.run(run())
+
+    def test_no_correction_on_first_sentence(self):
+        async def run():
+            corrections = []
+
+            async def on_translation(spanish, english, ts):
+                pass
+
+            async def on_correction(ts, english):
+                corrections.append((ts, english))
+
+            svc = FakeGoogleTranslateService(
+                responses=[self._make_p("God is light")],
+                on_translation=on_translation,
+                on_correction=on_correction,
+            )
+            await svc.translate("Dios es luz.", ts=1000)
+            await asyncio.sleep(0.05)
+            assert corrections == []  # empty context — nothing to correct
+
+        asyncio.run(run())
+
+    def test_context_appended_after_translate(self):
+        async def run():
+            translations = []
+
+            async def on_translation(spanish, english, ts):
+                translations.append((spanish, english, ts))
+
+            svc = FakeGoogleTranslateService(
+                responses=[
+                    self._make_p("God is light"),
+                    self._make_p("God is light", "And he loves us"),
+                ],
+                on_translation=on_translation,
+                on_correction=lambda *a: None,
+            )
+            assert len(svc._context) == 0
+            await svc.translate("Dios es luz.", ts=1000)
+            await asyncio.sleep(0.05)
+            assert len(svc._context) == 1
+            await svc.translate("Y él nos ama.", ts=2000)
+            await asyncio.sleep(0.05)
+            assert len(svc._context) == 2
+
+        asyncio.run(run())

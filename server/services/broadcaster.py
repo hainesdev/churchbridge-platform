@@ -18,6 +18,10 @@ class Broadcaster:
         self._redis: redis.Redis | None = None
         self._available = False
 
+    @property
+    def available(self) -> bool:
+        return self._available
+
     async def connect(self):
         try:
             self._redis = redis.from_url(REDIS_URL, decode_responses=True)
