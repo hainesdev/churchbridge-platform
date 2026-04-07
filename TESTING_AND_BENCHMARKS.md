@@ -43,7 +43,7 @@ server\.venv\Scripts\python.exe -m pytest tests\server -q
 Latest verified result in this workspace:
 
 - `tests/server/test_pipeline_regressions.py`: `4 passed`
-- `tests/server`: `95 passed`
+- `tests/server`: `97 passed`
 
 ## Pipeline Benchmark
 

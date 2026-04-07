@@ -178,6 +178,8 @@ class SentenceBuffer:
         combined = ' '.join(self._parts)
         if self._should_flush(combined):
             await self._flush("immediate_flush")
+        elif self._should_guard_flush(combined):
+            self._timer = asyncio.create_task(self._guarded_flush())
         else:
             self._timer = asyncio.create_task(self._delayed_flush())
 
@@ -250,6 +252,44 @@ class SentenceBuffer:
         # Between MAX_WORDS and ABSOLUTE_MAX_WORDS: don't flush immediately — let the
         # timer fire so _is_incomplete() can gate the flush.
         return False
+
+    def _should_guard_flush(self, text: str) -> bool:
+        """Return True when the buffer should enter the guarded max-words path.
+
+        This is the pre-hard-cap safety valve: once a sentence reaches MAX_WORDS
+        without terminal punctuation, run the completeness guard immediately
+        instead of waiting the normal fallback delay.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return False
+        word_count = len(stripped.split())
+        return MAX_WORDS <= word_count < ABSOLUTE_MAX_WORDS
+
+    async def _guarded_flush(self):
+        """Immediate completeness check used when MAX_WORDS is reached.
+
+        This bypasses the normal FLUSH_DELAY_S wait but still respects the
+        structural incomplete-tail guard before falling back to extensions.
+        """
+        try:
+            if not self._parts:
+                return
+            combined = ' '.join(self._parts)
+            if self._extension_count < MAX_EXTENSIONS and _is_incomplete(combined):
+                self._extension_count += 1
+                self.structural_flush_block_count += 1
+                if _is_conditional_incomplete(combined):
+                    self.conditional_flush_block_count += 1
+                logger.debug(
+                    "[sentence_buffer] MAX_WORDS guard blocked flush (extension %d/%d): %s",
+                    self._extension_count, MAX_EXTENSIONS, combined[:60],
+                )
+                self._timer = asyncio.create_task(self._extended_flush())
+            else:
+                await self._flush("max_words_guard")
+        except asyncio.CancelledError:
+            pass
 
     async def _delayed_flush(self):
         """Fallback timer flush. Consumes any pending discourse hold first, then

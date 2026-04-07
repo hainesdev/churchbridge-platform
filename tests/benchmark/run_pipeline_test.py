@@ -51,6 +51,7 @@ load_dotenv(ROOT / ".env")
 
 sys.path.insert(0, str(ROOT))
 from tests.benchmark.run_benchmark import parse_srt, compute_wer  # noqa: E402
+from tests.benchmark.orchestrator import run_evaluation_cycle      # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -294,7 +295,7 @@ def save_results(result: dict, audio_dir_name: str):
 
     # Full run JSON
     run_file = out_dir / f"{result['run_id']}.json"
-    run_file.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    run_file.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nSaved  : {run_file}")
 
     # Append summary row to history.json
@@ -316,7 +317,7 @@ def save_results(result: dict, audio_dir_name: str):
         "verse_event_count":   len(result["layers"]["verse_events"]),
         "wall_time_s":         result["wall_time_s"],
     })
-    history_file.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+    history_file.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"History: {history_file}  ({len(history)} runs)")
 
 
@@ -402,6 +403,8 @@ async def main():
                         help="Seconds of audio to test (default: 85)")
     parser.add_argument("--note",      default="",
                         help="Free-text note recorded with this run")
+    parser.add_argument("--no-llm",   action="store_true",
+                        help="Skip LLM interpretation (deterministic evaluation only)")
     args = parser.parse_args()
 
     run_id    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -456,8 +459,13 @@ async def main():
         note         = args.note,
     )
 
-    save_results(result, Path(args.audio_dir).name)
+    audio_dir_name = Path(args.audio_dir).name
+    save_results(result, audio_dir_name)
     print_report(result)
+
+    # ── Closed-loop evaluation ─────────────────────────────────────────────────
+    pipeline_dir = ROOT / "tests" / "benchmark" / "results" / audio_dir_name / "pipeline"
+    run_evaluation_cycle(result, pipeline_dir, use_llm=not args.no_llm)
 
 
 if __name__ == "__main__":
