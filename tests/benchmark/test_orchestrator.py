@@ -99,3 +99,52 @@ def test_write_report_keeps_single_set_legacy_behavior(tmp_path):
 
     assert "## Benchmark Set: 1" in report
     assert "## Benchmark Sets" not in report
+
+
+def test_write_report_uses_conservative_action_across_staggered_sets(tmp_path):
+    results_root = tmp_path / "staggered"
+    set_one = results_root / "1" / "pipeline"
+    set_two = results_root / "2" / "pipeline"
+    set_one.mkdir(parents=True)
+    set_two.mkdir(parents=True)
+
+    (set_one / "trajectory.json").write_text(json.dumps(_trajectory(14.9)), encoding="utf-8")
+    (set_two / "trajectory.json").write_text(json.dumps(_trajectory(23.1)), encoding="utf-8")
+
+    cycle_log_path = results_root / "cycle_log.json"
+    cycle_log_path.write_text(
+        json.dumps(
+            [
+                {
+                    "cycle_id": "cycle-a",
+                    "audio_dir_name": "1",
+                    "review_action": "collect_more_runs",
+                    "git_commit": "abc123",
+                    "outcome": "pending",
+                },
+                {
+                    "cycle_id": "cycle-b",
+                    "audio_dir_name": "2",
+                    "review_action": "promote",
+                    "git_commit": "abc123",
+                    "outcome": "pending",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    report_path = results_root / "SELF_IMPROVEMENT_REPORT.md"
+
+    _write_report(
+        audio_dir_name="2",
+        trajectory=_trajectory(23.1),
+        cycle_entry={"cycle_id": "cycle-1", "git_commit": "abc123", "outcome": "pending"},
+        action="promote",
+        llm_analysis=None,
+        cycle_log_path=cycle_log_path,
+        report_path=report_path,
+    )
+
+    report = report_path.read_text(encoding="utf-8")
+    assert "## Current Action" in report
+    assert "**`collect_more_runs`**" in report

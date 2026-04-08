@@ -197,6 +197,46 @@ def _report_benchmark_sections(
     return sections
 
 
+def _aggregate_report_action(
+    default_action: str,
+    benchmark_sections: list[tuple[str, dict]],
+    cycle_log_path: Path | None,
+) -> str:
+    """
+    Compute a conservative report action across all benchmark sets in the regime.
+    Falls back to the current run action when per-set history is unavailable.
+    """
+    action_priority = {
+        "revert_or_fix": 0,
+        "investigate": 1,
+        "collect_more_runs": 2,
+        "propose_directive_update": 3,
+        "promote": 4,
+    }
+    section_names = {name for name, _ in benchmark_sections}
+    if not section_names:
+        return default_action
+
+    latest_by_set: dict[str, str] = {}
+    for cycle in load_cycle_log(cycle_log_path):
+        set_name = str(cycle.get("audio_dir_name", ""))
+        action = cycle.get("review_action")
+        if set_name in section_names and isinstance(action, str):
+            latest_by_set[set_name] = action
+
+    if not latest_by_set:
+        return default_action
+
+    aggregate_action = default_action
+    aggregate_rank = action_priority.get(default_action, 999)
+    for action in latest_by_set.values():
+        rank = action_priority.get(action, 999)
+        if rank < aggregate_rank:
+            aggregate_action = action
+            aggregate_rank = rank
+    return aggregate_action
+
+
 # ── SELF_IMPROVEMENT_REPORT.md ─────────────────────────────────────────────────
 
 def _write_report(
@@ -215,6 +255,11 @@ def _write_report(
     ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines: list[str] = []
 
+    benchmark_sections = _report_benchmark_sections(
+        audio_dir_name, trajectory, report_path
+    )
+    report_action = _aggregate_report_action(action, benchmark_sections, cycle_log_path)
+
     lines += [
         f"# Self-Improvement Report",
         f"",
@@ -228,7 +273,7 @@ def _write_report(
         f"",
         f"## Current Action",
         f"",
-        f"**`{action}`**",
+        f"**`{report_action}`**",
         f"",
     ]
 
@@ -256,15 +301,12 @@ def _write_report(
         ),
     }
     lines += [
-        f"*{guidance.get(action, '')}*",
+        f"*{guidance.get(report_action, '')}*",
         f"",
         f"---",
         f"",
     ]
 
-    benchmark_sections = _report_benchmark_sections(
-        audio_dir_name, trajectory, report_path
-    )
     snapshot_keys = [
         "wer_committed_pct", "wer_raw_pct",
         "out_of_order_event_count", "orphan_correction_count",
