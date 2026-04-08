@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+import json
 from fastapi import WebSocket
 
 from server.db.glossary import get_glossary
@@ -14,13 +15,29 @@ from server.db.sessions import (
 from server.services.audio_utils import resample_float32_to_pcm16, base64_to_float32_bytes
 from server.services.deepgram_session import DeepgramSession
 from server.services.google_translate_service import GoogleTranslateService
-from server.services.llm_enrichment_service import LLMEnrichmentService
-from server.services.sentence_buffer import SentenceBuffer
+from server.services.llm_enrichment_service import LLMEnrichmentService, _format_deferred_release_text
+from server.services.sentence_buffer import SentenceBuffer, _is_incomplete
 from server.services.sermon_state_tracker import SermonStateTracker
 from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
 
 logger = logging.getLogger(__name__)
+_DEBUG_LOG_PATH = "C:/Users/Dan/Desktop/Projects/churchbridge-ai/debug-233415.log"
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
+    # region agent log
+    with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "sessionId": "233415",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }, ensure_ascii=True) + "\n")
+    # endregion
 
 # Splits a Deepgram final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
@@ -228,9 +245,9 @@ class ServiceSession:
         self._enrichment: LLMEnrichmentService | None = None
         self._topic_tracker: TopicTracker | None = None
         self._state_tracker: SermonStateTracker | None = None
-        # Maps sentence ts → (audio_start, audio_end) so enrichment receives
-        # Deepgram sermon-relative timing even though translation is async.
-        self._pending_audio_timing: dict[int, tuple[float, float]] = {}
+        # Maps sentence ts → timing/flush metadata so enrichment can distinguish
+        # normal committed captions from session-end truncated tails.
+        self._pending_audio_timing: dict[int, dict[str, float | bool | str]] = {}
         # ts values for which LLM enrichment has completed — used to suppress
         # stale Google dual-pass corrections that arrive after the LLM has settled.
         self._enrichment_settled: set[int] = set()
@@ -362,10 +379,26 @@ class ServiceSession:
 
     # --- Sentence buffer callback ---
 
-    async def _on_sentence(self, text: str, audio_start: float, audio_end: float):
+    async def _on_sentence(self, text: str, audio_start: float, audio_end: float, flush_reason: str):
         ts = _now()
+        terminal_incomplete = flush_reason == "session_close" and _is_incomplete(text)
+        # region agent log
+        _debug_log("H5", "session_manager.py:_on_sentence", "Generated sentence timestamp", {
+            "churchId": self._church_id,
+            "ts": ts,
+            "textPreview": text[:80],
+            "flushReason": flush_reason,
+            "terminalIncomplete": terminal_incomplete,
+        })
+        # endregion
         logger.info("[session:%s] Sentence flushed: %s", self._church_id, text)
-        await self._broadcast({"type": "final_spanish", "text": text, "ts": ts})
+        await self._broadcast({
+            "type": "final_spanish",
+            "text": text,
+            "ts": ts,
+            "flush_reason": flush_reason,
+            "terminal_incomplete": terminal_incomplete,
+        })
         if self._topic_tracker:
             mode = self._state_tracker.settled_mode if self._state_tracker else "exposition"
             self._topic_tracker.add_segment(text, mode=mode)
@@ -387,7 +420,12 @@ class ServiceSession:
                 logger.debug("[session:%s] Hold set: rhetorical_question", self._church_id)
 
         if self._translation:
-            self._pending_audio_timing[ts] = (audio_start, audio_end)
+            self._pending_audio_timing[ts] = {
+                "audio_start": audio_start,
+                "audio_end": audio_end,
+                "terminal_incomplete": terminal_incomplete,
+                "flush_reason": flush_reason,
+            }
             # Prune entries older than 120s — these belong to sentences whose
             # translation failed after all retries and will never be consumed.
             cutoff = ts - 120_000
@@ -402,6 +440,25 @@ class ServiceSession:
     # --- Google Translation callbacks ---
 
     async def _on_translation(self, spanish: str, english: str, ts: int):
+        timing = self._pending_audio_timing.get(
+            ts,
+            {
+                "audio_start": 0.0,
+                "audio_end": 0.0,
+                "terminal_incomplete": False,
+                "flush_reason": "",
+            },
+        )
+        if timing.get("terminal_incomplete"):
+            english = _format_deferred_release_text(english, english)
+        # region agent log
+        _debug_log("H1", "session_manager.py:_on_translation", "Broadcasting translation", {
+            "churchId": self._church_id,
+            "ts": ts,
+            "spanishLen": len(spanish),
+            "englishLen": len(english),
+        })
+        # endregion
         logger.info("[session:%s] Translation: %s -> %s", self._church_id, spanish[:200], english[:200])
         await self._broadcast({
             "type": "translation",
@@ -414,8 +471,25 @@ class ServiceSession:
         if self._enrichment:
             # Pop timing; defaults to (0.0, 0.0) if translation was retried after
             # the entry aged out (extremely rare — session would need to be very long).
-            audio_start, audio_end = self._pending_audio_timing.pop(ts, (0.0, 0.0))
-            self._enrichment.enrich(spanish, english, ts, audio_start, audio_end)
+            timing = self._pending_audio_timing.pop(
+                ts,
+                {
+                    "audio_start": 0.0,
+                    "audio_end": 0.0,
+                    "terminal_incomplete": False,
+                    "flush_reason": "",
+                },
+            )
+            audio_start = float(timing.get("audio_start", 0.0))
+            audio_end = float(timing.get("audio_end", 0.0))
+            self._enrichment.enrich(
+                spanish,
+                english,
+                ts,
+                audio_start,
+                audio_end,
+                terminal_incomplete=bool(timing.get("terminal_incomplete")),
+            )
 
     async def _on_interim_translation(self, text: str):
         await self._broadcast({"type": "interim_translation", "text": text, "ts": _now()})
@@ -554,6 +628,16 @@ class ServiceSession:
         }
 
     async def _broadcast(self, event: dict):
+        if event.get("type") in ("translation", "caption_merge", "translation_update", "correction"):
+            # region agent log
+            _debug_log("H2", "session_manager.py:_broadcast", "Publishing display event", {
+                "churchId": self._church_id,
+                "type": event.get("type"),
+                "ts": event.get("ts"),
+                "ts_keep": event.get("ts_keep"),
+                "ts_absorb": event.get("ts_absorb"),
+            })
+            # endregion
         await self._broadcaster.publish(self._church_id, event)
 
     async def _send(self, msg: dict):

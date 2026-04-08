@@ -113,6 +113,21 @@ class FakeAnthropicClient:
         self.messages = FakeAnthropicMessages(responses_by_ts)
 
 
+class SequentialFakeAnthropicMessages:
+    def __init__(self, responses: list[tuple[float, str]]):
+        self._responses = list(responses)
+
+    async def create(self, **kwargs):
+        delay_s, raw = self._responses.pop(0)
+        await asyncio.sleep(delay_s)
+        return type("Resp", (), {"content": [type("Block", (), {"text": raw})()]})()
+
+
+class SequentialFakeAnthropicClient:
+    def __init__(self, responses: list[tuple[float, str]]):
+        self.messages = SequentialFakeAnthropicMessages(responses)
+
+
 def make_json_result(
     improved_translation: str,
     *,
@@ -318,6 +333,108 @@ class TestDeferredRelease:
 
         run(run_())
 
+    def test_deferred_release_marks_incomplete_tail_with_ellipsis(self):
+        async def run_():
+            updates = []
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda ts, english: updates.append((ts, english)) or asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+
+            task = asyncio.create_task(
+                service._deferred_translation_release(
+                    456,
+                    "Now, let's understand this phrase by phrase, word by word, what",
+                    "Now, let's understand, phrase by phrase, word by word, what",
+                )
+            )
+            service._deferred_updates[456] = ("placeholder", task)
+            await asyncio.wait_for(task, timeout=7.5)
+
+            assert updates == [
+                (456, "Now, let's understand, phrase by phrase, word by word, what...")
+            ]
+
+        run(run_())
+
+
+class TestTerminalIncompleteEnrichment:
+    def test_terminal_incomplete_segment_emits_single_metadata_and_ellipsized_release(self):
+        async def run_():
+            updates = []
+            metadata = []
+            settled = []
+
+            async def on_translation_update(ts, english):
+                updates.append((ts, english))
+
+            async def on_segment_metadata(ts, payload):
+                metadata.append((ts, payload))
+
+            async def on_enrichment_settled(ts):
+                settled.append(ts)
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=on_enrichment_settled,
+                on_segment_metadata=on_segment_metadata,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "Ahora, vamos a entender frase por frase palabra por palabra, lo que": (
+                    0.01,
+                    make_json_result(
+                        "Now, let us understand this phrase by phrase, word by word, what",
+                        display_ready=False,
+                        thought_complete=False,
+                        continuation_required=True,
+                        discourse_tag="transition",
+                    ),
+                ),
+            })
+
+            await service.enrich(
+                "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
+                "Now, let's understand, phrase by phrase, word by word, what...",
+                1000,
+                terminal_incomplete=True,
+            )
+
+            assert metadata == [
+                (
+                    1000,
+                    {
+                        "translation_register": "expository",
+                        "paragraph_break": False,
+                        "source_quality": "clean",
+                        "pending_completion": True,
+                        "terminal_incomplete": True,
+                    },
+                )
+            ]
+            assert settled == [1000]
+            task = service._deferred_updates[1000][1]
+            await asyncio.wait_for(task, timeout=7.5)
+            assert updates == [
+                (1000, "Now, let's understand, phrase by phrase, word by word, what...")
+            ]
+
+        run(run_())
+
 
 class TestCorrectionSuppressedEvent:
     def test_suppressed_correction_broadcasts_correction_suppressed_event(self):
@@ -383,6 +500,276 @@ class TestEnrichmentCloseDrain:
             await service.close()
 
             assert updates == [(1000, "Better First")]
+            assert settled == [1000]
+
+        run(run_())
+
+
+class TestSessionCloseIncompleteMetadata:
+    def test_session_close_incomplete_flush_is_marked_terminal_incomplete(self):
+        async def run_():
+            events = []
+            translate_calls = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubTranslation:
+                async def translate(self, text, ts):
+                    translate_calls.append((text, ts))
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._topic_tracker = None
+            session._state_tracker = None
+            session._sentence_buffer = None
+            session._translation = _StubTranslation()
+            session._enrichment = None
+            session._pending_audio_timing = {}
+            session._enrichment_settled = set()
+            session._db_session_id = None
+
+            await session._on_sentence(
+                "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
+                10.0,
+                12.0,
+                "session_close",
+            )
+
+            assert events[0]["type"] == "final_spanish"
+            assert events[0]["terminal_incomplete"] is True
+            assert events[0]["flush_reason"] == "session_close"
+            assert translate_calls == [
+                ("Ahora, vamos a entender frase por frase palabra por palabra, lo que", events[0]["ts"])
+            ]
+            assert session._pending_audio_timing[events[0]["ts"]]["terminal_incomplete"] is True
+            assert len(events) == 1
+
+        run(run_())
+
+    def test_terminal_incomplete_translation_event_is_ellipsized_immediately(self):
+        async def run_():
+            events = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._db_session_id = None
+            session._enrichment = None
+            session._pending_audio_timing = {
+                1000: {
+                    "audio_start": 0.0,
+                    "audio_end": 1.0,
+                    "terminal_incomplete": True,
+                    "flush_reason": "session_close",
+                }
+            }
+
+            await session._on_translation(
+                "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
+                "Now, let's understand, phrase by phrase, word by word, what",
+                1000,
+            )
+
+            assert events == [
+                {
+                    "type": "translation",
+                    "spanish": "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
+                    "english": "Now, let's understand, phrase by phrase, word by word, what...",
+                    "ts": 1000,
+                }
+            ]
+
+        run(run_())
+
+
+class TestTranslationRepairFallback:
+    def test_merge_candidate_is_checked_against_full_merged_unit(self):
+        async def run_():
+            updates = []
+            merges = []
+
+            async def on_translation_update(ts, english):
+                updates.append((ts, english))
+
+            async def on_caption_merge(absorb_ts, keep_ts, merged_spanish, merged_english):
+                merges.append((absorb_ts, keep_ts, merged_spanish, merged_english))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=on_caption_merge,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    make_json_result("What is the proof that we are in the light?", discourse_tag="rhetorical_question"),
+                ),
+                (
+                    0.01,
+                    make_json_result(
+                        "We have fellowship with one another.",
+                        merge_with_previous=True,
+                        discourse_tag="answer_to_question",
+                    ),
+                ),
+                (
+                    0.01,
+                    (
+                        "{"
+                        "\"literal_translation\": \"What is the proof that we are in the light? "
+                        "We have fellowship with one another.\", "
+                        "\"natural_translation\": \"What is the proof that we are in the light? "
+                        "We have fellowship with one another.\""
+                        "}"
+                    ),
+                ),
+            ])
+
+            await service.enrich(
+                "¿Cuál es la prueba de que estamos en la luz?",
+                "What is the proof that we are in the light?",
+                1000,
+            )
+            await service.enrich(
+                "Tenemos comunión unos con otros.",
+                "We have fellowship with one another.",
+                2000,
+            )
+
+            assert merges == [
+                (
+                    2000,
+                    1000,
+                    "¿Cuál es la prueba de que estamos en la luz? Tenemos comunión unos con otros.",
+                    "What is the proof that we are in the light? We have fellowship with one another.",
+                )
+            ]
+            assert updates[-1] == (
+                2000,
+                "What is the proof that we are in the light? We have fellowship with one another.",
+            )
+
+        run(run_())
+
+    def test_incomplete_primary_candidate_uses_repair_choice(self):
+        async def run_():
+            updates = []
+            settled = []
+
+            async def on_translation_update(ts, english):
+                updates.append((ts, english))
+
+            async def on_enrichment_settled(ts):
+                settled.append(ts)
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=on_enrichment_settled,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    make_json_result("We have fellowship with one another."),
+                ),
+                (
+                    0.01,
+                    (
+                        "{"
+                        "\"literal_translation\": \"If we walk in the light as he is in the light, "
+                        "we have fellowship with one another.\", "
+                        "\"natural_translation\": \"If we walk in the light, as he himself is in the light, "
+                        "we have fellowship with one another.\""
+                        "}"
+                    ),
+                ),
+            ])
+
+            await service.enrich(
+                "Si andamos en luz, como él está en luz, tenemos comunión unos con otros.",
+                "If we walk in the light, as he is in the light, we have fellowship with one another.",
+                1000,
+            )
+
+            assert updates == [
+                (1000, "If we walk in the light, as he himself is in the light, we have fellowship with one another.")
+            ]
+            assert settled == [1000]
+
+        run(run_())
+
+    def test_unrepaired_incomplete_candidate_falls_back_to_google(self):
+        async def run_():
+            updates = []
+            settled = []
+
+            async def on_translation_update(ts, english):
+                updates.append((ts, english))
+
+            async def on_enrichment_settled(ts):
+                settled.append(ts)
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=on_enrichment_settled,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    make_json_result("We have fellowship with one another."),
+                ),
+                (
+                    0.01,
+                    (
+                        "{"
+                        "\"literal_translation\": \"We have fellowship with one another.\", "
+                        "\"natural_translation\": \"We have fellowship together.\""
+                        "}"
+                    ),
+                ),
+            ])
+
+            await service.enrich(
+                "Si andamos en luz, como él está en luz, tenemos comunión unos con otros.",
+                "If we walk in the light, as he is in the light, we have fellowship with one another.",
+                1000,
+            )
+
+            assert updates == []
             assert settled == [1000]
 
         run(run_())

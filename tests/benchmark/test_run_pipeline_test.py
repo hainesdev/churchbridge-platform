@@ -1,5 +1,6 @@
 from tests.benchmark.run_pipeline_test import (
     DEFAULT_DURATION_S,
+    build_arg_parser,
     filter_srt,
     generate_run_id,
     resolve_duration,
@@ -52,3 +53,11 @@ def test_generate_run_id_includes_audio_context_and_unique_suffix():
     assert "-1-30000-" in first
     assert "-2-30000-" in second
     assert first != second
+
+
+def test_build_arg_parser_mentions_concurrent_run_isolation():
+    help_text = build_arg_parser().format_help()
+
+    assert "Concurrent runs" in help_text
+    assert "different ports" in help_text
+    assert "--results-root" in help_text

@@ -82,6 +82,7 @@ def run_evaluation_cycle(
     use_llm:      bool = True,
     cycle_log_path: Path | None = None,
     report_path: Path | None = None,
+    precomputed_scorecard: dict | None = None,
 ) -> dict:
     """
     Run a full evaluation cycle for one benchmark result.
@@ -97,10 +98,16 @@ def run_evaluation_cycle(
     print(f"{'-' * 60}")
 
     # ── 1. Scorecard ──────────────────────────────────────────────────────────
-    scorecard = generate_scorecard(
-        result,
-        pipeline_dir / "scorecards" / f"{run_id}.json",
-    )
+    # When a pre-patched scorecard is supplied (quality scalars already merged in),
+    # use it directly so trajectory and the interpreter see quality data this run.
+    if precomputed_scorecard is not None:
+        scorecard = precomputed_scorecard
+        print(f"Scorecard: (precomputed, quality-patched)")
+    else:
+        scorecard = generate_scorecard(
+            result,
+            pipeline_dir / "scorecards" / f"{run_id}.json",
+        )
 
     # ── 2. Trajectory ─────────────────────────────────────────────────────────
     trajectory = compute_trajectory(pipeline_dir)
@@ -120,7 +127,8 @@ def run_evaluation_cycle(
     if use_llm and action in _LLM_ACTIONS:
         cycle_history = load_cycle_log(cycle_log_path)
         llm_analysis  = interpret_run(
-            scorecard, trajectory, result, review_md, cycle_history, action
+            scorecard, trajectory, result, review_md, cycle_history, action,
+            pipeline_dir=pipeline_dir,
         )
         _print_llm_summary(llm_analysis)
     else:
@@ -237,6 +245,32 @@ def _aggregate_report_action(
     return aggregate_action
 
 
+# ── Quality report loader ──────────────────────────────────────────────────────
+
+def _latest_quality_summary(section_name: str, report_path: Path | None) -> str:
+    """
+    Return the overall_summary string from the most recent translation quality
+    report for a benchmark set, or "" if none exists.
+    """
+    target_report = report_path or REPORT_PATH
+    results_root  = target_report.parent
+
+    # Locate the pipeline dir for this section
+    quality_dir = results_root / section_name / "pipeline" / "translation_quality"
+    if not quality_dir.exists():
+        return ""
+
+    quality_files = sorted(quality_dir.glob("*.json"))
+    if not quality_files:
+        return ""
+
+    try:
+        data = load_json_with_fallback(quality_files[-1])
+        return data.get("overall_summary", "")
+    except Exception:
+        return ""
+
+
 # ── SELF_IMPROVEMENT_REPORT.md ─────────────────────────────────────────────────
 
 def _write_report(
@@ -314,6 +348,14 @@ def _write_report(
         "time_to_first_translation_s", "wall_time_s",
     ]
 
+    quality_snapshot_keys = [
+        "translation_quality_rating",
+        "translation_flagged_pair_count",
+        "translation_reconstruction_risk_count",
+        "translation_llm_win_chunk_count",
+        "translation_google_win_chunk_count",
+    ]
+
     if len(benchmark_sections) == 1:
         lines += [
             f"## Benchmark Set: {benchmark_sections[0][0]}",
@@ -350,6 +392,30 @@ def _write_report(
                 d_str = f"{sign}{delta:.2f}{suffix}" if delta is not None else "n/a"
                 lines.append(f"- `{k}`: {current}{suffix}  (d:{d_str}, {trend})")
         lines.append("")
+
+        # Translation quality metrics (only when at least one quality eval has run)
+        quality_entries = [
+            (k, metrics.get(k, {}))
+            for k in quality_snapshot_keys
+            if metrics.get(k, {}).get("current") is not None
+        ]
+        if quality_entries:
+            lines += ["**Translation Quality (current run):**", ""]
+            for k, entry in quality_entries:
+                current = entry.get("current")
+                trend   = entry.get("trend", "n/a")
+                delta   = entry.get("delta_vs_prev")
+                suffix  = "/5.0" if k == "translation_quality_rating" else ""
+                sign    = "+" if (delta or 0) >= 0 else ""
+                d_str   = f"{sign}{delta:.2f}" if delta is not None else "n/a"
+                lines.append(f"- `{k}`: {current}{suffix}  (d:{d_str}, {trend})")
+            lines.append("")
+
+            # Inject latest quality summary text if available
+            quality_summary = _latest_quality_summary(section_name, report_path)
+            if quality_summary:
+                lines += [f"*{quality_summary}*", ""]
+
         if index != len(benchmark_sections) - 1:
             lines += ["---", ""]
 

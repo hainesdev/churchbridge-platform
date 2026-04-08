@@ -138,7 +138,7 @@ class SentenceBuffer:
     sermon timeline for verse consolidation.
     """
 
-    def __init__(self, on_sentence: Callable[[str, float, float], Awaitable[None]]):
+    def __init__(self, on_sentence: Callable[[str, float, float, str], Awaitable[None]]):
         self._on_sentence = on_sentence
         self._parts: list[str] = []
         self._timer: asyncio.Task | None = None
@@ -366,7 +366,7 @@ class SentenceBuffer:
                 "[sentence_buffer] decision=%s words=%d text=%s",
                 reason, len(sentence.split()), sentence[:80],
             )
-            await self._on_sentence(sentence, audio_start, audio_end)
+            await self._on_sentence(sentence, audio_start, audio_end, reason)
 
     def _cancel_timer(self):
         if self._timer and not self._timer.done():

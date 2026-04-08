@@ -10,6 +10,7 @@ from typing import Callable, Awaitable, TYPE_CHECKING
 import anthropic
 
 from server.db.verses import save_verse_detection, save_verse_suggestions
+from server.services.translation_deviation import translation_deviation_score
 
 if TYPE_CHECKING:
     from server.services.topic_tracker import TopicTracker
@@ -54,6 +55,20 @@ RULES:
 2. improved_translation: provide a better English rendering than the Google Translate output if needed.
    Preserve the preaching register — declarative, present tense, active voice where natural.
    If Google's translation is already excellent, return it unchanged.
+   Prefer idiomatic English over literal calques for sermon expressions when meaning is clear.
+   Example: "por el vil metal" should be rendered as "for money" (or equivalent natural wording),
+   not "for the vile metal".
+   For anecdotal/narrative spans, resolve disfluencies into coherent spoken English:
+   - remove accidental immediate repetitions ("yo yo", "ya que ya que")
+   - preserve meaning and emphasis without duplicating filler words
+   - keep speaker references clear ("él", "usted") and avoid role confusion.
+   For rhetorical question/answer sequences, keep explicit Q/A structure in English:
+   - keep questions as clear direct questions
+   - when current line answers the prior rhetorical question, make the answer concise
+   - avoid blending the answer into unrelated trailing clauses.
+   Existential / vague fillers: phrases like "tiene que haber" ("there has to be one/someone")
+   assert existence without naming the referent. Do not substitute a concrete noun
+   ("a connection", "a reason") unless the Spanish names it — keep the same vagueness.
    Common Spanish Pentecostal sermon interjections ("Santo", "Aleluya", "Gloria", "Amén") that appear
    mid-sentence and disrupt grammatical flow should be silently removed from the translation — they are
    STT artifacts of the preaching register, not content words.
@@ -135,6 +150,8 @@ RULES:
 
 9. Use English book names in all references (e.g. "John", "Romans", "Revelation").
 10. Infer chapter/verse from quoted text only when highly confident.
+    When matching quoted Spanish verse text, use the Reina-Valera 1960 (RVR1960) as the
+    primary reference to identify the correct book and verse before rendering canonical_english.
 
 11. continuation_required: true if the speaker's thought clearly requires more text to complete —
     stronger and more forward-looking than thought_complete.
@@ -239,6 +256,7 @@ STRICT RULES:
 - Each suggestion must be a SPECIFIC verse or short range, not a chapter or book.
 - Only suggest when you are confident the verse meaningfully illuminates THIS sentence.
 - Use NIV text for canonical_english.
+- When identifying quoted Spanish verse text, compare against the Reina-Valera 1960 (RVR1960) for accurate book/verse matching before rendering the NIV canonical_english.
 
 JSON schema: {"suggestions": [{"reference": "string", "canonical_english": "string", "relevance_note": "string"}]}
 """
@@ -250,13 +268,17 @@ JSON schema: {"suggestions": [{"reference": "string", "canonical_english": "stri
 # live sermon context (e.g. "transmit" is technically correct for "transmitir" but
 # sounds robotic; "share" is the natural preaching-register equivalent).
 # ---------------------------------------------------------------------------
-_TRANSLATION_NORMALIZATION: list[tuple[re.Pattern, str]] = [
-    (re.compile(r'\btransmit\b', re.IGNORECASE), 'share'),
-    (re.compile(r'\btransmits\b', re.IGNORECASE), 'shares'),
-    (re.compile(r'\btransmitting\b', re.IGNORECASE), 'sharing'),
-    (re.compile(r'\btransmitted\b', re.IGNORECASE), 'shared'),
-    (re.compile(r'\btransmission\b', re.IGNORECASE), 'sharing'),
-]
+_TRANSLATION_NORMALIZATION: dict[str, str] = {
+    'transmit': 'share',
+    'transmits': 'shares',
+    'transmitting': 'sharing',
+    'transmitted': 'shared',
+    'transmission': 'sharing',
+}
+_TRANSLATION_NORMALIZATION_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in _TRANSLATION_NORMALIZATION) + r')\b',
+    re.IGNORECASE,
+)
 
 
 def _scripture_speaker_normalization(text: str) -> str:
@@ -292,6 +314,77 @@ def _scripture_speaker_normalization(text: str) -> str:
     return text
 
 
+def _sermon_register_normalization(text: str) -> str:
+    """Apply narrow sermon-register phrase normalizations.
+
+    Keep this intentionally small and exact-match-biased so we do not
+    accidentally rewrite ordinary prose into churchy English.
+    """
+    stripped = text.strip()
+    if re.fullmatch(r"(?:That|This|It) is the text\.", stripped):
+        subject = stripped.split()[0]
+        return f"{subject} is the passage."
+    return text
+
+
+def _preserve_reference_appositives(text: str, reference_english: str) -> str:
+    """Restore explicit appositive clarifications already present in the baseline.
+
+    Example:
+      reference: "as he, Jesus, is in the light"
+      candidate: "as Jesus is in the light"
+      result:    "as he, Jesus, is in the light"
+
+    This is intentionally conservative: it only fires when the reference already
+    carries a pronoun+name appositive and the candidate keeps the same name in
+    the same local verb phrase.
+    """
+    pattern = re.compile(
+        r"\b(he|she|they),\s+([A-Z][a-z]+),\s+(is|are|was|were|says|said|did|does|has|have)\b"
+    )
+    for match in pattern.finditer(reference_english):
+        pronoun, name, verb = match.groups()
+        candidate_pattern = re.compile(
+            rf"\b{name}\s+{verb}\b"
+        )
+        candidate_match = candidate_pattern.search(text)
+        if not candidate_match:
+            continue
+        prefix = text[max(0, candidate_match.start() - 6):candidate_match.start()]
+        if "," in prefix or pronoun.lower() in prefix.lower():
+            continue
+        replacement = f"{pronoun}, {name}, {verb}"
+        text = text[:candidate_match.start()] + replacement + text[candidate_match.end():]
+        break
+    return text
+
+
+def _preserve_reference_speaker_intro(text: str, reference_english: str) -> str:
+    """Preserve explicit biblical-speaker framing already present in the reference.
+
+    This only restores a narrow family of source-anchored intros like
+    "John says" / "Paul writes" when the candidate otherwise drops the speaker
+    and launches directly into the quoted content.
+    """
+    normalized_reference = _scripture_speaker_normalization(reference_english)
+    match = re.search(
+        r"\b(John|Peter|Paul|David|Moses|Jesus)\s+(says|writes|declares|states|teaches|warns)\b",
+        normalized_reference,
+    )
+    if not match:
+        return text
+
+    name, verb = match.groups()
+    if re.search(rf"\b{name}\b", text):
+        return text
+
+    stripped = text.lstrip("“\"' ")
+    if not re.match(r"^(If|We|I|He|She|They|God|The)\b", stripped):
+        return text
+
+    return f"{name} {verb}, {text[0].lower() + text[1:]}" if text else f"{name} {verb}"
+
+
 def _if_clause_validator(text: str) -> str:
     """Detect and flag logically broken conditional constructions.
 
@@ -320,17 +413,18 @@ def _if_clause_validator(text: str) -> str:
     return text  # no auto-correction — LLM handles the merge
 
 
-def _normalize_translation(text: str) -> str:
+def _normalize_translation(text: str, reference_english: str = "") -> str:
     """Apply domain normalization to an English translation for natural sermon register."""
-    for pattern, replacement in _TRANSLATION_NORMALIZATION:
-        # Preserve original case for sentence-initial words
-        def _replace(m: re.Match, repl: str = replacement) -> str:
-            orig = m.group(0)
-            if orig[0].isupper():
-                return repl[0].upper() + repl[1:]
-            return repl
-        text = pattern.sub(_replace, text)
+    def _replace(m: re.Match) -> str:
+        word = m.group(0)
+        replacement = _TRANSLATION_NORMALIZATION[word.lower()]
+        return replacement[0].upper() + replacement[1:] if word[0].isupper() else replacement
+    text = _TRANSLATION_NORMALIZATION_RE.sub(_replace, text)
+    text = _sermon_register_normalization(text)
     text = _scripture_speaker_normalization(text)
+    if reference_english:
+        text = _preserve_reference_appositives(text, reference_english)
+        text = _preserve_reference_speaker_intro(text, reference_english)
     text = _if_clause_validator(text)
     return text
 
@@ -342,18 +436,170 @@ def _translation_deviation_score(google: str, improved: str) -> float:
     Used to detect when LLM reconstruction diverges too far from the Google
     baseline for noisy source text, flagging a reconstruction risk.
     """
-    g_words = set(google.lower().split())
-    i_words = set(improved.lower().split())
-    if not g_words and not i_words:
-        return 1.0
-    union = g_words | i_words
-    intersection = g_words & i_words
-    return len(intersection) / len(union)
+    return translation_deviation_score(google, improved)
 
 
 # Threshold below which an improved translation is considered to diverge
 # significantly from the Google baseline when source_quality is "noisy".
 _RECONSTRUCTION_RISK_THRESHOLD = 0.35
+_COMPLETENESS_MIN_LENGTH_RATIO = 0.55
+_COMPLETENESS_MIN_COVERAGE_RATIO = 0.45
+_COMPLETENESS_MIN_GOOGLE_WORDS = 8
+_COMPLETENESS_LONG_SENTENCE_WORDS = 14
+_COMPLETENESS_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
+    "from", "he", "her", "his", "i", "if", "in", "into", "is", "it",
+    "me", "my", "of", "on", "or", "our", "she", "so", "that", "the",
+    "their", "them", "there", "they", "this", "to", "us", "was", "we",
+    "were", "what", "when", "where", "who", "why", "will", "with", "you",
+    "your",
+})
+_ENGLISH_INCOMPLETE_TAIL = re.compile(
+    r"\b(?:and|as|because|but|for|from|how|if|in|into|like|of|on|or|that|the|"
+    r"this|to|what|when|where|which|who|why|with)\s*$",
+    re.IGNORECASE,
+)
+
+_REPAIR_TRANSLATION_SYSTEM = """\
+You are a bilingual theological translation repair assistant for a live church captioning system.
+
+Return ONLY valid JSON. No prose, no markdown fences, no code blocks.
+
+Goal:
+- The first translation candidate looked unsafe or incomplete.
+- Produce two repaired English options for the SAME Spanish source:
+  1. literal_translation: conservative, clause-complete, faithful to source structure
+  2. natural_translation: natural spoken English, but still complete and faithful
+
+Rules:
+- Do not omit major clauses, questions, named speakers, or consequences.
+- Do not summarize.
+- Preserve rhetorical questions as questions.
+- For scripture-like material, prefer fidelity over polish.
+- If Google is already the safest option, one or both fields may equal the Google translation.
+
+JSON schema:
+{
+  "literal_translation": "string",
+  "natural_translation": "string"
+}
+"""
+
+
+def _strip_json_fences(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+    return raw
+
+
+def _parse_json_object(raw: str) -> dict | None:
+    raw = _strip_json_fences(raw)
+    try:
+        result = json.loads(raw)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            result = json.loads(match.group(0))
+            return result if isinstance(result, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+
+def _translation_word_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9']+", text.lower())
+
+
+def _translation_keyword_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in _translation_word_tokens(text)
+        if len(token) >= 4 and token not in _COMPLETENESS_STOPWORDS
+    }
+
+
+def _sentence_count(text: str) -> int:
+    count = len(re.findall(r"[.!?]+", text))
+    return count if count > 0 else int(bool(text.strip()))
+
+
+def _translation_completeness_issues(
+    google_english: str,
+    candidate: str,
+    *,
+    translation_register: str,
+) -> list[str]:
+    issues: list[str] = []
+    candidate = candidate.strip()
+    if not candidate:
+        return ["empty_candidate"]
+
+    google_words = _translation_word_tokens(google_english)
+    candidate_words = _translation_word_tokens(candidate)
+    if len(google_words) >= _COMPLETENESS_MIN_GOOGLE_WORDS:
+        length_ratio = len(candidate_words) / max(len(google_words), 1)
+        min_ratio = _COMPLETENESS_MIN_LENGTH_RATIO
+        if translation_register == "scripture" or len(google_words) >= _COMPLETENESS_LONG_SENTENCE_WORDS:
+            min_ratio = max(min_ratio, 0.65)
+        if length_ratio < min_ratio:
+            issues.append("length_ratio")
+
+        google_sentences = _sentence_count(google_english)
+        candidate_sentences = _sentence_count(candidate)
+        if google_sentences >= 2 and candidate_sentences < google_sentences:
+            issues.append("sentence_count")
+
+        google_terms = _translation_keyword_terms(google_english)
+        if len(google_terms) >= 3:
+            candidate_terms = _translation_keyword_terms(candidate)
+            coverage_ratio = len(google_terms & candidate_terms) / len(google_terms)
+            if coverage_ratio < _COMPLETENESS_MIN_COVERAGE_RATIO:
+                issues.append("content_coverage")
+
+    if "?" in google_english and "?" not in candidate:
+        issues.append("question_preservation")
+    return issues
+
+
+def _candidate_selection_score(
+    google_english: str,
+    candidate: str,
+    *,
+    prefer_natural: bool,
+) -> float:
+    score = _translation_deviation_score(google_english, candidate)
+    if prefer_natural:
+        score += 0.05
+    return score
+
+
+def _translation_looks_incomplete(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("...", ".", "!", "?", ";", ":")):
+        return False
+    if stripped.endswith(","):
+        return True
+    if _ENGLISH_INCOMPLETE_TAIL.search(stripped):
+        return True
+    if re.search(r"\bif\b", stripped, re.IGNORECASE) and "," not in stripped:
+        return True
+    return False
+
+
+def _format_deferred_release_text(english: str, google_english: str) -> str:
+    candidate = _normalize_translation(english, google_english) if english else ""
+    google = _normalize_translation(google_english, google_english) if google_english else ""
+    release_text = candidate or google
+    if _translation_looks_incomplete(candidate):
+        release_text = google or candidate
+    if release_text and _translation_looks_incomplete(release_text):
+        release_text = release_text.rstrip(" ,;:") + "..."
+    return release_text
 
 
 def _build_system_prompt(church_terms: dict[str, str]) -> str:
@@ -377,6 +623,7 @@ def _build_user_message(
     shown_suggestions: set[str],
     current_mode_label: str = "",
     prev_discourse: dict | None = None,
+    recent_modes: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -385,6 +632,9 @@ def _build_user_message(
 
     if current_mode_label:
         parts.append(f"[CURRENT MODE]\n{current_mode_label}")
+
+    if recent_modes and len(recent_modes) > 1:
+        parts.append(f"[MODE TRAJECTORY — most recent last]\n{' → '.join(recent_modes)}")
 
     if active_passage:
         parts.append(
@@ -501,8 +751,8 @@ class LLMEnrichmentService:
         self._apply_condition = asyncio.Condition()
         self._scheduled_ts: deque[int] = deque()
 
-        # Rolling sentence context (last 5 sentences, Spanish + best English)
-        self._sentence_history: deque[tuple[str, str]] = deque(maxlen=5)
+        # Rolling sentence context (last 3 sentences, Spanish + best English)
+        self._sentence_history: deque[tuple[str, str]] = deque(maxlen=3)
         # Most recent explicit verse citation — injected into every subsequent prompt
         self._active_passage: dict | None = None
         # All references suggested this session — prevents repetition
@@ -523,6 +773,12 @@ class LLMEnrichmentService:
         #   "length": int,
         # }
         self._merge_chain_head: dict | None = None
+        # Rolling sermon mode trajectory (last 3 modes) — injected into prompt for
+        # better mode classification at rhetorical transitions.
+        self._recent_modes: deque[str] = deque(maxlen=3)
+        # Last translation emitted per ts — guards against redundant caption_merge
+        # emissions when chain extends (prevents UI flickering on the head segment).
+        self._last_emitted_translation: dict[int, str] = {}
 
         # Verse scratch pad — accumulates detections for temporal range consolidation
         self._verse_scratch: list[VerseScratchEntry] = []
@@ -552,15 +808,158 @@ class LLMEnrichmentService:
         ts: int,
         audio_start: float = 0.0,
         audio_end: float = 0.0,
+        terminal_incomplete: bool = False,
     ) -> asyncio.Task:
         """Schedule enrichment as a fire-and-forget task. Does not block."""
         self._scheduled_ts.append(ts)
         task = asyncio.create_task(
-            self._run_enrichment(spanish, google_english, ts, audio_start, audio_end)
+            self._run_enrichment(
+                spanish,
+                google_english,
+                ts,
+                audio_start,
+                audio_end,
+                terminal_incomplete,
+            )
         )
         self._tasks = [t for t in self._tasks if not t.done()]
         self._tasks.append(task)
         return task
+
+    async def _create_json_response(
+        self,
+        *,
+        system: str,
+        user_message: str,
+        ts: int,
+        stage: str,
+        max_tokens: int = MAX_ENRICHMENT_TOKENS,
+    ) -> dict | None:
+        response = await self._client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            temperature=0,
+            system=system,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        raw = response.content[0].text.strip()
+        stripped = _strip_json_fences(raw)
+        result = _parse_json_object(raw)
+        if result is not None:
+            if raw != stripped:
+                self.metrics["parse_retry_success"] += 1
+            return result
+
+        self.metrics["parse_failed"] += 1
+        logger.warning(
+            "[enrichment:%s] Could not parse %s JSON for ts=%d: %.160s",
+            self._church_id, stage, ts, raw,
+        )
+        return None
+
+    async def _repair_translation_candidates(
+        self,
+        *,
+        spanish: str,
+        google_english: str,
+        current_candidate: str,
+        issues: list[str],
+        translation_register: str,
+        discourse_tag: str,
+        ts: int,
+    ) -> dict[str, str] | None:
+        issue_lines = "\n".join(f"- {issue}" for issue in issues)
+        user_message = (
+            f"[SOURCE — Spanish original]\n{spanish}\n\n"
+            f"[GOOGLE TRANSLATION]\n{google_english}\n\n"
+            f"[REJECTED FIRST CANDIDATE]\n{current_candidate}\n\n"
+            f"[FAILURE SIGNALS]\n{issue_lines}\n\n"
+            f"[REGISTER]\n{translation_register}\n\n"
+            f"[DISCOURSE TAG]\n{discourse_tag}"
+        )
+        result = await self._create_json_response(
+            system=_REPAIR_TRANSLATION_SYSTEM,
+            user_message=user_message,
+            ts=ts,
+            stage="repair",
+            max_tokens=600,
+        )
+        if result is None:
+            return None
+        return {
+            "literal_translation": str(result.get("literal_translation", "")).strip(),
+            "natural_translation": str(result.get("natural_translation", "")).strip(),
+        }
+
+    def _select_best_translation(
+        self,
+        *,
+        google_english: str,
+        improved: str,
+        source_quality: str,
+        translation_register: str,
+        discourse_tag: str,
+        ts: int,
+        repair_options: dict[str, str] | None = None,
+    ) -> tuple[str, str, list[str]]:
+        normalized_google = _normalize_translation(google_english, google_english)
+        normalized_improved = _normalize_translation(improved, google_english) if improved else ""
+
+        def evaluate(candidate: str, label: str) -> tuple[bool, list[str], float, str]:
+            normalized = _normalize_translation(candidate, google_english) if candidate else ""
+            if not normalized:
+                return False, ["empty_candidate"], -1.0, ""
+            if normalized == normalized_google:
+                score = _candidate_selection_score(
+                    normalized_google,
+                    normalized_google,
+                    prefer_natural=(label == "natural"),
+                )
+                return True, [], score, normalized_google
+
+            issues = _translation_completeness_issues(
+                normalized_google,
+                normalized,
+                translation_register=translation_register,
+            )
+            if source_quality == "noisy":
+                deviation = _translation_deviation_score(normalized_google, normalized)
+                if deviation < _RECONSTRUCTION_RISK_THRESHOLD:
+                    issues.append("reconstruction_risk")
+            valid = not issues
+            score = _candidate_selection_score(
+                normalized_google,
+                normalized if valid else normalized_google,
+                prefer_natural=(label == "natural"),
+            )
+            return valid, issues, score, normalized
+
+        candidates: list[tuple[bool, list[str], float, str, str]] = [
+            (*evaluate(normalized_improved, "primary"), "primary"),
+        ]
+        if repair_options:
+            for label in ("literal", "natural"):
+                candidates.append(
+                    (*evaluate(repair_options.get(f"{label}_translation", ""), label), label)
+                )
+
+        valid_candidates = [candidate for candidate in candidates if candidate[0] and candidate[3]]
+        if valid_candidates:
+            prefer_close = translation_register == "scripture" or source_quality != "clean"
+            if prefer_close:
+                valid_candidates.sort(
+                    key=lambda entry: (entry[2], entry[4] == "literal"),
+                    reverse=True,
+                )
+            else:
+                valid_candidates.sort(
+                    key=lambda entry: (entry[4] == "natural", entry[4] == "primary", entry[2]),
+                    reverse=True,
+                )
+            _, _, _, chosen_text, chosen_label = valid_candidates[0]
+            return chosen_text, chosen_label, []
+
+        return normalized_google, "google_fallback", candidates[0][1]
 
     async def _wait_for_apply_turn(self, ts: int) -> None:
         async with self._apply_condition:
@@ -586,6 +985,7 @@ class LLMEnrichmentService:
         ts: int,
         audio_start: float,
         audio_end: float,
+        terminal_incomplete: bool,
     ) -> None:
         # topic_context is from TopicTracker (updated on an independent schedule,
         # not affected by enrichment apply ordering — snapshot early is fine).
@@ -611,6 +1011,7 @@ class LLMEnrichmentService:
             current_mode_label = (
                 self._state_tracker.get_context_label() if self._state_tracker else ""
             )
+            recent_modes = list(self._recent_modes)
 
         logger.debug(
             "[enrichment:%s] Enriching ts=%d at audio=%.1f–%.1fs | "
@@ -624,59 +1025,106 @@ class LLMEnrichmentService:
 
         user_msg = _build_user_message(
             spanish, google_english, topic_context, history, active_passage, shown,
-            current_mode_label, prev_discourse,
+            current_mode_label, prev_discourse, recent_modes,
         )
 
         try:
-            response = await self._client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=MAX_ENRICHMENT_TOKENS,
-                temperature=0,
+            result = await self._create_json_response(
                 system=self._system_prompt,
-                messages=[{"role": "user", "content": user_msg}],
+                user_message=user_msg,
+                ts=ts,
+                stage="enrichment",
             )
-            raw = response.content[0].text.strip()
         except asyncio.CancelledError:
             await self._finish_apply_turn(ts)
             raise
         except Exception as e:
             logger.warning("[enrichment:%s] Claude call failed for ts=%d: %s", self._church_id, ts, e)
+            # Fire enrichment_settled so the Google correction guard is not permanently blocked,
+            # and the original Google translation remains visible (no frozen caption).
+            try:
+                await self._on_enrichment_settled(ts)
+            except Exception:
+                pass
             await self._finish_apply_turn(ts)
             return
 
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-
-        result = None
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            # Retry: extract first {...} JSON block from the response
-            m = re.search(r'\{.*\}', raw, re.DOTALL)
-            if m:
-                try:
-                    result = json.loads(m.group(0))
-                    async with self._mutation_lock:
-                        self.metrics["parse_retry_success"] += 1
-                    logger.info(
-                        "[enrichment:%s] JSON extracted via retry for ts=%d", self._church_id, ts
-                    )
-                except json.JSONDecodeError:
-                    pass
-            if result is None:
-                async with self._mutation_lock:
-                    self.metrics["parse_failed"] += 1
-                logger.warning(
-                    "[enrichment:%s] Could not parse JSON for ts=%d: %.120s",
-                    self._church_id, ts, raw,
-                )
-                await self._finish_apply_turn(ts)
-                return
-
-        if not isinstance(result, dict):
-            logger.warning("[enrichment:%s] Expected JSON object for ts=%d, got %s", self._church_id, ts, type(result).__name__)
+        if result is None:
             await self._finish_apply_turn(ts)
             return
+
+        discourse_tag = result.get("discourse_tag", "statement")
+        introduces_quote = bool(result.get("introduces_quote", False))
+        thought_complete = bool(result.get("thought_complete", True))
+        continuation_required = bool(result.get("continuation_required", False))
+        merge_with_previous = bool(result.get("merge_with_previous", False))
+        paragraph_break = bool(result.get("paragraph_break", False))
+        source_quality = result.get("source_quality", "clean")
+        if source_quality not in ("clean", "noisy", "fragmented"):
+            source_quality = "clean"
+        translation_register = result.get("translation_register", "expository")
+        if translation_register not in ("scripture", "expository", "narrative", "exhortation"):
+            translation_register = "expository"
+        display_ready = (
+            thought_complete
+            and not continuation_required
+            and source_quality != "fragmented"
+            and discourse_tag != "quote_introduction"
+        )
+        display_ready_from_llm = result.get("display_ready")
+        if isinstance(display_ready_from_llm, bool) and not display_ready_from_llm:
+            display_ready = False
+        if terminal_incomplete:
+            display_ready = False
+
+        sermon_mode = result.get("sermon_mode", "exposition")
+        if sermon_mode not in _VALID_SERMON_MODES:
+            sermon_mode = "exposition"
+
+        guard_google_english = google_english
+        if merge_with_previous and history:
+            guard_google_english = f"{history[-1][1]} {google_english}".strip()
+
+        improved = result.get("improved_translation", "").strip()
+        chosen_english, chosen_source, candidate_issues = self._select_best_translation(
+            google_english=guard_google_english,
+            improved=improved,
+            source_quality=source_quality,
+            translation_register=translation_register,
+            discourse_tag=discourse_tag,
+            ts=ts,
+        )
+        if candidate_issues:
+            repair_options = await self._repair_translation_candidates(
+                spanish=spanish,
+                google_english=guard_google_english,
+                current_candidate=improved,
+                issues=candidate_issues,
+                translation_register=translation_register,
+                discourse_tag=discourse_tag,
+                ts=ts,
+            )
+            chosen_english, chosen_source, candidate_issues = self._select_best_translation(
+                google_english=guard_google_english,
+                improved=improved,
+                source_quality=source_quality,
+                translation_register=translation_register,
+                discourse_tag=discourse_tag,
+                ts=ts,
+                repair_options=repair_options,
+            )
+
+        best_english = chosen_english
+        if terminal_incomplete:
+            best_english = _format_deferred_release_text(best_english, google_english)
+        if chosen_source == "google_fallback":
+            logger.warning(
+                "[enrichment:%s] translation_guard_fallback_google ts=%d "
+                "register=%s tag=%s issues=%s",
+                self._church_id, ts, translation_register, discourse_tag, ",".join(candidate_issues),
+            )
+        if "reconstruction_risk" in candidate_issues:
+            self.metrics["reconstruction_risk"] += 1
 
         # (apply turn already acquired above — proceed directly to state mutation)
 
@@ -685,35 +1133,6 @@ class LLMEnrichmentService:
         # API latency; the lock ensures sentence history, active passage, shown
         # suggestions, and mode signals are always updated in arrival order.
         async with self._mutation_lock:
-            # --- Discourse tagging ---
-            discourse_tag = result.get("discourse_tag", "statement")
-            introduces_quote = bool(result.get("introduces_quote", False))
-            thought_complete = bool(result.get("thought_complete", True))
-            continuation_required = bool(result.get("continuation_required", False))
-            merge_with_previous = bool(result.get("merge_with_previous", False))
-            paragraph_break = bool(result.get("paragraph_break", False))
-            source_quality = result.get("source_quality", "clean")
-            if source_quality not in ("clean", "noisy", "fragmented"):
-                source_quality = "clean"
-            translation_register = result.get("translation_register", "expository")
-            if translation_register not in ("scripture", "expository", "narrative", "exhortation"):
-                translation_register = "expository"
-
-            # display_ready: always computed deterministically from the structural signals.
-            # The LLM's field is read but can only make it MORE restrictive (false), never relax it.
-            # This prevents cases where the LLM returns display_ready=true despite
-            # continuation_required=true or source_quality="fragmented".
-            display_ready = (
-                thought_complete
-                and not continuation_required
-                and source_quality != "fragmented"
-                and discourse_tag != "quote_introduction"
-            )
-            display_ready_from_llm = result.get("display_ready")
-            if isinstance(display_ready_from_llm, bool) and not display_ready_from_llm:
-                # LLM says not ready even though heuristic says ready — trust the LLM restriction
-                display_ready = False
-
             logger.info(
                 "[enrichment:%s] Discourse ts=%d: tag=%s introduces_quote=%s "
                 "complete=%s continuation=%s merge=%s break=%s quality=%s "
@@ -760,13 +1179,10 @@ class LLMEnrichmentService:
                 except Exception as e:
                     logger.warning("[enrichment:%s] on_buffer_hold (quote) failed: %s", self._church_id, e)
 
-            # --- Sermon mode ---
-            sermon_mode = result.get("sermon_mode", "exposition")
-            if sermon_mode not in _VALID_SERMON_MODES:
-                sermon_mode = "exposition"
             logger.info("[enrichment:%s] Sermon mode ts=%d: %s", self._church_id, ts, sermon_mode)
             if self._state_tracker:
                 await self._state_tracker.add_signal(sermon_mode, ts)
+            self._recent_modes.append(sermon_mode)
 
             # Track noisy input
             if source_quality == "noisy":
@@ -776,46 +1192,18 @@ class LLMEnrichmentService:
             if len(spanish.split()) > 25:
                 self.metrics["long_sentence_handled_count"] += 1
 
-            # --- Translation improvement ---
-            improved = result.get("improved_translation", "").strip()
-            # Apply domain normalization for natural sermon English ("transmit" → "share", etc.)
-            if improved:
-                improved = _normalize_translation(improved)
-
-            # Reconstruction risk guard: if source is noisy and the LLM's translation
-            # diverges significantly from the Google baseline, the LLM may have hallucinated
-            # meaning. In that case, fall back to the Google translation to be conservative.
-            reconstruction_risk = False
-            if source_quality == "noisy" and improved and improved != google_english:
-                deviation = _translation_deviation_score(google_english, improved)
-                if deviation < _RECONSTRUCTION_RISK_THRESHOLD:
-                    reconstruction_risk = True
-                    self.metrics["reconstruction_risk"] += 1
-                    logger.warning(
-                        "[enrichment:%s] reconstruction_risk=true ts=%d "
-                        "deviation_score=%.2f\n  google: %s\n     llm: %s",
-                        self._church_id, ts, deviation,
-                        google_english[:80], improved[:80],
-                    )
-                    # Fall back to Google to avoid emitting hallucinated content.
-                    # The noisy flag will also suppress this sentence until a merge.
-                    improved = google_english
-
-            best_english = improved if (improved and improved != google_english) else google_english
-            # Apply normalization to the final best_english so the domain map is
-            # always applied regardless of whether the LLM improved the translation.
-            best_english = _normalize_translation(best_english)
-
             if display_ready:
                 # Sentence is finalised — emit translation update immediately.
-                if improved and improved != google_english:
+                if best_english != _normalize_translation(google_english):
                     logger.info(
-                        "[enrichment:%s] decision=immediate_translation_update ts=%d:\n"
+                        "[enrichment:%s] decision=immediate_translation_update ts=%d "
+                        "source=%s:\n"
                         "  google: %s\n     llm: %s",
-                        self._church_id, ts, google_english[:80], improved[:80],
+                        self._church_id, ts, chosen_source, google_english[:80], best_english[:80],
                     )
                     try:
-                        await self._on_translation_update(ts, improved)
+                        await self._on_translation_update(ts, best_english)
+                        self._last_emitted_translation[ts] = best_english
                     except Exception as e:
                         logger.warning("[enrichment:%s] on_translation_update failed: %s", self._church_id, e)
                 else:
@@ -823,6 +1211,7 @@ class LLMEnrichmentService:
                         "[enrichment:%s] decision=immediate_translation_update ts=%d — no change",
                         self._church_id, ts,
                     )
+                    self._last_emitted_translation[ts] = _normalize_translation(google_english)
             else:
                 # Sentence is not display_ready — suppress translation update and defer.
                 # The deferred release fires after DEFERRED_RELEASE_S if no merge arrives.
@@ -880,15 +1269,29 @@ class LLMEnrichmentService:
                     }
                     if chain_len > self.metrics["merge_chain_max_length"]:
                         self.metrics["merge_chain_max_length"] = chain_len
+                    logger.debug(
+                        "[enrichment:%s] decision=merge_chain_extended ts=%d absorbed_by_head=%d "
+                        "chain_len=%d spanish_len=%d",
+                        self._church_id, ts, head_ts, chain_len, len(chain_spanish),
+                    )
                     logger.info(
                         "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
                         "chain_len=%d",
                         self._church_id, ts, head_ts, chain_len,
                     )
-                    try:
-                        await self._on_caption_merge(ts, head_ts, chain_spanish, best_english)
-                    except Exception as e:
-                        logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+                    # Lock-in guard: skip emission if the merged translation is identical
+                    # to what was last emitted for the head, preventing UI flickering.
+                    if self._last_emitted_translation.get(head_ts) != best_english:
+                        try:
+                            await self._on_caption_merge(ts, head_ts, chain_spanish, best_english)
+                            self._last_emitted_translation[head_ts] = best_english
+                        except Exception as e:
+                            logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+                    else:
+                        logger.debug(
+                            "[enrichment:%s] decision=merge_skipped_no_change head=%d ts=%d",
+                            self._church_id, head_ts, ts,
+                        )
 
                 else:
                     # Starting a new chain — prev_ts becomes the head anchor; current ts absorbed.
@@ -917,10 +1320,19 @@ class LLMEnrichmentService:
                         "chain_len=2",
                         self._church_id, ts, prev_ts,
                     )
-                    try:
-                        await self._on_caption_merge(ts, prev_ts, chain_spanish, best_english)
-                    except Exception as e:
-                        logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+                    # Lock-in guard: only emit if the merged translation differs from
+                    # what was last shown for the head, preventing redundant UI updates.
+                    if self._last_emitted_translation.get(prev_ts) != best_english:
+                        try:
+                            await self._on_caption_merge(ts, prev_ts, chain_spanish, best_english)
+                            self._last_emitted_translation[prev_ts] = best_english
+                        except Exception as e:
+                            logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+                    else:
+                        logger.debug(
+                            "[enrichment:%s] decision=merge_skipped_no_change head=%d ts=%d",
+                            self._church_id, prev_ts, ts,
+                        )
 
             else:
                 # No merge — reset chain.
@@ -934,13 +1346,14 @@ class LLMEnrichmentService:
             # --- Segment metadata ---
             # pending_completion signals that this segment may be updated or merged.
             # The client can dim/italicise it until a translation_update or caption_merge arrives.
-            pending_completion = not display_ready
+            pending_completion = (not display_ready) or terminal_incomplete
             if self._on_segment_metadata:
                 metadata = {
                     "translation_register": translation_register,
                     "paragraph_break": paragraph_break,
                     "source_quality": source_quality,
                     "pending_completion": pending_completion,
+                    "terminal_incomplete": terminal_incomplete,
                 }
                 try:
                     await self._on_segment_metadata(ts, metadata)
@@ -1077,9 +1490,10 @@ class LLMEnrichmentService:
                 # Always emit a release event when we time out a deferred caption,
                 # even if the text matches Google's original output. The client
                 # uses this event to clear pending-completion UI state.
-                if english:
+                release_text = _format_deferred_release_text(english, google_english)
+                if release_text:
                     try:
-                        await self._on_translation_update(ts, english)
+                        await self._on_translation_update(ts, release_text)
                     except Exception as e:
                         logger.warning(
                             "[enrichment:%s] deferred translation_update failed ts=%d: %s",
@@ -1297,6 +1711,7 @@ class LLMEnrichmentService:
         for _, (_, defer_task) in list(self._deferred_updates.items()):
             defer_task.cancel()
         self._deferred_updates.clear()
+        self._last_emitted_translation.clear()
         self._tasks = [task for task in self._tasks if not task.done()]
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)

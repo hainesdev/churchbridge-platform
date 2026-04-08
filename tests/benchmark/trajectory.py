@@ -78,6 +78,10 @@ LOWER_IS_BETTER = {
     "duplicate_commit_count",
     "mode_flip_count",
     "display_ready_violation_count",
+    # Translation quality — lower flagged/risk counts are better
+    "translation_flagged_pair_count",
+    "translation_reconstruction_risk_count",
+    "translation_google_win_chunk_count",
 }
 
 # Metrics whose trend labels are unreliable when clip_duration_s changes significantly
@@ -123,6 +127,14 @@ TIER = {
     "avg_translation_latency_s":      3,
     "avg_llm_correction_latency_s":   3,
     "client_visible_rewrite_count":   3,
+    # Translation quality metrics (Tier 2 — primary optimization target for output quality)
+    "translation_quality_rating":            2,
+    "translation_flagged_pair_count":        2,
+    "translation_reconstruction_risk_count": 2,
+    "translation_llm_win_chunk_count":       3,
+    "translation_google_win_chunk_count":    3,
+    "translation_mixed_chunk_count":         3,
+    "translation_pair_count":                3,
 }
 
 
@@ -217,7 +229,7 @@ def _extract_series(scorecards: list[dict]) -> dict[str, list[float | None]]:
     """
     series: dict[str, list[float | None]] = {}
     for sc in scorecards:
-        for group in ("accuracy", "latency", "behavioral"):
+        for group in ("accuracy", "latency", "behavioral", "quality"):
             for k, v in sc.get(group, {}).items():
                 series.setdefault(k, []).append(v if isinstance(v, (int, float)) else None)
         # Expose clip_duration_s at the top level so compute_trajectory can detect

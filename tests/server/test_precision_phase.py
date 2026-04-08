@@ -20,7 +20,12 @@ from server.services.sentence_buffer import _is_incomplete, _is_conditional_inco
 from server.services.llm_enrichment_service import (
     _normalize_translation,
     _scripture_speaker_normalization,
+    _sermon_register_normalization,
+    _preserve_reference_appositives,
+    _preserve_reference_speaker_intro,
     _if_clause_validator,
+    _translation_looks_incomplete,
+    _format_deferred_release_text,
 )
 from server.services.google_translate_service import GoogleTranslateService
 
@@ -106,6 +111,58 @@ class TestScriptureSpeakerNormalization:
         """'John says' already correct — must not be altered."""
         result = _scripture_speaker_normalization("John says: if we confess our sins")
         assert result == "John says: if we confess our sins"
+
+
+class TestSermonRegisterNormalization:
+    def test_that_is_the_text_becomes_passage(self):
+        assert _sermon_register_normalization("That is the text.") == "That is the passage."
+
+    def test_this_is_the_text_becomes_passage(self):
+        assert _sermon_register_normalization("This is the text.") == "This is the passage."
+
+    def test_longer_sentence_not_rewritten(self):
+        assert _sermon_register_normalization("That is the text we read yesterday.") == (
+            "That is the text we read yesterday."
+        )
+
+
+class TestReferenceAppositives:
+    def test_preserves_baseline_pronoun_name_appositive(self):
+        result = _preserve_reference_appositives(
+            "But if we walk in the light as Jesus is in the light, what is the proof?",
+            "But if we walk in the light as he, Jesus, is in the light, what is the proof?",
+        )
+        assert "he, Jesus, is in the light" in result
+
+    def test_does_not_invent_appositive_without_reference(self):
+        result = _preserve_reference_appositives(
+            "But if we walk in the light as Jesus is in the light, what is the proof?",
+            "But if we walk in the light as Jesus is in the light, what is the proof?",
+        )
+        assert result == "But if we walk in the light as Jesus is in the light, what is the proof?"
+
+
+class TestReferenceSpeakerIntro:
+    def test_preserves_reference_john_says_intro(self):
+        result = _preserve_reference_speaker_intro(
+            "If we say that we have fellowship with him, but walk in darkness, we lie.",
+            "John says, If we say that we have fellowship with him, but walk in darkness, we lie.",
+        )
+        assert result == "John says, if we say that we have fellowship with him, but walk in darkness, we lie."
+
+    def test_does_not_invent_speaker_intro_without_reference(self):
+        result = _preserve_reference_speaker_intro(
+            "If we say that we have fellowship with him, but walk in darkness, we lie.",
+            "If we say that we have fellowship with him, but walk in darkness, we lie.",
+        )
+        assert result == "If we say that we have fellowship with him, but walk in darkness, we lie."
+
+    def test_keeps_existing_speaker_intro(self):
+        result = _preserve_reference_speaker_intro(
+            "John says, if we say that we have fellowship with him, but walk in darkness, we lie.",
+            "John says, If we say that we have fellowship with him, but walk in darkness, we lie.",
+        )
+        assert result == "John says, if we say that we have fellowship with him, but walk in darkness, we lie."
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +262,50 @@ class TestNormalizeTranslationIntegration:
     def test_pentecostal_prefix_cleaned(self):
         result = _normalize_translation("Pentecostal John says we must repent")
         assert "Pentecostal John" not in result
+
+    def test_reference_appositive_preserved_from_google(self):
+        result = _normalize_translation(
+            "But if we walk in the light as Jesus is in the light, what is the proof that we are in the light?",
+            "But if we walk in the light as he, Jesus, is in the light, what is the proof that we are in the light?",
+        )
+        assert "he, Jesus, is in the light" in result
+
+    def test_sermon_phrase_text_to_passage(self):
+        result = _normalize_translation("That is the text.")
+        assert result == "That is the passage."
+
+    def test_reference_speaker_intro_preserved_from_google(self):
+        result = _normalize_translation(
+            "If we say that we have fellowship with him, but walk in darkness, we lie.",
+            "John says, If we say that we have fellowship with him, but walk in darkness, we lie.",
+        )
+        assert result == "John says, if we say that we have fellowship with him, but walk in darkness, we lie."
+
+
+class TestDeferredReleaseFormatting:
+    def test_trailing_wh_word_marked_incomplete(self):
+        assert _translation_looks_incomplete(
+            "Now, let's understand, phrase by phrase, word by word, what"
+        ) is True
+
+    def test_complete_sentence_not_marked_incomplete(self):
+        assert _translation_looks_incomplete(
+            "We have fellowship with one another."
+        ) is False
+
+    def test_deferred_release_prefers_conservative_google_for_incomplete_rewrite(self):
+        result = _format_deferred_release_text(
+            "Now, let's understand this phrase by phrase, word by word, what",
+            "Now, let's understand, phrase by phrase, word by word, what",
+        )
+        assert result == "Now, let's understand, phrase by phrase, word by word, what..."
+
+    def test_deferred_release_leaves_complete_text_alone(self):
+        result = _format_deferred_release_text(
+            "That is the text.",
+            "It is the text.",
+        )
+        assert result == "That is the passage."
 
 
 # ---------------------------------------------------------------------------
