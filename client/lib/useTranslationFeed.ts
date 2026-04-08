@@ -37,10 +37,31 @@ export interface Segment {
   /** True while the segment is pending a merge or deferred translation release.
    *  Set by segment_metadata when display_ready=false; cleared on translation_update or caption_merge. */
   pendingCompletion?: boolean;
+  /** True when the buffer had to flush an incomplete tail because the audio chunk/session ended. */
+  terminalIncomplete?: boolean;
 }
 
 const PARTIAL_FLUSH_MS = 80;
 const FLASH_MS = 600;
+const DEBUG_ENDPOINT = 'http://127.0.0.1:7272/ingest/21d235ae-7f16-4db5-a1b3-9bc0bbde2463';
+
+const debugLog = (hypothesisId: string, location: string, message: string, data: Record<string, unknown>) => {
+  // #region agent log
+  fetch(DEBUG_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '233415' },
+    body: JSON.stringify({
+      sessionId: '233415',
+      runId: 'pre-fix',
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+};
 
 export interface TranslationFeed {
   segments: Segment[];
@@ -86,9 +107,18 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
 
     const connect = () => {
       if (stopped) return;
+      // #region agent log
+      debugLog('H2', 'useTranslationFeed.ts:connect', 'Opening display websocket', { churchId });
+      // #endregion
       ws = new WebSocket(`${getWebSocketBaseUrl()}/api/display/v1?church_id=${encodeURIComponent(churchId)}`);
       ws.onopen = () => setConnected(true);
-      ws.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
+      ws.onclose = () => {
+        // #region agent log
+        debugLog('H2', 'useTranslationFeed.ts:onclose', 'Display websocket closed; scheduling reconnect', { churchId });
+        // #endregion
+        setConnected(false);
+        setTimeout(connect, 2000);
+      };
       ws.onmessage = (e) => {
         let msg: Record<string, unknown>;
         try {
@@ -115,7 +145,26 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           }
 
         } else if (msg.type === 'translation') {
-          setSegments(prev => [...prev.slice(-99), { id: msg.ts, spanish: msg.spanish, english: msg.english }]);
+          setSegments(prev => {
+            const ts = Number(msg.ts);
+            const duplicateCount = prev.filter(s => s.id === ts).length;
+            // #region agent log
+            debugLog('H1', 'useTranslationFeed.ts:translation', 'Received translation event', {
+              ts,
+              duplicateCountBeforeAppend: duplicateCount,
+              segmentCountBeforeAppend: prev.length,
+            });
+            // #endregion
+            // Deduplicate by ts to keep React keys stable when duplicate delivery/replay occurs.
+            if (duplicateCount > 0) {
+              return prev.map(s =>
+                s.id === ts
+                  ? { ...s, spanish: String(msg.spanish ?? ''), english: String(msg.english ?? '') }
+                  : s
+              );
+            }
+            return [...prev.slice(-99), { id: ts, spanish: String(msg.spanish ?? ''), english: String(msg.english ?? '') }];
+          });
           setSpanishLines([]);
           setPartialSpanish('');
           lastInterimTextRef.current = null;
@@ -129,6 +178,12 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           setSegments(prev => prev.map(s =>
             s.id === msg.ts ? { ...s, english: msg.english, pendingCompletion: false } : s
           ));
+          // #region agent log
+          debugLog('H4', 'useTranslationFeed.ts:correction_or_update', 'Applied correction/translation_update', {
+            type: msg.type,
+            ts: Number(msg.ts),
+          });
+          // #endregion
           setFlashingId(msg.ts);
           if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
           flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
@@ -160,6 +215,13 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           // Remove the absorbed segment and update the kept segment with merged content.
           // Clear pendingCompletion on the kept segment — it is now the merged final caption.
           setSegments(prev => {
+            // #region agent log
+            debugLog('H3', 'useTranslationFeed.ts:caption_merge', 'Applying caption merge', {
+              tsKeep: Number(msg.ts_keep),
+              tsAbsorb: Number(msg.ts_absorb),
+              segmentCountBeforeMerge: prev.length,
+            });
+            // #endregion
             const filtered = prev.filter(s => s.id !== (msg.ts_absorb as number));
             return filtered.map(s =>
               s.id === msg.ts_keep
@@ -179,6 +241,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
                   paragraphBreak: msg.paragraph_break as boolean | undefined,
                   sourceQuality: msg.source_quality as 'clean' | 'noisy' | 'fragmented' | undefined,
                   pendingCompletion: msg.pending_completion as boolean | undefined,
+                  terminalIncomplete: (msg.terminal_incomplete as boolean | undefined) ?? s.terminalIncomplete,
                 }
               : s
           ));

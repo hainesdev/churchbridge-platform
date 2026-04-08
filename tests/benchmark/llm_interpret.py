@@ -123,6 +123,72 @@ def _directive_summary() -> str:
     return text[:3000]
 
 
+def _quality_report_summary(result: dict, pipeline_dir: Path | None) -> str:
+    """
+    Load the translation quality report for this run (if it exists) and return
+    a compact summary for injection into the interpretation prompt.
+
+    Returns an empty string when no quality report is available — the prompt
+    degrades gracefully rather than failing.
+    """
+    if pipeline_dir is None:
+        return ""
+
+    run_id = result.get("run_id", "")
+    quality_path = pipeline_dir / "translation_quality" / f"{run_id}.json"
+    if not quality_path.exists():
+        return ""
+
+    try:
+        raw = quality_path.read_bytes()
+        for enc in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                report = json.loads(raw.decode(enc))
+                break
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        else:
+            return ""
+    except Exception:
+        return ""
+
+    rating   = report.get("overall_quality_rating")
+    conf     = report.get("confidence", "unknown")
+    summary  = report.get("overall_summary", "")
+    flagged  = report.get("flagged_pairs") or []
+    chunks   = report.get("chunk_evaluations") or []
+    recs     = report.get("recommendations") or []
+
+    winners  = [c.get("llm_vs_google_winner") for c in chunks]
+    llm_wins = winners.count("llm")
+    goog_wins = winners.count("google")
+    mixed    = winners.count("mixed")
+
+    lines = [
+        f"Overall quality rating: {rating}/5.0 (confidence: {conf})",
+        f"LLM vs Google: {llm_wins} LLM wins / {goog_wins} Google wins / {mixed} mixed across {len(chunks)} chunks",
+        f"Flagged pairs (high deviation): {len(flagged)}",
+    ]
+    if summary:
+        lines.append(f"Summary: {summary}")
+
+    high_severity = [p for p in flagged if p.get("severity") == "high"]
+    if high_severity:
+        lines.append(f"High-severity flagged pairs ({len(high_severity)}):")
+        for p in high_severity[:3]:
+            lines.append(
+                f"  [{p['index']}] deviation={p.get('deviation_score', '?'):.2f} "
+                f"risk={p.get('reconstruction_risk', False)}: {p.get('verdict', '')}"
+            )
+
+    if recs:
+        lines.append("Quality recommendations:")
+        for r in recs[:3]:
+            lines.append(f"  - {r}")
+
+    return "\n".join(lines)
+
+
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
 def _build_prompt(
@@ -132,10 +198,12 @@ def _build_prompt(
     review_md:      str,
     cycle_history:  list[dict],
     action:         str,
+    pipeline_dir:   Path | None = None,
 ) -> str:
     event_sample   = _sample_event_log(result)
     pairs          = _committed_pairs(result)
     directive_info = _directive_summary()
+    quality_info   = _quality_report_summary(result, pipeline_dir)
 
     n_runs         = trajectory.get("n_runs", 0)
     audio_dir      = scorecard.get("audio_dir", "unknown")
@@ -188,6 +256,12 @@ def _build_prompt(
         event_lines.append(f"  [{e}s] {t}: {preview}")
     event_block = "\n".join(event_lines) if event_lines else "  (empty)"
 
+    quality_block = (
+        f"\nTRANSLATION QUALITY EVALUATION (this run):\n{quality_info}\n"
+        if quality_info else
+        "\nTRANSLATION QUALITY EVALUATION: (not yet run — use --translation-quality to enable)\n"
+    )
+
     prompt = f"""You are a specialist benchmark evaluator for ChurchBridge AI.
 
 ChurchBridge AI provides real-time Spanish → English caption translation for live
@@ -227,6 +301,8 @@ COMMITTED SENTENCES WITH TRANSLATIONS (aligned by ts):
 {pairs_block}
 
 ---
+{quality_block}
+---
 
 EVENT LOG SAMPLE ({len(event_sample)} events):
 {event_block}
@@ -261,6 +337,11 @@ Your job:
 CONSTRAINTS:
 - Never propose changes unless you can cite specific evidence from the event
   log or committed sentence pairs above.
+- Distinguish three cases explicitly when relevant: true pipeline regression,
+  evaluator uncertainty/noise, and expected degradation on clipped or damaged
+  stress audio.
+- Do not treat stress-window weakness alone as proof that the clean-audio path
+  regressed.
 - For directive changes: only propose if the trajectory shows {n_runs} runs
   of consistent evidence. If evidence is thin, say so and lower confidence.
 - For code changes: name file:function, not a general area.
@@ -295,6 +376,7 @@ def interpret_run(
     cycle_history: list[dict],
     action:        str,
     model:         str = "claude-opus-4-6",
+    pipeline_dir:  Path | None = None,
 ) -> dict:
     """
     Call the Claude API and return a structured interpretation dict.
@@ -336,7 +418,7 @@ def interpret_run(
         }
 
     prompt = _build_prompt(
-        scorecard, trajectory, result, review_md, cycle_history, action
+        scorecard, trajectory, result, review_md, cycle_history, action, pipeline_dir
     )
 
     print(f"  Calling Claude ({model}) for benchmark interpretation...")

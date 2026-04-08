@@ -14,6 +14,20 @@ full production pipeline:
 All events received by the display WebSocket are stored in the result JSON,
 including interim results, committed sentences, translations, LLM corrections,
 verse detections, segment metadata, and mode changes.
+
+Concurrent runs must be isolated. If you run multiple pipeline benchmarks at
+the same time, give each process its own --port and preferably its own
+--church-id / --results-root as well. Sequential runs are the safest default.
+
+The source recordings are also intentionally long. Use --start-offset plus a
+bounded --duration to probe multiple windows from the same file, with cleaner
+audio windows serving as optimization targets and clipped windows serving as
+stress tests.
+
+Translation quality is evaluated alongside pipeline behavior, but the loop
+should still distinguish evaluator uncertainty from true regressions and should
+read clipped/noisy windows as resilience checks rather than as the main clean
+audio optimization target.
 """
 
 from __future__ import annotations
@@ -40,6 +54,8 @@ load_dotenv(ROOT / ".env")
 
 sys.path.insert(0, str(ROOT))
 from tests.benchmark.orchestrator import run_evaluation_cycle  # noqa: E402
+from tests.benchmark.llm_translation_quality import evaluate_translation_quality  # noqa: E402
+from tests.benchmark.scorecard import generate_scorecard  # noqa: E402
 from tests.benchmark.run_benchmark import compute_wer, parse_srt  # noqa: E402
 from tests.benchmark.storage import (  # noqa: E402
     append_history_row,
@@ -374,6 +390,43 @@ def print_report(result: dict) -> None:
     print(divider)
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="ChurchBridge AI â€” Pipeline Regression Test",
+        epilog=(
+            "Concurrent runs: use a unique --port for each process, and prefer "
+            "isolated --church-id / --results-root values. Reusing the default "
+            "port across concurrent runs can cause bind failures and noisy logs."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--audio-dir", default="tests/audio/1",
+                        help="Directory containing .mp3 and .srt files")
+    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION_S,
+                        help=f"Seconds of audio to test (default: {DEFAULT_DURATION_S:g})")
+    parser.add_argument("--start-offset", type=float, default=0.0,
+                        help="Start offset in seconds within the source audio")
+    parser.add_argument("--allow-long-duration", action="store_true",
+                        help="Allow durations above the default live-test limit")
+    parser.add_argument("--port", type=int, default=SERVER_PORT,
+                        help=f"Server port for this benchmark run (default: {SERVER_PORT}); concurrent runs must use different ports")
+    parser.add_argument("--church-id", default="",
+                        help="Church/session namespace for this run; defaults to an isolated generated value, but set it explicitly for concurrent runs when needed")
+    parser.add_argument("--results-root", default="tests/benchmark/results",
+                        help="Results root for artifacts. Use tests/benchmark/results/staggered for the new regime or a separate root to isolate concurrent runs")
+    parser.add_argument("--capture-only", action="store_true",
+                        help="Save the raw run JSON only; skip history, review, trajectory, cycle log, and report")
+    parser.add_argument("--note", default="",
+                        help="Free-text note recorded with this run")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="Skip LLM interpretation (deterministic evaluation only)")
+    parser.add_argument("--translation-quality", action="store_true",
+                        help="Run LLM translation quality evaluation after the benchmark cycle")
+    parser.add_argument("--tq-chunk-size", type=int, default=5,
+                        help="Sentences per chunk for translation quality evaluation (default: 5)")
+    return parser
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="ChurchBridge AI — Pipeline Regression Test")
     parser.add_argument("--audio-dir", default="tests/audio/1",
@@ -396,6 +449,10 @@ async def main() -> None:
                         help="Free-text note recorded with this run")
     parser.add_argument("--no-llm", action="store_true",
                         help="Skip LLM interpretation (deterministic evaluation only)")
+    parser.add_argument("--translation-quality", action="store_true",
+                        help="Run LLM translation quality evaluation after the benchmark cycle")
+    parser.add_argument("--tq-chunk-size", type=int, default=5,
+                        help="Sentences per chunk for translation quality evaluation (default: 5)")
     args = parser.parse_args()
 
     run_id = generate_run_id(args.audio_dir, args.start_offset)
@@ -479,12 +536,26 @@ async def main() -> None:
     history = json.loads(history_file.read_text(encoding="utf-8"))
     print(f"History: {history_file}  ({len(history)} runs)")
 
+    # Generate scorecard early so the quality evaluator can patch it before
+    # the evaluation cycle runs trajectory / review / LLM interpretation.
+    scorecard_path = pipeline_dir / "scorecards" / f"{run_id}.json"
+    scorecard = generate_scorecard(result, scorecard_path)
+
+    if args.translation_quality:
+        # Patch quality scalars into the scorecard file before the cycle so that
+        # trajectory, action recommendation, and the LLM interpreter all see the
+        # quality signal for this run rather than the next one.
+        evaluate_translation_quality(result, pipeline_dir, chunk_size=args.tq_chunk_size)
+        # Reload from disk — _patch_scorecard() wrote the quality section in place.
+        scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+
     run_evaluation_cycle(
         result,
         pipeline_dir,
         use_llm=not args.no_llm,
         cycle_log_path=regime_cycle_log_path(results_root),
         report_path=regime_report_path(results_root),
+        precomputed_scorecard=scorecard,
     )
 
 

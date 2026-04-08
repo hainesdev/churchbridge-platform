@@ -210,7 +210,7 @@ Required variables:
 | `GOOGLE_TRANSLATE_API_KEY` | Fast-path translation |
 | `ANTHROPIC_API_KEY` | Claude enrichment + verse suggestions |
 
-Place `.env` in the repository root. For Next.js, copy `client/.env.local.example` to `client/.env.local` if you need to override `NEXT_PUBLIC_WS_URL` or `NEXT_PUBLIC_API_URL` (defaults target `localhost:8000`).
+Place `.env` in the repository root. For Next.js, add `client/.env.local` and set `NEXT_PUBLIC_WS_URL` or `NEXT_PUBLIC_API_URL` only if you need to override defaults (they target `localhost:8000` for local dev).
 
 ## Running
 
@@ -242,3 +242,85 @@ Start in order: Redis (optional) → backend → frontend.
 | Deferred release fallback | 6s after enrichment if no merge |
 
 The audience sees the Google translation within ~300ms of a sentence finalising. The LLM-improved translation updates it silently a second later if the sentence is display-ready, or holds it until a merge assembles the complete thought.
+
+## Benchmarking
+
+The live pipeline benchmark is the closest check of production behavior:
+
+```bash
+server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/1 --translation-quality
+```
+
+It launches its own local server on port `8799` by default, captures the full
+display event stream, writes the raw run JSON, and then updates the
+self-improvement artifacts for that benchmark set.
+
+### Long recordings and offsets
+
+The benchmark audio directories are long-form sources, not just one-shot test
+cases. Use `--start-offset` with a bounded `--duration` to sample different
+windows from the same recording and turn one dataset into several benchmark
+segments.
+
+This is especially useful for `tests/audio/1`: it is long enough that we can
+pick cleaner windows as optimization targets without losing realism. By
+contrast, clipped or noisy windows are still valuable, but they should be read
+more as resilience checks than as the primary quality target.
+
+A simple sweep against one recording looks like:
+
+```bash
+server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/1 --duration 30 --start-offset 0 --translation-quality
+server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/1 --duration 30 --start-offset 30 --translation-quality
+server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/1 --duration 30 --start-offset 60 --translation-quality
+```
+
+Recommended use:
+
+- Use cleaner `tests/audio/1` windows as the main optimization target.
+- Use clipped or noisy windows as stress tests for graceful degradation.
+- Keep notes on which offsets represent clean baseline behavior versus damaged input.
+
+### Concurrent benchmark runs
+
+Concurrent pipeline runs need isolation. If two processes reuse the default
+port or write into the same benchmark namespace, one run can fail to bind its
+server or produce logs and loop artifacts that are difficult to interpret.
+
+Use these rules when running more than one benchmark at once:
+
+- Give each process a unique `--port`.
+- Keep `--church-id` isolated if the runs share downstream infrastructure.
+- Use separate `--results-root` values when you want fully independent loop
+  history and reports.
+- Prefer sequential runs unless you specifically need concurrency.
+
+A safe concurrent pattern looks like:
+
+```bash
+server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/1 --translation-quality --port 8799 --church-id bench-a --results-root tests/benchmark/results/concurrent-a
+server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/2 --translation-quality --port 8800 --church-id bench-b --results-root tests/benchmark/results/concurrent-b
+```
+
+### Translation safety and interpreting results
+
+The live translation path is intentionally layered now:
+
+- Google Translate is still the fast baseline shown first.
+- Claude enrichment is validated before it can replace that baseline.
+- Unsafe rewrites fall back to Google.
+- Higher-risk cases can trigger a repair pass before release.
+- Session-end incomplete captions are emitted with `...` so they are visibly truncated rather than looking complete.
+
+That means future self-improvement runs should separate three different outcomes:
+
+- True pipeline regressions: ordering, leaks, latency, unsafe rewrite behavior.
+- Evaluator uncertainty: malformed quality JSON, low-confidence chunk analysis, or too few evaluated pairs.
+- Expected stress-case degradation: clipped or damaged audio can lower WER and translation quality without implying the clean-path pipeline regressed.
+
+Recommended benchmark interpretation:
+
+- Treat clean `tests/audio/1` windows as primary optimization targets.
+- Treat `tests/audio/1 --start-offset 60` as a translation-safety regression window.
+- Treat clipped `tests/audio/2` windows as resilience checks, not the sole optimization target.
+- Treat broad offset sweeps as exploratory sampling, not one combined trajectory for promotion/revert decisions.
