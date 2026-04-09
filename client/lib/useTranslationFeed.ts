@@ -44,25 +44,6 @@ export interface Segment {
 
 const PARTIAL_FLUSH_MS = 80;
 const FLASH_MS = 600;
-const DEBUG_ENDPOINT = 'http://127.0.0.1:7272/ingest/21d235ae-7f16-4db5-a1b3-9bc0bbde2463';
-
-const debugLog = (hypothesisId: string, location: string, message: string, data: Record<string, unknown>) => {
-  // #region agent log
-  fetch(DEBUG_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '233415' },
-    body: JSON.stringify({
-      sessionId: '233415',
-      runId: 'pre-fix',
-      hypothesisId,
-      location,
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
-};
 
 export interface TranslationFeed {
   segments: Segment[];
@@ -109,15 +90,9 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
 
     const connect = () => {
       if (stopped) return;
-      // #region agent log
-      debugLog('H2', 'useTranslationFeed.ts:connect', 'Opening display websocket', { churchId });
-      // #endregion
       ws = new WebSocket(`${getWebSocketBaseUrl()}/api/display/v1?church_id=${encodeURIComponent(churchId)}`);
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
-        // #region agent log
-        debugLog('H2', 'useTranslationFeed.ts:onclose', 'Display websocket closed; scheduling reconnect', { churchId });
-        // #endregion
         setConnected(false);
         setTimeout(connect, 2000);
       };
@@ -150,13 +125,6 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           setSegments(prev => {
             const ts = Number(msg.ts);
             const duplicateCount = prev.filter(s => s.id === ts).length;
-            // #region agent log
-            debugLog('H1', 'useTranslationFeed.ts:translation', 'Received translation event', {
-              ts,
-              duplicateCountBeforeAppend: duplicateCount,
-              segmentCountBeforeAppend: prev.length,
-            });
-            // #endregion
             // Deduplicate by ts to keep React keys stable when duplicate delivery/replay occurs.
             if (duplicateCount > 0) {
               return prev.map(s =>
@@ -181,13 +149,6 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           setSegments(prev => prev.map(s =>
             s.id === msg.ts ? { ...s, english, pendingCompletion: false } : s
           ));
-          // #region agent log
-          debugLog('H4', 'useTranslationFeed.ts:correction_or_update', 'Applied correction/translation_update', {
-            type: msg.type,
-            ts: Number(msg.ts),
-            reason: typeof msg.reason === 'string' ? msg.reason : '',
-          });
-          // #endregion
           const isMergedRebaseline = msg.type === 'correction' && msg.reason === 'merged_rebaseline';
           if (!isMergedRebaseline) {
             setFlashingId(Number(msg.ts));
@@ -222,13 +183,6 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           // Remove the absorbed segment and update the kept segment with merged content.
           // Clear pendingCompletion on the kept segment — it is now the merged final caption.
           setSegments(prev => {
-            // #region agent log
-            debugLog('H3', 'useTranslationFeed.ts:caption_merge', 'Applying caption merge', {
-              tsKeep: Number(msg.ts_keep),
-              tsAbsorb: Number(msg.ts_absorb),
-              segmentCountBeforeMerge: prev.length,
-            });
-            // #endregion
             const tsKeep = Number(msg.ts_keep);
             const tsAbsorb = Number(msg.ts_absorb);
             const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, tsKeep);

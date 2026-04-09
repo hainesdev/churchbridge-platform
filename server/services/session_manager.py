@@ -1,7 +1,6 @@
 import logging
 import re
 import time
-import json
 from fastapi import WebSocket
 
 from server.db.glossary import get_glossary
@@ -22,22 +21,6 @@ from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
 
 logger = logging.getLogger(__name__)
-_DEBUG_LOG_PATH = "C:/Users/Dan/Desktop/Projects/churchbridge-ai/debug-233415.log"
-
-
-def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
-    # region agent log
-    with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "sessionId": "233415",
-            "runId": "pre-fix",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }, ensure_ascii=True) + "\n")
-    # endregion
 
 # Splits a Deepgram final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
@@ -382,15 +365,6 @@ class ServiceSession:
     async def _on_sentence(self, text: str, audio_start: float, audio_end: float, flush_reason: str):
         ts = _now()
         terminal_incomplete = flush_reason == "session_close" and _is_incomplete(text)
-        # region agent log
-        _debug_log("H5", "session_manager.py:_on_sentence", "Generated sentence timestamp", {
-            "churchId": self._church_id,
-            "ts": ts,
-            "textPreview": text[:80],
-            "flushReason": flush_reason,
-            "terminalIncomplete": terminal_incomplete,
-        })
-        # endregion
         logger.info("[session:%s] Sentence flushed: %s", self._church_id, text)
         await self._broadcast({
             "type": "final_spanish",
@@ -451,14 +425,6 @@ class ServiceSession:
         )
         if timing.get("terminal_incomplete"):
             english = _format_deferred_release_text(english, english)
-        # region agent log
-        _debug_log("H1", "session_manager.py:_on_translation", "Broadcasting translation", {
-            "churchId": self._church_id,
-            "ts": ts,
-            "spanishLen": len(spanish),
-            "englishLen": len(english),
-        })
-        # endregion
         logger.info("[session:%s] Translation: %s -> %s", self._church_id, spanish[:200], english[:200])
         await self._broadcast({
             "type": "translation",
@@ -628,16 +594,6 @@ class ServiceSession:
         }
 
     async def _broadcast(self, event: dict):
-        if event.get("type") in ("translation", "caption_merge", "translation_update", "correction"):
-            # region agent log
-            _debug_log("H2", "session_manager.py:_broadcast", "Publishing display event", {
-                "churchId": self._church_id,
-                "type": event.get("type"),
-                "ts": event.get("ts"),
-                "ts_keep": event.get("ts_keep"),
-                "ts_absorb": event.get("ts_absorb"),
-            })
-            # endregion
         await self._broadcaster.publish(self._church_id, event)
 
     async def _send(self, msg: dict):

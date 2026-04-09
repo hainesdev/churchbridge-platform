@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { attachVerseToVisibleSegment, resolveMergedSegmentId } from './mergedVerseRouting.ts';
+import { attachVerseToVisibleSegment, resolveMergedSegmentId } from './mergedVerseRouting';
 
 test('resolveMergedSegmentId follows merge chains to the visible kept segment', () => {
   const mergeMap = new Map([
