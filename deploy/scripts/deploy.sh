@@ -11,4 +11,6 @@ if [[ ! -f ".env.production" ]]; then
   exit 1
 fi
 
+bash "${SCRIPT_DIR}/sync-db.sh"
+
 docker compose -f deploy/docker-compose.prod.yml up -d --build --remove-orphans
