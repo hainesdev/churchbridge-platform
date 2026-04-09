@@ -1,0 +1,10 @@
+[Unit]
+Description=Run churchbridge-ai auto-deploy check every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=churchbridge-ai-autodeploy.service
+
+[Install]
+WantedBy=timers.target

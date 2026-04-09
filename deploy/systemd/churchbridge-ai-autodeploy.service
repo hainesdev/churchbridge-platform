@@ -1,0 +1,9 @@
+[Unit]
+Description=Check churchbridge-ai main branch and redeploy when it changes
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/churchbridge-ai
+ExecStart=/var/www/churchbridge-ai/deploy/scripts/update-if-needed.sh

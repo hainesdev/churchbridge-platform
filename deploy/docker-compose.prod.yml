@@ -1,0 +1,67 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+    container_name: churchbridge_api
+    restart: unless-stopped
+    env_file:
+      - ../.env.production
+    environment:
+      DATABASE_URL: sqlite:///./data/churchbridge.db
+      ENVIRONMENT: production
+      PORT: 8000
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    volumes:
+      - churchbridge_data:/app/data
+    networks:
+      - proxy
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://churchbridge.dhaines.dev}
+    container_name: churchbridge_web
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://churchbridge.dhaines.dev}
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - proxy
+
+volumes:
+  churchbridge_data:
+
+networks:
+  proxy:
+    external: true
+    name: dhainesdev_web

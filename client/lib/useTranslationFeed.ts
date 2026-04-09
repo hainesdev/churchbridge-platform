@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
+import { attachVerseToVisibleSegment, resolveMergedSegmentId } from '@/lib/mergedVerseRouting';
 
 export interface VerseDetection {
   book: string;
@@ -91,6 +92,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   const partialQueueRef = useRef('');
   const lastInterimTextRef = useRef<string | null>(null);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mergedIntoRef = useRef<Map<number, number>>(new Map());
 
   // Flush buffered partial tokens to state on a fixed interval
   useEffect(() => {
@@ -129,10 +131,10 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
         }
 
         if (msg.type === 'interim') {
-          setPartialSpanish(msg.text);
+          setPartialSpanish(String(msg.text ?? ''));
 
         } else if (msg.type === 'stt_final') {
-          setSpanishLines(prev => [...prev, msg.text].slice(-8));
+          setSpanishLines(prev => [...prev, String(msg.text ?? '')].slice(-8));
           setPartialSpanish('');
 
         } else if (msg.type === 'interim_translation') {
@@ -175,41 +177,46 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           // Both events update a committed segment's English text and flash it.
           // translation_update is the LLM-improved version (or deferred release); correction is Google's dual-pass.
           // Clear pendingCompletion — the segment is now finalised.
+          const english = String(msg.english ?? '');
           setSegments(prev => prev.map(s =>
-            s.id === msg.ts ? { ...s, english: msg.english, pendingCompletion: false } : s
+            s.id === msg.ts ? { ...s, english, pendingCompletion: false } : s
           ));
           // #region agent log
           debugLog('H4', 'useTranslationFeed.ts:correction_or_update', 'Applied correction/translation_update', {
             type: msg.type,
             ts: Number(msg.ts),
+            reason: typeof msg.reason === 'string' ? msg.reason : '',
           });
           // #endregion
-          setFlashingId(msg.ts);
-          if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-          flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
+          const isMergedRebaseline = msg.type === 'correction' && msg.reason === 'merged_rebaseline';
+          if (!isMergedRebaseline) {
+            setFlashingId(Number(msg.ts));
+            if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+            flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
+          }
 
         } else if (msg.type === 'verse_detected') {
-          setSegments(prev => prev.map(s =>
-            s.id === msg.ts ? { ...s, verseDetected: msg.verse } : s
-          ));
-          setVerses(prev => [...prev, msg.verse]);
-          setActiveVerseTs(msg.ts);
+          const verse = msg.verse as VerseDetection;
+          const targetTs = resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts));
+          setSegments(prev => attachVerseToVisibleSegment(prev, targetTs, verse));
+          setVerses(prev => [...prev, verse]);
+          setActiveVerseTs(targetTs);
 
         } else if (msg.type === 'verse_range_update') {
+          const verse = msg.verse as VerseDetection;
+          const targetTs = resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts));
           // Replace the existing verse entry for this book+chapter with the
           // expanded range as the scratch pad accumulates more detections.
           setVerses(prev => prev.map(v =>
-            v.book === msg.verse.book && v.chapter === msg.verse.chapter
-              ? msg.verse
+            v.book === verse.book && v.chapter === verse.chapter
+              ? verse
               : v
           ));
-          setSegments(prev => prev.map(s =>
-            s.id === msg.ts ? { ...s, verseDetected: msg.verse } : s
-          ));
+          setSegments(prev => attachVerseToVisibleSegment(prev, targetTs, verse));
 
         } else if (msg.type === 'verse_suggestion') {
-          setSuggestions(msg.suggestions);
-          setActiveVerseTs(msg.ts);
+          setSuggestions(msg.suggestions as VerseSuggestion[]);
+          setActiveVerseTs(resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts)));
 
         } else if (msg.type === 'caption_merge') {
           // Remove the absorbed segment and update the kept segment with merged content.
@@ -222,10 +229,21 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
               segmentCountBeforeMerge: prev.length,
             });
             // #endregion
-            const filtered = prev.filter(s => s.id !== (msg.ts_absorb as number));
+            const tsKeep = Number(msg.ts_keep);
+            const tsAbsorb = Number(msg.ts_absorb);
+            const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, tsKeep);
+            const carriedVerse = prev.find(s => s.id === tsAbsorb)?.verseDetected;
+            mergedIntoRef.current.set(tsAbsorb, resolvedKeep);
+            const filtered = prev.filter(s => s.id !== tsAbsorb);
             return filtered.map(s =>
-              s.id === msg.ts_keep
-                ? { ...s, spanish: msg.spanish as string, english: msg.english as string, pendingCompletion: false }
+              s.id === resolvedKeep
+                ? {
+                    ...s,
+                    spanish: msg.spanish as string,
+                    english: msg.english as string,
+                    pendingCompletion: false,
+                    verseDetected: s.verseDetected ?? carriedVerse,
+                  }
                 : s
             );
           });
