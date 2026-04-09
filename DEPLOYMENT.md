@@ -20,9 +20,11 @@ The public proxy serves the site on `https://churchbridge.dhaines.dev`, routes `
 - `deploy/nginx/churchbridge.dhaines.dev.conf`: vhost config to copy into the shared proxy
 - `deploy/.env.production.example`: production env template
 - `deploy/scripts/deploy.sh`: build and restart the stack
+- `deploy/scripts/deploy-ref.sh`: deploy a specific Git SHA/ref from `main`
 - `deploy/scripts/update-if-needed.sh`: pull `main` and redeploy when changed
 - `deploy/systemd/churchbridge-ai-autodeploy.service`: systemd oneshot unit
 - `deploy/systemd/churchbridge-ai-autodeploy.timer`: systemd timer for polling GitHub
+- `.github/workflows/deploy.yml`: GitHub Actions production deploy workflow
 
 ## Server bootstrap
 
@@ -34,6 +36,35 @@ The public proxy serves the site on `https://churchbridge.dhaines.dev`, routes `
 6. Issue a certificate with the existing Certbot container and webroot volume.
 7. Run `deploy/scripts/deploy.sh`.
 8. Install and enable the systemd timer for automatic updates.
+
+## GitHub Actions deployment
+
+GitHub Actions can now deploy production on every push to `main` and via manual dispatch.
+
+### Required GitHub secrets
+
+- `DEPLOY_HOST`: droplet hostname or IP, for example `167.71.84.35`
+- `DEPLOY_USER`: SSH user, for example `root`
+- `DEPLOY_SSH_KEY`: private key that can SSH into the droplet
+- `DEPLOY_PATH`: repo checkout on the droplet, for example `/var/www/churchbridge-ai`
+- `DEPLOY_PORT`: optional SSH port, defaults to `22`
+- `DEPLOY_HEALTHCHECK_URL`: optional public health URL, for example `https://churchbridge.dhaines.dev/health`
+
+### Workflow behavior
+
+- On push to `main`, GitHub Actions SSHes into the droplet and deploys the exact pushed SHA.
+- Manual runs can deploy any SHA or ref through the workflow dispatch `ref` input.
+- The workflow uses `deploy/scripts/deploy-ref.sh`, which fetches `main`, hard-resets to the requested ref, and runs the existing Docker deploy script.
+
+### Recommended `gh` commands
+
+```bash
+gh workflow run deploy.yml --ref main
+gh workflow run deploy.yml -f ref=<sha>
+gh run list --workflow deploy.yml
+gh run watch
+gh run view --log
+```
 
 ## Useful commands
 
@@ -53,3 +84,4 @@ journalctl -u churchbridge-ai-autodeploy.service -n 100 --no-pager
 - `NEXT_PUBLIC_API_URL` should stay on the same origin (`https://churchbridge.dhaines.dev`) so browser websocket connections use the public proxy instead of trying to reach port `8000` directly.
 - The app persists SQLite data in the Docker volume `churchbridge_data`.
 - The auto-deploy timer is pull-based. It checks `origin/main` every 5 minutes, hard-resets to that commit, and rebuilds only when the commit SHA changes.
+- The GitHub Actions workflow is a better default control plane than the polling timer because it deploys the exact pushed SHA immediately and gives you logs in GitHub. Keep the timer only as a fallback if you still want pull-based recovery.
