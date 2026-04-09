@@ -12,12 +12,38 @@ export interface VerseDetection {
   canonical_english: string;
   reference: string;
   confidence: 'explicit' | 'quoted';
+  explanation?: string;
+  source_version_slug?: string;
+  display_version_slug?: string;
+  source_passage?: ScripturePassage | null;
+  display_passage?: ScripturePassage | null;
 }
 
 export interface VerseSuggestion {
   reference: string;
   canonical_english: string;
   relevance_note: string;
+  explanation?: string;
+  source_version_slug?: string;
+  display_version_slug?: string;
+  source_passage?: ScripturePassage | null;
+  display_passage?: ScripturePassage | null;
+}
+
+export interface ScripturePassageVerse {
+  verse: number;
+  text: string;
+  reference: string;
+}
+
+export interface ScripturePassage {
+  version: { slug: string; name: string };
+  book: string;
+  chapter: number;
+  verse_start: number;
+  verse_end: number | null;
+  reference: string;
+  verses: ScripturePassageVerse[];
 }
 
 export type SermonMode =
@@ -31,6 +57,7 @@ export interface Segment {
   spanish: string;
   english: string;
   verseDetected?: VerseDetection;
+  verseSuggestions?: VerseSuggestion[];
   // TODO: use register to pull exact verse text once Bible versions are stored
   register?: TranslationRegister;
   paragraphBreak?: boolean;
@@ -176,8 +203,13 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           setSegments(prev => attachVerseToVisibleSegment(prev, targetTs, verse));
 
         } else if (msg.type === 'verse_suggestion') {
-          setSuggestions(msg.suggestions as VerseSuggestion[]);
-          setActiveVerseTs(resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts)));
+          const nextSuggestions = msg.suggestions as VerseSuggestion[];
+          const targetTs = resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts));
+          setSuggestions(nextSuggestions);
+          setSegments(prev => prev.map(s =>
+            s.id === targetTs ? { ...s, verseSuggestions: nextSuggestions } : s
+          ));
+          setActiveVerseTs(targetTs);
 
         } else if (msg.type === 'caption_merge') {
           // Remove the absorbed segment and update the kept segment with merged content.
@@ -187,6 +219,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
             const tsAbsorb = Number(msg.ts_absorb);
             const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, tsKeep);
             const carriedVerse = prev.find(s => s.id === tsAbsorb)?.verseDetected;
+            const carriedSuggestions = prev.find(s => s.id === tsAbsorb)?.verseSuggestions;
             mergedIntoRef.current.set(tsAbsorb, resolvedKeep);
             const filtered = prev.filter(s => s.id !== tsAbsorb);
             return filtered.map(s =>
@@ -197,6 +230,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
                     english: msg.english as string,
                     pendingCompletion: false,
                     verseDetected: s.verseDetected ?? carriedVerse,
+                    verseSuggestions: s.verseSuggestions ?? carriedSuggestions,
                   }
                 : s
             );

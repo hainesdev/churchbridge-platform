@@ -1,9 +1,12 @@
 'use client';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { motion } from 'framer-motion';
+import { BibleVersionSelectors } from './BibleVersionSelectors';
+import { ScripturePopover } from './ScripturePopover';
+import { useBibleVersions } from '@/lib/useBibleVersions';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
 import { float32ToBase64 } from '@/lib/audioUtils';
-import { useTranslationFeed } from '@/lib/useTranslationFeed';
+import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
 
@@ -16,7 +19,7 @@ const MAX_RETRY_DELAY_MS = 30_000;
 
 // ── Audio capture + streaming ─────────────────────────────────────────────────
 
-function useAudioStream(churchId: string) {
+function useAudioStream(churchId: string, sourceScriptureVersion: string, displayScriptureVersion: string) {
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
 
@@ -29,6 +32,7 @@ function useAudioStream(churchId: string) {
   const retryDelayRef = useRef(1000);
   const shouldReconnectRef = useRef(false);
   const sampleRateRef = useRef(48000);
+  const connectRef = useRef<() => void>(() => {});
 
   const flushBuffer = useCallback(() => {
     if (!sendBufferRef.current.length || wsRef.current?.readyState !== WebSocket.OPEN) return;
@@ -45,7 +49,13 @@ function useAudioStream(churchId: string) {
       setStatus('active');
       setErrorMsg('');
       retryDelayRef.current = 1000;
-      ws.send(JSON.stringify({ type: 'session.start', sampleRate: sampleRateRef.current, topic: '' }));
+      ws.send(JSON.stringify({
+        type: 'session.start',
+        sampleRate: sampleRateRef.current,
+        topic: '',
+        sourceScriptureVersion,
+        displayScriptureVersion,
+      }));
     };
 
     ws.onmessage = (e) => {
@@ -56,10 +66,14 @@ function useAudioStream(churchId: string) {
     ws.onclose = () => {
       if (!shouldReconnectRef.current) return;
       setStatus('reconnecting');
-      setTimeout(() => { if (shouldReconnectRef.current) connect(); }, retryDelayRef.current);
+      setTimeout(() => { if (shouldReconnectRef.current) connectRef.current(); }, retryDelayRef.current);
       retryDelayRef.current = Math.min(retryDelayRef.current * 2, MAX_RETRY_DELAY_MS);
     };
-  }, [churchId]);
+  }, [churchId, displayScriptureVersion, sourceScriptureVersion]);
+
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
 
   const start = useCallback(async () => {
     setStatus('connecting');
@@ -123,8 +137,18 @@ function useAudioStream(churchId: string) {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function MobileTest({ churchId }: MobileTestProps) {
-  const { status, errorMsg, start, stop } = useAudioStream(churchId);
+  const [sourceScriptureVersion, setSourceScriptureVersion] = useState('rvr1960');
+  const [displayScriptureVersion, setDisplayScriptureVersion] = useState('kjv');
+  const { versions, loading: versionsLoading, error: versionsError } = useBibleVersions(churchId);
+  const { status, errorMsg, start, stop } = useAudioStream(churchId, sourceScriptureVersion, displayScriptureVersion);
   const { segments, spanishLines, partialSpanish, partialEnglish, connected: displayConnected, flashingId } = useTranslationFeed(churchId);
+  const [popover, setPopover] = useState<{
+    title: string;
+    color: 'cited' | 'recommended';
+    explanation?: string;
+    sourcePassage?: VerseDetection['source_passage'] | VerseSuggestion['source_passage'];
+    displayPassage?: VerseDetection['display_passage'] | VerseSuggestion['display_passage'];
+  } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -160,6 +184,21 @@ export function MobileTest({ churchId }: MobileTestProps) {
           <h1 className="text-2xl font-semibold">Translation Test</h1>
           <p className="text-gray-500 text-sm">Speak in Spanish. Translation appears in real time.</p>
         </div>
+        {versionsError ? (
+          <p className="text-red-400 text-sm text-center">{versionsError}</p>
+        ) : versions.length > 0 ? (
+          <div className="w-full max-w-xl">
+            <BibleVersionSelectors
+              versions={versions}
+              sourceVersion={sourceScriptureVersion}
+              displayVersion={displayScriptureVersion}
+              onSourceVersionChange={setSourceScriptureVersion}
+              onDisplayVersionChange={setDisplayScriptureVersion}
+              disabled={false}
+            />
+            {versionsLoading && <p className="mt-2 text-xs text-gray-500 text-center">Loading versions…</p>}
+          </div>
+        ) : null}
         {errorMsg && <p className="text-red-400 text-sm text-center">{errorMsg}</p>}
         <button
           onClick={start}
@@ -223,9 +262,40 @@ export function MobileTest({ churchId }: MobileTestProps) {
               animate={{ opacity: 1, transition: { duration: 0.4 } }}
               className="space-y-0.5"
             >
-              <p className={`text-xl font-semibold leading-snug transition-colors duration-[600ms] ${
+              <div className="flex flex-wrap items-center gap-2">
+                <p className={`text-xl font-semibold leading-snug transition-colors duration-[600ms] ${
                 flashingId === s.id ? 'text-blue-200' : ''
-              }`}>{s.english}</p>
+                }`}>{s.english}</p>
+                {s.verseDetected && (
+                  <button
+                    onClick={() => setPopover({
+                      title: s.verseDetected!.reference,
+                      color: 'cited',
+                      explanation: s.verseDetected!.explanation,
+                      sourcePassage: s.verseDetected!.source_passage,
+                      displayPassage: s.verseDetected!.display_passage,
+                    })}
+                    className="rounded-full border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-xs font-semibold text-amber-300"
+                  >
+                    {s.verseDetected.reference}
+                  </button>
+                )}
+                {s.verseSuggestions?.map((suggestion) => (
+                  <button
+                    key={suggestion.reference}
+                    onClick={() => setPopover({
+                      title: suggestion.reference,
+                      color: 'recommended',
+                      explanation: suggestion.explanation ?? suggestion.relevance_note,
+                      sourcePassage: suggestion.source_passage,
+                      displayPassage: suggestion.display_passage,
+                    })}
+                    className="rounded-full border border-sky-400/40 bg-sky-400/10 px-2 py-0.5 text-xs font-semibold text-sky-300"
+                  >
+                    {suggestion.reference}
+                  </button>
+                ))}
+              </div>
               <p className="text-sm text-gray-500 leading-snug">{s.spanish}</p>
             </motion.div>
           ))}
@@ -256,6 +326,15 @@ export function MobileTest({ churchId }: MobileTestProps) {
           <p className="text-red-300 text-xs">{errorMsg}</p>
         </div>
       )}
+      <ScripturePopover
+        open={popover !== null}
+        title={popover?.title ?? ''}
+        color={popover?.color ?? 'cited'}
+        explanation={popover?.explanation}
+        sourcePassage={popover?.sourcePassage}
+        displayPassage={popover?.displayPassage}
+        onClose={() => setPopover(null)}
+      />
     </div>
   );
 }

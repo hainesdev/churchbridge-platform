@@ -2,6 +2,14 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from server.db.bible_catalog import canonicalize_book_name
+from server.db.bible_text import (
+    get_chapter,
+    get_passage,
+    list_bible_versions,
+    list_books_for_version,
+    search_bible_text,
+)
 from server.db.glossary import get_glossary, upsert_glossary_term, delete_glossary_term
 from server.db.church_terms import load_church_terms, upsert_term
 from server.db.sessions import get_full_transcript
@@ -77,6 +85,7 @@ async def remove_term(church_id: str, spanish_term: str):
     return {"ok": True}
 
 
+
 # ── Session history ───────────────────────────────────────────────────────────
 
 @router.get("/sessions")
@@ -128,3 +137,59 @@ async def get_transcript(church_id: str, session_id: int):
         raise HTTPException(status_code=404, detail="Session not found")
     segments = await get_full_transcript(session_id)
     return {"session_id": session_id, "segments": segments}
+
+
+# —— Bible corpus API ————————————————————————————————————————————————————————————————
+
+@router.get("/bibles")
+async def get_bibles(church_id: str):
+    """Return imported Bible versions available for query."""
+    return {"versions": await list_bible_versions()}
+
+
+@router.get("/bibles/{version_slug}/books")
+async def get_bible_books(church_id: str, version_slug: str):
+    books = await list_books_for_version(version_slug)
+    if not books:
+        raise HTTPException(status_code=404, detail="Bible version not found")
+    return {"version_slug": version_slug, "books": books}
+
+
+@router.get("/bibles/{version_slug}/chapter")
+async def get_bible_chapter(church_id: str, version_slug: str, book: str, chapter: int):
+    try:
+        canonicalize_book_name(book)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = await get_chapter(version_slug, book, chapter)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    return result
+
+
+@router.get("/bibles/{version_slug}/passage")
+async def get_bible_passage(
+    church_id: str,
+    version_slug: str,
+    book: str,
+    chapter: int,
+    verse_start: int,
+    verse_end: int | None = None,
+):
+    try:
+        canonicalize_book_name(book)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = await get_passage(version_slug, book, chapter, verse_start, verse_end)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Passage not found")
+    return result
+
+
+@router.get("/bibles/{version_slug}/search")
+async def search_bible(church_id: str, version_slug: str, q: str, limit: int = 10):
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+    limit = max(1, min(limit, 50))
+    results = await search_bible_text(version_slug, q.strip(), limit=limit)
+    return {"version_slug": version_slug, "query": q.strip(), "results": results}

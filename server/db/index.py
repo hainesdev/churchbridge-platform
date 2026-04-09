@@ -71,6 +71,62 @@ CREATE TABLE IF NOT EXISTS sermon_mode_transitions (
     segment_ts  INTEGER NOT NULL,
     occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS bible_versions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key        TEXT NOT NULL UNIQUE,
+    slug              TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL,
+    language_code     TEXT NOT NULL,
+    source_url        TEXT NOT NULL,
+    license_note      TEXT,
+    import_path       TEXT NOT NULL,
+    file_sha256       TEXT NOT NULL,
+    book_count        INTEGER NOT NULL DEFAULT 0,
+    chapter_count     INTEGER NOT NULL DEFAULT 0,
+    verse_count       INTEGER NOT NULL DEFAULT 0,
+    imported_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS bible_books (
+    id                INTEGER PRIMARY KEY,
+    osis_id           TEXT NOT NULL UNIQUE,
+    canonical_name    TEXT NOT NULL UNIQUE,
+    book_order        INTEGER NOT NULL UNIQUE,
+    testament         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bible_verses (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id        INTEGER NOT NULL REFERENCES bible_versions(id) ON DELETE CASCADE,
+    canonical_book_id INTEGER NOT NULL REFERENCES bible_books(id),
+    canonical_book_name TEXT NOT NULL,
+    book_name         TEXT NOT NULL,
+    book_order        INTEGER NOT NULL,
+    source_book_order INTEGER NOT NULL DEFAULT 0,
+    chapter_num       INTEGER NOT NULL,
+    verse_num         INTEGER NOT NULL,
+    reference         TEXT NOT NULL,
+    text              TEXT NOT NULL,
+    normalized_text   TEXT NOT NULL,
+    UNIQUE(version_id, book_name, chapter_num, verse_num)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bible_verses_lookup
+    ON bible_verses(version_id, canonical_book_id, chapter_num, verse_num);
+
+CREATE INDEX IF NOT EXISTS idx_bible_verses_reference
+    ON bible_verses(version_id, reference);
+
+CREATE INDEX IF NOT EXISTS idx_bible_verses_canonical_name
+    ON bible_verses(version_id, canonical_book_name, chapter_num, verse_num);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS bible_verses_fts USING fts5(
+    text,
+    normalized_text,
+    content='bible_verses',
+    content_rowid='id'
+);
 """
 
 SEED_DEFAULT_TERMS = """
@@ -125,12 +181,22 @@ async def _migrate(db) -> None:
     migrations = [
         "ALTER TABLE verse_detections ADD COLUMN audio_start REAL",
         "ALTER TABLE verse_detections ADD COLUMN audio_end REAL",
+        "ALTER TABLE bible_verses ADD COLUMN canonical_book_id INTEGER REFERENCES bible_books(id)",
+        "ALTER TABLE bible_verses ADD COLUMN canonical_book_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE bible_verses ADD COLUMN source_book_order INTEGER NOT NULL DEFAULT 0",
     ]
     for stmt in migrations:
         try:
             await db.execute(stmt)
         except Exception:
             pass  # column already exists
+    try:
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bible_verses_canonical_name "
+            "ON bible_verses(version_id, canonical_book_name, chapter_num, verse_num)"
+        )
+    except Exception:
+        pass
 
 
 async def init_db():

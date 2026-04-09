@@ -19,6 +19,20 @@ function normalizeEnvWs(envWs: string): string {
   return trimmed;
 }
 
+function normalizeEnvApi(envApi: string): string {
+  const trimmed = envApi.replace(/\/$/, '');
+  if (typeof window === 'undefined') return trimmed;
+  const host = window.location.hostname;
+  const pageIsLocal = host === 'localhost' || host === '127.0.0.1';
+  if (!pageIsLocal && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/?$/i.test(trimmed)) {
+    const proto = window.location.protocol;
+    const portMatch = trimmed.match(/:(\d+)(?:\/|$)/);
+    const port = portMatch ? portMatch[1] : '8000';
+    return `${proto}//${host}:${port}`;
+  }
+  return trimmed;
+}
+
 export function getWebSocketBaseUrl(): string {
   const envWs = process.env.NEXT_PUBLIC_WS_URL?.trim();
   if (envWs) return normalizeEnvWs(envWs);
@@ -40,4 +54,26 @@ export function getWebSocketBaseUrl(): string {
 
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.hostname}:8000`;
+}
+
+export function getApiBaseUrl(): string {
+  const envApi = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (envApi) return normalizeEnvApi(envApi);
+
+  const envWs = process.env.NEXT_PUBLIC_WS_URL?.trim();
+  if (envWs) {
+    try {
+      const u = new URL(normalizeEnvWs(envWs));
+      const apiProto = u.protocol === 'wss:' ? 'https:' : 'http:';
+      return `${apiProto}//${u.host}`;
+    } catch {
+      /* ignore invalid URL */
+    }
+  }
+
+  if (typeof window === 'undefined') {
+    return 'http://localhost:8000';
+  }
+
+  return `${window.location.protocol}//${window.location.hostname}:8000`;
 }

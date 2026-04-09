@@ -3,6 +3,7 @@ import re
 import time
 from fastapi import WebSocket
 
+from server.db.bible_text import get_passage, get_passage_by_reference
 from server.db.glossary import get_glossary
 from server.db.church_terms import load_church_terms
 from server.db.modes import save_mode_transition
@@ -236,9 +237,19 @@ class ServiceSession:
         self._enrichment_settled: set[int] = set()
         # Session-level STT noise removal counter (Pentecostés, Santo, etc.)
         self._stt_noise_removed_count: int = 0
+        self._source_scripture_version: str = "rvr1960"
+        self._display_scripture_version: str = "kjv"
 
-    async def start(self, sample_rate: int, sermon_topic: str = ""):
+    async def start(
+        self,
+        sample_rate: int,
+        sermon_topic: str = "",
+        source_scripture_version: str = "rvr1960",
+        display_scripture_version: str = "kjv",
+    ):
         self._sample_rate = sample_rate
+        self._source_scripture_version = source_scripture_version or "rvr1960"
+        self._display_scripture_version = display_scripture_version or "kjv"
         self._db_session_id = await create_service_session(self._church_id)
 
         glossary = await get_glossary(self._church_id)
@@ -285,10 +296,19 @@ class ServiceSession:
         )
         await self._deepgram.start(glossary=glossary, sample_rate=16000)
 
-        await self._send({"type": "session_started", "sessionId": self._db_session_id})
+        await self._send({
+            "type": "session_started",
+            "sessionId": self._db_session_id,
+            "sourceScriptureVersion": self._source_scripture_version,
+            "displayScriptureVersion": self._display_scripture_version,
+        })
         logger.info(
-            "[session] Started for church %s (db_id=%s, topic=%r)",
-            self._church_id, self._db_session_id, sermon_topic or "(none)",
+            "[session] Started for church %s (db_id=%s, topic=%r, source_version=%s, display_version=%s)",
+            self._church_id,
+            self._db_session_id,
+            sermon_topic or "(none)",
+            self._source_scripture_version,
+            self._display_scripture_version,
         )
 
     async def ingest(self, audio_b64: str):
@@ -503,15 +523,86 @@ class ServiceSession:
         Marks the sentence settled so late-arriving corrections are suppressed."""
         self._enrichment_settled.add(ts)
 
+    async def _hydrate_detected_verse(self, verse: dict) -> dict:
+        payload = dict(verse)
+        payload["explanation"] = (
+            "Detected as an explicit scripture citation."
+            if payload.get("confidence") == "explicit"
+            else "Detected as quoted scripture based on the sermon wording."
+        )
+        payload["source_version_slug"] = self._source_scripture_version
+        payload["display_version_slug"] = self._display_scripture_version
+        try:
+            source_passage = await get_passage(
+                self._source_scripture_version,
+                payload["book"],
+                int(payload["chapter"]),
+                int(payload["verse_start"]),
+                payload.get("verse_end"),
+            )
+            display_passage = await get_passage(
+                self._display_scripture_version,
+                payload["book"],
+                int(payload["chapter"]),
+                int(payload["verse_start"]),
+                payload.get("verse_end"),
+            )
+            payload["source_passage"] = source_passage
+            payload["display_passage"] = display_passage
+            if display_passage:
+                payload["canonical_english"] = " ".join(v["text"] for v in display_passage["verses"])
+        except Exception as e:
+            logger.warning(
+                "[session:%s] Failed to hydrate detected verse %s: %s",
+                self._church_id,
+                payload.get("reference"),
+                e,
+            )
+            payload["source_passage"] = None
+            payload["display_passage"] = None
+        return payload
+
+    async def _hydrate_suggested_verse(self, suggestion: dict) -> dict:
+        payload = dict(suggestion)
+        payload["explanation"] = payload.get("relevance_note", "")
+        payload["source_version_slug"] = self._source_scripture_version
+        payload["display_version_slug"] = self._display_scripture_version
+        try:
+            source_passage = await get_passage_by_reference(
+                self._source_scripture_version,
+                payload["reference"],
+            )
+            display_passage = await get_passage_by_reference(
+                self._display_scripture_version,
+                payload["reference"],
+            )
+            payload["source_passage"] = source_passage
+            payload["display_passage"] = display_passage
+            if display_passage:
+                payload["canonical_english"] = " ".join(v["text"] for v in display_passage["verses"])
+        except Exception as e:
+            logger.warning(
+                "[session:%s] Failed to hydrate suggested verse %s: %s",
+                self._church_id,
+                payload.get("reference"),
+                e,
+            )
+            payload["source_passage"] = None
+            payload["display_passage"] = None
+        return payload
+
     async def _on_verse_detected(self, ts: int, verse: dict):
+        verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse detected: %s", self._church_id, verse.get("reference"))
         await self._broadcast({"type": "verse_detected", "ts": ts, "verse": verse})
 
     async def _on_verse_range_update(self, ts: int, verse: dict):
+        verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse range update: %s", self._church_id, verse.get("reference"))
         await self._broadcast({"type": "verse_range_update", "ts": ts, "verse": verse})
 
     async def _on_verse_suggestion(self, ts: int, suggestions: list[dict]):
+        suggestions = [await self._hydrate_suggested_verse(s) for s in suggestions]
         logger.info(
             "[session:%s] Verse suggestions for ts=%d: %s",
             self._church_id, ts, [s["reference"] for s in suggestions],
@@ -616,13 +707,20 @@ class SessionManager:
         ws: WebSocket,
         sample_rate: int,
         sermon_topic: str = "",
+        source_scripture_version: str = "rvr1960",
+        display_scripture_version: str = "kjv",
     ) -> ServiceSession:
         if church_id in self._sessions:
             await self._sessions[church_id].close()
 
         session = ServiceSession(church_id, ws, self._broadcaster)
         self._sessions[church_id] = session
-        await session.start(sample_rate, sermon_topic=sermon_topic)
+        await session.start(
+            sample_rate,
+            sermon_topic=sermon_topic,
+            source_scripture_version=source_scripture_version,
+            display_scripture_version=display_scripture_version,
+        )
         return session
 
     async def remove(self, church_id: str):

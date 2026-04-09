@@ -1,6 +1,8 @@
 'use client';
 import { useRef, useState, useCallback, useEffect } from 'react';
+import { BibleVersionSelectors } from './BibleVersionSelectors';
 import { VUMeter } from './VUMeter';
+import { useBibleVersions } from '@/lib/useBibleVersions';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
 import { float32ToBase64 } from '@/lib/audioUtils';
 
@@ -18,6 +20,9 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
   const [errorMsg, setErrorMsg] = useState('');
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [sermonTopic, setSermonTopic] = useState('');
+  const [sourceScriptureVersion, setSourceScriptureVersion] = useState('rvr1960');
+  const [displayScriptureVersion, setDisplayScriptureVersion] = useState('kjv');
+  const { versions, loading: versionsLoading, error: versionsError } = useBibleVersions(churchId);
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -29,9 +34,11 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
   const shouldReconnectRef = useRef(false);
   const sampleRateRef = useRef(48000);
   const sermonTopicRef = useRef('');
+  const connectRef = useRef<() => void>(() => {});
 
-  // Assign during render so reconnect handler always reads the current value
-  sermonTopicRef.current = sermonTopic;
+  useEffect(() => {
+    sermonTopicRef.current = sermonTopic;
+  }, [sermonTopic]);
 
   const flushBuffer = useCallback(() => {
     if (sendBufferRef.current.length === 0 || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -53,6 +60,8 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
         type: 'session.start',
         sampleRate: sampleRateRef.current,
         topic: sermonTopicRef.current,
+        sourceScriptureVersion,
+        displayScriptureVersion,
       }));
     };
 
@@ -68,7 +77,7 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
       if (!shouldReconnectRef.current) return;
       setStatus('reconnecting');
       setTimeout(() => {
-        if (shouldReconnectRef.current) connect();
+        if (shouldReconnectRef.current) connectRef.current();
       }, retryDelayRef.current);
       retryDelayRef.current = Math.min(retryDelayRef.current * 2, MAX_RETRY_DELAY_MS);
     };
@@ -76,7 +85,11 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
     ws.onerror = () => {
       setErrorMsg('Connection error — retrying...');
     };
-  }, [churchId]);
+  }, [churchId, displayScriptureVersion, sourceScriptureVersion]);
+
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
 
   const start = useCallback(async () => {
     setStatus('connecting');
@@ -203,6 +216,28 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
         )}
         <p className="text-gray-500 text-xs">
           Helps the AI resolve ambiguous theological terms correctly.
+        </p>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <p className="text-gray-400 text-xs font-medium uppercase tracking-wide">Bible Versions</p>
+          {versionsLoading && <span className="text-[11px] text-gray-500">Loading…</span>}
+        </div>
+        {versionsError ? (
+          <p className="text-red-400 text-xs">{versionsError}</p>
+        ) : versions.length > 0 ? (
+          <BibleVersionSelectors
+            versions={versions}
+            sourceVersion={sourceScriptureVersion}
+            displayVersion={displayScriptureVersion}
+            onSourceVersionChange={setSourceScriptureVersion}
+            onDisplayVersionChange={setDisplayScriptureVersion}
+            disabled={isLive}
+          />
+        ) : null}
+        <p className="text-gray-500 text-xs">
+          Defaults are RVR1960 for detected scripture and KJV for displayed passages.
         </p>
       </div>
 

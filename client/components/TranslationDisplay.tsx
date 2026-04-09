@@ -1,8 +1,8 @@
 'use client';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useTranslationFeed } from '@/lib/useTranslationFeed';
-import { VersePanel } from './VersePanel';
+import { ScripturePopover } from './ScripturePopover';
+import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
 
 interface TranslationDisplayProps {
   churchId: string;
@@ -13,8 +13,14 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
   const {
     segments, spanishLines, partialSpanish, partialEnglish,
     connected, flashingId,
-    verses, suggestions,
   } = useTranslationFeed(churchId);
+  const [popover, setPopover] = useState<{
+    title: string;
+    color: 'cited' | 'recommended';
+    explanation?: string;
+    sourcePassage?: VerseDetection['source_passage'] | VerseSuggestion['source_passage'];
+    displayPassage?: VerseDetection['display_passage'] | VerseSuggestion['display_passage'];
+  } | null>(null);
 
   const [scrolledUp, setScrolledUp] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -59,6 +65,40 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     </button>
   );
 
+  const renderVerseChips = useCallback((segment: typeof segments[number]) => (
+    <div className="flex flex-wrap items-center gap-2">
+      {segment.verseDetected && (
+        <button
+          onClick={() => setPopover({
+            title: segment.verseDetected!.reference,
+            color: 'cited',
+            explanation: segment.verseDetected!.explanation,
+            sourcePassage: segment.verseDetected!.source_passage,
+            displayPassage: segment.verseDetected!.display_passage,
+          })}
+          className="rounded-full border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-xs font-semibold text-amber-300 shrink-0"
+        >
+          {segment.verseDetected.reference}
+        </button>
+      )}
+      {segment.verseSuggestions?.map((suggestion) => (
+        <button
+          key={suggestion.reference}
+          onClick={() => setPopover({
+            title: suggestion.reference,
+            color: 'recommended',
+            explanation: suggestion.explanation ?? suggestion.relevance_note,
+            sourcePassage: suggestion.source_passage,
+            displayPassage: suggestion.display_passage,
+          })}
+          className="rounded-full border border-sky-400/40 bg-sky-400/10 px-2 py-0.5 text-xs font-semibold text-sky-300 shrink-0"
+        >
+          {suggestion.reference}
+        </button>
+      ))}
+    </div>
+  ), []);
+
   // ── Lower-thirds overlay — no verse panel (OBS/projection use) ───────────────
   if (mode === 'lowerthird') {
     return (
@@ -96,14 +136,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
           <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
             <div className="min-h-full flex flex-col justify-end px-10 pt-20 pb-8 gap-4">
               {segments.map((s) => (
-                <motion.p
+                <motion.div
                   key={s.id}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1, transition: { duration: 0.4 } }}
-                  className="text-4xl font-semibold leading-snug"
+                  className="space-y-2"
                 >
-                  {s.spanish}
-                </motion.p>
+                  <span className="block text-4xl font-semibold leading-snug">{s.spanish}</span>
+                  {renderVerseChips(s)}
+                </motion.div>
               ))}
               <p className="text-4xl font-semibold leading-snug text-gray-400 min-h-[3rem]">
                 {activeSpanish}
@@ -113,7 +154,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
           </div>
           {liveButton}
         </div>
-        <VersePanel verses={verses} suggestions={suggestions} />
+        <ScripturePopover
+          open={popover !== null}
+          title={popover?.title ?? ''}
+          color={popover?.color ?? 'cited'}
+          explanation={popover?.explanation}
+          sourcePassage={popover?.sourcePassage}
+          displayPassage={popover?.displayPassage}
+          onClose={() => setPopover(null)}
+        />
       </div>
     );
   }
@@ -142,12 +191,8 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                           ? 'text-blue-100'
                           : 'text-blue-300'
                     }`}>{s.english}</p>
-                    {s.verseDetected && (
-                      <span className="text-amber-400 text-xs font-mono shrink-0">
-                        {s.verseDetected.reference}
-                      </span>
-                    )}
                   </div>
+                  {renderVerseChips(s)}
                 </motion.div>
               ))}
               <div className="space-y-1 min-h-[4rem]">
@@ -163,7 +208,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
           </div>
           {liveButton}
         </div>
-        <VersePanel verses={verses} suggestions={suggestions} />
+        <ScripturePopover
+          open={popover !== null}
+          title={popover?.title ?? ''}
+          color={popover?.color ?? 'cited'}
+          explanation={popover?.explanation}
+          sourcePassage={popover?.sourcePassage}
+          displayPassage={popover?.displayPassage}
+          onClose={() => setPopover(null)}
+        />
       </div>
     );
   }
@@ -192,12 +245,8 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                   }`}>
                     {s.english}
                   </p>
-                  {s.verseDetected && (
-                    <span className="text-amber-400 text-sm font-mono shrink-0">
-                      {s.verseDetected.reference}
-                    </span>
-                  )}
                 </div>
+                {renderVerseChips(s)}
                 <p className="text-base text-gray-500 leading-snug">{s.spanish}</p>
               </motion.div>
             ))}
@@ -213,7 +262,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         </div>
         {liveButton}
       </div>
-      <VersePanel verses={verses} suggestions={suggestions} />
+      <ScripturePopover
+        open={popover !== null}
+        title={popover?.title ?? ''}
+        color={popover?.color ?? 'cited'}
+        explanation={popover?.explanation}
+        sourcePassage={popover?.sourcePassage}
+        displayPassage={popover?.displayPassage}
+        onClose={() => setPopover(null)}
+      />
     </div>
   );
 }

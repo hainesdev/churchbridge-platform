@@ -21,6 +21,7 @@ out/
 # Database
 *.db
 *.sqlite
+data/source_bibles/
 
 # OS
 .DS_Store
