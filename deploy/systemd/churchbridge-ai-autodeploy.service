@@ -6,4 +6,4 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/var/www/churchbridge-ai
-ExecStart=/var/www/churchbridge-ai/deploy/scripts/update-if-needed.sh
+ExecStart=/bin/bash /var/www/churchbridge-ai/deploy/scripts/update-if-needed.sh
