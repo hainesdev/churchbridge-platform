@@ -19,4 +19,4 @@ fi
 
 git checkout "${BRANCH}"
 git reset --hard "origin/${BRANCH}"
-"${SCRIPT_DIR}/deploy.sh"
+bash "${SCRIPT_DIR}/deploy.sh"
