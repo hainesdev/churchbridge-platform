@@ -9,19 +9,92 @@ import { float32ToBase64 } from '@/lib/audioUtils';
 import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
+type AudioPreset = 'quiet-room' | 'noisy-church' | 'near-speaker' | 'manual';
 
 interface MobileTestProps {
   churchId: string;
 }
 
+interface AudioCaptureOptions {
+  noiseSuppression: boolean;
+  echoCancellation: boolean;
+  autoGainControl: boolean;
+}
+
+interface AudioDiagnostics {
+  inputLevel: number;
+  noiseFloor: number;
+  clipping: boolean;
+  speechDetected: boolean;
+  batchesSent: number;
+  lastBatchAt: number | null;
+  audioContextSampleRate: number | null;
+  requestedSampleRate: number;
+  inputDeviceLabel: string;
+  lastSpeechAt: number | null;
+  appliedOptions: AudioCaptureOptions | null;
+}
+
 const BATCH_INTERVAL_MS = 100;
 const MAX_RETRY_DELAY_MS = 30_000;
+const TARGET_SAMPLE_RATE = 16000;
+const AUDIO_PRESETS: Record<Exclude<AudioPreset, 'manual'>, AudioCaptureOptions> = {
+  'quiet-room': { noiseSuppression: true, echoCancellation: false, autoGainControl: true },
+  'noisy-church': { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
+  'near-speaker': { noiseSuppression: true, echoCancellation: true, autoGainControl: false },
+};
+
+function getEffectiveOptions(preset: AudioPreset, manualOptions: AudioCaptureOptions): AudioCaptureOptions {
+  return preset === 'manual' ? manualOptions : AUDIO_PRESETS[preset];
+}
+
+function computeSignalMetrics(samples: Float32Array): { rms: number; peak: number } {
+  let sumSquares = 0;
+  let peak = 0;
+  for (const sample of samples) {
+    const abs = Math.abs(sample);
+    if (abs > peak) peak = abs;
+    sumSquares += sample * sample;
+  }
+  return {
+    rms: Math.sqrt(sumSquares / Math.max(samples.length, 1)),
+    peak,
+  };
+}
+
+function formatAge(now: number, ts: number | null): string {
+  if (!ts) return 'No signal yet';
+  const seconds = Math.max(0, Math.round((now - ts) / 1000));
+  return seconds < 2 ? 'Just now' : `${seconds}s ago`;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
 
 // ── Audio capture + streaming ─────────────────────────────────────────────────
 
-function useAudioStream(churchId: string, sourceScriptureVersion: string, displayScriptureVersion: string) {
+function useAudioStream(
+  churchId: string,
+  sourceScriptureVersion: string,
+  displayScriptureVersion: string,
+  audioOptions: AudioCaptureOptions,
+) {
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
+  const [diagnostics, setDiagnostics] = useState<AudioDiagnostics>({
+    inputLevel: 0,
+    noiseFloor: 0,
+    clipping: false,
+    speechDetected: false,
+    batchesSent: 0,
+    lastBatchAt: null,
+    audioContextSampleRate: null,
+    requestedSampleRate: TARGET_SAMPLE_RATE,
+    inputDeviceLabel: '',
+    lastSpeechAt: null,
+    appliedOptions: null,
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -31,14 +104,22 @@ function useAudioStream(churchId: string, sourceScriptureVersion: string, displa
   const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryDelayRef = useRef(1000);
   const shouldReconnectRef = useRef(false);
-  const sampleRateRef = useRef(48000);
+  const sampleRateRef = useRef(TARGET_SAMPLE_RATE);
   const connectRef = useRef<() => void>(() => {});
+  const noiseFloorRef = useRef(0);
+  const speechHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const flushBuffer = useCallback(() => {
     if (!sendBufferRef.current.length || wsRef.current?.readyState !== WebSocket.OPEN) return;
     const chunks = sendBufferRef.current;
     sendBufferRef.current = [];
     wsRef.current.send(JSON.stringify({ type: 'audio', audio: float32ToBase64(chunks) }));
+    const now = Date.now();
+    setDiagnostics(prev => ({
+      ...prev,
+      batchesSent: prev.batchesSent + 1,
+      lastBatchAt: now,
+    }));
   }, []);
 
   const connect = useCallback(() => {
@@ -80,7 +161,11 @@ function useAudioStream(churchId: string, sourceScriptureVersion: string, displa
     setErrorMsg('');
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true },
+        audio: {
+          echoCancellation: audioOptions.echoCancellation,
+          noiseSuppression: audioOptions.noiseSuppression,
+          autoGainControl: audioOptions.autoGainControl,
+        },
         video: false,
       });
       streamRef.current = mediaStream;
@@ -88,14 +173,71 @@ function useAudioStream(churchId: string, sourceScriptureVersion: string, displa
       ctxRef.current = ctx;
       // Worklet downsamples to 16 kHz before posting chunks; advertise that rate
       // so the server's resample_float32_to_pcm16 hits the fast no-op path.
-      sampleRateRef.current = 16000;
+      sampleRateRef.current = TARGET_SAMPLE_RATE;
       if (ctx.state === 'suspended') await ctx.resume();
       await ctx.audioWorklet.addModule('/worklets/recorder-worklet.js');
       const source = ctx.createMediaStreamSource(mediaStream);
       const worklet = new AudioWorkletNode(ctx, 'recorder-processor');
       workletRef.current = worklet;
+      noiseFloorRef.current = 0;
+      const track = mediaStream.getAudioTracks()[0];
+      setDiagnostics(prev => ({
+        ...prev,
+        inputLevel: 0,
+        noiseFloor: 0,
+        clipping: false,
+        speechDetected: false,
+        batchesSent: 0,
+        lastBatchAt: null,
+        lastSpeechAt: null,
+        audioContextSampleRate: ctx.sampleRate,
+        requestedSampleRate: TARGET_SAMPLE_RATE,
+        inputDeviceLabel: track?.label ?? '',
+        appliedOptions: { ...audioOptions },
+      }));
       worklet.port.onmessage = (e) => {
-        if (e.data.type === 'chunk') sendBufferRef.current.push(e.data.samples);
+        if (e.data.type !== 'chunk') return;
+        const samples = e.data.samples as Float32Array;
+        sendBufferRef.current.push(samples);
+        const { rms, peak } = computeSignalMetrics(samples);
+        const nextNoiseFloor = noiseFloorRef.current === 0
+          ? rms
+          : rms < noiseFloorRef.current
+            ? (noiseFloorRef.current * 0.8) + (rms * 0.2)
+            : (noiseFloorRef.current * 0.98) + (rms * 0.02);
+        noiseFloorRef.current = nextNoiseFloor;
+        const speechThreshold = Math.max(nextNoiseFloor * 2.5, 0.02);
+        const speechDetected = rms >= speechThreshold;
+        const now = Date.now();
+
+        if (speechDetected) {
+          if (speechHoldTimerRef.current) {
+            clearTimeout(speechHoldTimerRef.current);
+            speechHoldTimerRef.current = null;
+          }
+          setDiagnostics(prev => ({
+            ...prev,
+            inputLevel: rms,
+            noiseFloor: nextNoiseFloor,
+            clipping: peak >= 0.98,
+            speechDetected: true,
+            lastSpeechAt: now,
+          }));
+          return;
+        }
+
+        setDiagnostics(prev => ({
+          ...prev,
+          inputLevel: rms,
+          noiseFloor: nextNoiseFloor,
+          clipping: peak >= 0.98,
+        }));
+        if (!speechHoldTimerRef.current) {
+          speechHoldTimerRef.current = setTimeout(() => {
+            setDiagnostics(prev => ({ ...prev, speechDetected: false }));
+            speechHoldTimerRef.current = null;
+          }, 1200);
+        }
       };
       source.connect(worklet);
       worklet.connect(ctx.destination);
@@ -107,11 +249,12 @@ function useAudioStream(churchId: string, sourceScriptureVersion: string, displa
       setErrorMsg(err instanceof Error ? err.message : 'Failed to access microphone');
       setStatus('error');
     }
-  }, [connect, flushBuffer]);
+  }, [audioOptions, connect, flushBuffer]);
 
   const stop = useCallback(() => {
     shouldReconnectRef.current = false;
     if (sendTimerRef.current) { clearInterval(sendTimerRef.current); sendTimerRef.current = null; }
+    if (speechHoldTimerRef.current) { clearTimeout(speechHoldTimerRef.current); speechHoldTimerRef.current = null; }
     workletRef.current?.port.postMessage('stop');
     workletRef.current = null;
     if (wsRef.current) {
@@ -126,12 +269,226 @@ function useAudioStream(churchId: string, sourceScriptureVersion: string, displa
     ctxRef.current?.close();
     ctxRef.current = null;
     sendBufferRef.current = [];
+    noiseFloorRef.current = 0;
+    setDiagnostics(prev => ({ ...prev, speechDetected: false, inputLevel: 0, clipping: false }));
     setStatus('idle');
   }, []);
 
   useEffect(() => () => stop(), [stop]);
 
-  return { status, errorMsg, start, stop };
+  return { status, errorMsg, diagnostics, start, stop };
+}
+
+function DiagnosticsBar({
+  label,
+  value,
+  color,
+  detail,
+}: {
+  label: string;
+  value: number;
+  color: string;
+  detail: string;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-gray-300">{label}</span>
+        <span className="text-gray-500">{detail}</span>
+      </div>
+      <div className="h-2 rounded-full bg-gray-800">
+        <div className={`h-2 rounded-full ${color}`} style={{ width: `${Math.max(4, Math.round(value * 100))}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function ToggleRow({
+  label,
+  description,
+  checked,
+  disabled,
+  onToggle,
+}: {
+  label: string;
+  description: string;
+  checked: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <label className={`flex items-center justify-between gap-4 rounded-2xl border px-4 py-3 ${disabled ? 'border-gray-800 bg-gray-900/60 opacity-60' : 'border-gray-800 bg-gray-900'}`}>
+      <div className="space-y-1">
+        <p className="text-sm font-medium text-white">{label}</p>
+        <p className="text-xs text-gray-400">{description}</p>
+      </div>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={onToggle}
+        className={`relative h-7 w-12 rounded-full transition-colors ${checked ? 'bg-green-500' : 'bg-gray-700'} ${disabled ? 'cursor-not-allowed' : ''}`}
+      >
+        <span className={`absolute top-1 h-5 w-5 rounded-full bg-white transition-transform ${checked ? 'translate-x-6' : 'translate-x-1'}`} />
+      </button>
+    </label>
+  );
+}
+
+function TranslationTestPanel({
+  open,
+  onClose,
+  preset,
+  onPresetChange,
+  options,
+  onOptionChange,
+  diagnostics,
+  status,
+  displayConnected,
+  recordingActive,
+  now,
+  lastInterimSpanish,
+  lastFinalSpanish,
+  lastCommittedEnglish,
+  lastInterimAt,
+  lastFinalAt,
+  lastTranslationAt,
+}: {
+  open: boolean;
+  onClose: () => void;
+  preset: AudioPreset;
+  onPresetChange: (preset: AudioPreset) => void;
+  options: AudioCaptureOptions;
+  onOptionChange: (key: keyof AudioCaptureOptions, value: boolean) => void;
+  diagnostics: AudioDiagnostics;
+  status: Status;
+  displayConnected: boolean;
+  recordingActive: boolean;
+  now: number;
+  lastInterimSpanish: string;
+  lastFinalSpanish: string;
+  lastCommittedEnglish: string;
+  lastInterimAt: number | null;
+  lastFinalAt: number | null;
+  lastTranslationAt: number | null;
+}) {
+  const sttHealthy = !!(lastFinalAt && now - lastFinalAt < 10_000);
+  const translationHealthy = !!(lastTranslationAt && now - lastTranslationAt < 12_000);
+
+  return (
+    <div className={`fixed inset-0 z-40 transition ${open ? 'pointer-events-auto' : 'pointer-events-none'}`}>
+      <div onClick={onClose} className={`absolute inset-0 bg-black/55 transition-opacity ${open ? 'opacity-100' : 'opacity-0'}`} />
+      <div className={`absolute inset-x-0 bottom-0 mx-auto max-w-2xl rounded-t-3xl border border-gray-800 bg-gray-950/98 px-5 pb-6 pt-5 shadow-2xl backdrop-blur-md transition-transform duration-300 ${open ? 'translate-y-0' : 'translate-y-full'}`}>
+        <div className="mx-auto mb-4 h-1.5 w-14 rounded-full bg-gray-700" />
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.24em] text-gray-500">Translation Test</p>
+            <h2 className="text-xl font-semibold text-white">Settings & Diagnostics</h2>
+            <p className="mt-1 text-sm text-gray-400">Tune phone capture for the room, then watch each pipeline stage.</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-full border border-gray-700 px-3 py-1.5 text-xs font-medium text-gray-300 transition-colors hover:border-gray-500 hover:text-white">
+            Close
+          </button>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="rounded-2xl border border-gray-800 bg-gray-900 p-3">
+            <p className="text-xs uppercase tracking-wide text-gray-500">Capture</p>
+            <p className="mt-1 text-sm font-medium text-white">{status === 'active' ? 'Mic live' : status === 'reconnecting' ? 'Reconnecting' : status === 'error' ? 'Mic error' : 'Ready to start'}</p>
+            <p className="mt-1 text-xs text-gray-400">{diagnostics.speechDetected ? 'Speech detected' : 'Listening for speech'}</p>
+          </div>
+          <div className="rounded-2xl border border-gray-800 bg-gray-900 p-3">
+            <p className="text-xs uppercase tracking-wide text-gray-500">Speech to Text</p>
+            <p className="mt-1 text-sm font-medium text-white">{sttHealthy ? 'Receiving finals' : 'Watching for finals'}</p>
+            <p className="mt-1 text-xs text-gray-400">Last final: {formatAge(now, lastFinalAt)}</p>
+          </div>
+          <div className="rounded-2xl border border-gray-800 bg-gray-900 p-3">
+            <p className="text-xs uppercase tracking-wide text-gray-500">Translation</p>
+            <p className="mt-1 text-sm font-medium text-white">{translationHealthy ? 'English flowing' : 'Waiting on translation'}</p>
+            <p className="mt-1 text-xs text-gray-400">Last English: {formatAge(now, lastTranslationAt)}</p>
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-4">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-white">Capture Settings</h3>
+              {recordingActive && <span className="text-[11px] text-amber-400">Changes apply on next start</span>}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {([
+                ['quiet-room', 'Phone - Quiet Room'],
+                ['noisy-church', 'Phone - Noisy Church'],
+                ['near-speaker', 'Near Speaker / PA'],
+                ['manual', 'Manual'],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => onPresetChange(value)}
+                  className={`rounded-2xl border px-4 py-3 text-left transition-colors ${preset === value ? 'border-green-500 bg-green-500/10 text-white' : 'border-gray-800 bg-gray-900 text-gray-300 hover:border-gray-600'}`}
+                >
+                  <p className="text-sm font-medium">{label}</p>
+                </button>
+              ))}
+            </div>
+            <div className="space-y-3">
+              <ToggleRow label="Noise Suppression" description="Cuts steady room wash and ambient noise." checked={options.noiseSuppression} disabled={preset !== 'manual'} onToggle={() => onOptionChange('noiseSuppression', !options.noiseSuppression)} />
+              <ToggleRow label="Echo Cancellation" description="Helps when house speakers bleed into the phone mic." checked={options.echoCancellation} disabled={preset !== 'manual'} onToggle={() => onOptionChange('echoCancellation', !options.echoCancellation)} />
+              <ToggleRow label="Auto Gain Control" description="Boosts quiet speech, but can also raise room noise." checked={options.autoGainControl} disabled={preset !== 'manual'} onToggle={() => onOptionChange('autoGainControl', !options.autoGainControl)} />
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <h3 className="text-sm font-semibold text-white">Live Diagnostics</h3>
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-4 space-y-4">
+              <DiagnosticsBar label="Input level" value={diagnostics.inputLevel} color={diagnostics.clipping ? 'bg-red-500' : diagnostics.speechDetected ? 'bg-green-500' : 'bg-sky-500'} detail={diagnostics.clipping ? 'Clipping' : formatPercent(diagnostics.inputLevel)} />
+              <DiagnosticsBar label="Noise floor" value={diagnostics.noiseFloor} color="bg-amber-400" detail={formatPercent(diagnostics.noiseFloor)} />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Capture path</p>
+                  <p className="mt-1 text-sm text-white">{diagnostics.inputDeviceLabel || 'Phone microphone'}</p>
+                  <p className="mt-1 text-xs text-gray-400">Browser DSP: {diagnostics.appliedOptions ? `${diagnostics.appliedOptions.noiseSuppression ? 'NS on' : 'NS off'} · ${diagnostics.appliedOptions.echoCancellation ? 'EC on' : 'EC off'} · ${diagnostics.appliedOptions.autoGainControl ? 'AGC on' : 'AGC off'}` : 'Will apply on start'}</p>
+                </div>
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Streaming</p>
+                  <p className="mt-1 text-sm text-white">{displayConnected ? 'Display feed connected' : 'Display feed reconnecting'}</p>
+                  <p className="mt-1 text-xs text-gray-400">Audio batches sent: {diagnostics.batchesSent}</p>
+                  <p className="mt-1 text-xs text-gray-500">Last batch: {formatAge(now, diagnostics.lastBatchAt)}</p>
+                </div>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Speech</p>
+                  <p className="mt-1 text-sm text-white">{diagnostics.speechDetected ? 'Detected' : 'Idle / room tone'}</p>
+                  <p className="mt-1 text-xs text-gray-400">Last speech: {formatAge(now, diagnostics.lastSpeechAt)}</p>
+                </div>
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">STT interim</p>
+                  <p className="mt-1 text-sm text-white">{formatAge(now, lastInterimAt)}</p>
+                  <p className="mt-1 text-xs text-gray-400 line-clamp-3">{lastInterimSpanish || 'Waiting for interim Spanish...'}</p>
+                </div>
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Translation</p>
+                  <p className="mt-1 text-sm text-white">{formatAge(now, lastTranslationAt)}</p>
+                  <p className="mt-1 text-xs text-gray-400 line-clamp-3">{lastCommittedEnglish || 'Waiting for committed English...'}</p>
+                </div>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Last final Spanish</p>
+                  <p className="mt-2 text-sm text-gray-200">{lastFinalSpanish || 'No final phrase yet.'}</p>
+                </div>
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Sample rate</p>
+                  <p className="mt-2 text-sm text-gray-200">Requested {diagnostics.requestedSampleRate} Hz{diagnostics.audioContextSampleRate ? ` · Context ${diagnostics.audioContextSampleRate} Hz` : ''}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -139,9 +496,32 @@ function useAudioStream(churchId: string, sourceScriptureVersion: string, displa
 export function MobileTest({ churchId }: MobileTestProps) {
   const [sourceScriptureVersion, setSourceScriptureVersion] = useState('rvr1960');
   const [displayScriptureVersion, setDisplayScriptureVersion] = useState('kjv');
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [preset, setPreset] = useState<AudioPreset>('noisy-church');
+  const [manualOptions, setManualOptions] = useState<AudioCaptureOptions>(AUDIO_PRESETS['noisy-church']);
+  const [now, setNow] = useState(() => Date.now());
   const { versions, loading: versionsLoading, error: versionsError } = useBibleVersions(churchId);
-  const { status, errorMsg, start, stop } = useAudioStream(churchId, sourceScriptureVersion, displayScriptureVersion);
-  const { segments, spanishLines, partialSpanish, partialEnglish, connected: displayConnected, flashingId } = useTranslationFeed(churchId);
+  const effectiveOptions = getEffectiveOptions(preset, manualOptions);
+  const { status, errorMsg, diagnostics, start, stop } = useAudioStream(
+    churchId,
+    sourceScriptureVersion,
+    displayScriptureVersion,
+    effectiveOptions,
+  );
+  const {
+    segments,
+    spanishLines,
+    partialSpanish,
+    partialEnglish,
+    connected: displayConnected,
+    flashingId,
+    lastInterimAt,
+    lastFinalAt,
+    lastTranslationAt,
+    lastInterimSpanish,
+    lastFinalSpanish,
+    lastCommittedEnglish,
+  } = useTranslationFeed(churchId);
   const [popover, setPopover] = useState<{
     title: string;
     color: 'cited' | 'recommended';
@@ -153,6 +533,23 @@ export function MobileTest({ churchId }: MobileTestProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const [scrolledUp, setScrolledUp] = useState(false);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const handlePresetChange = useCallback((nextPreset: AudioPreset) => {
+    setPreset(nextPreset);
+    if (nextPreset !== 'manual') {
+      setManualOptions(AUDIO_PRESETS[nextPreset]);
+    }
+  }, []);
+
+  const handleOptionChange = useCallback((key: keyof AudioCaptureOptions, value: boolean) => {
+    setPreset('manual');
+    setManualOptions(prev => ({ ...prev, [key]: value }));
+  }, []);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -173,21 +570,52 @@ export function MobileTest({ churchId }: MobileTestProps) {
   }, []);
 
   const isLive = status === 'active' || status === 'reconnecting';
+  const panelTone = status === 'error' || diagnostics.clipping
+    ? 'red'
+    : status === 'reconnecting' || (lastFinalAt !== null && now - lastFinalAt > 15_000)
+      ? 'yellow'
+      : 'green';
+  const waitingHint = diagnostics.clipping
+    ? 'Input is clipping. Move the phone farther away or lower the source level.'
+    : diagnostics.inputLevel < 0.015
+      ? 'Input is very low. Move the phone closer to the speaker or PA.'
+      : lastInterimAt && (!lastFinalAt || lastFinalAt < lastInterimAt) && now - lastInterimAt > 6_000
+        ? 'Interim speech is arriving, but STT is not settling on a final phrase yet.'
+        : lastFinalAt && (!lastTranslationAt || lastTranslationAt < lastFinalAt) && now - lastFinalAt > 6_000
+          ? 'Spanish finals are arriving, but the translation stage is lagging behind.'
+          : diagnostics.speechDetected && !lastInterimAt
+            ? 'Speech is reaching the mic, but STT has not responded yet.'
+            : 'Waiting for speech...';
   const activeSpanish =
     spanishLines.join(' ') + (spanishLines.length > 0 && partialSpanish ? ' ' : '') + partialSpanish;
+  const panelButton = (
+    <button
+      type="button"
+      onClick={() => setPanelOpen(true)}
+      className="inline-flex items-center gap-2 rounded-full border border-gray-700 bg-gray-900/80 px-3 py-2 text-xs font-medium text-gray-200 transition-colors hover:border-gray-500 hover:text-white"
+    >
+      <span className={`h-2 w-2 rounded-full ${panelTone === 'green' ? 'bg-green-400' : panelTone === 'yellow' ? 'bg-yellow-400' : 'bg-red-400'}`} />
+      Settings & Diagnostics
+    </button>
+  );
 
   if (!isLive && status !== 'connecting') {
     return (
-      <div className="h-screen bg-gray-950 text-white flex flex-col items-center justify-center gap-6 px-8">
-        <div className="text-center space-y-2">
-          <p className="text-gray-400 text-sm">Church: <span className="text-white">{churchId}</span></p>
-          <h1 className="text-2xl font-semibold">Translation Test</h1>
-          <p className="text-gray-500 text-sm">Speak in Spanish. Translation appears in real time.</p>
-        </div>
+      <div className="min-h-screen bg-gray-950 text-white px-6 py-6">
+        <div className="mx-auto flex min-h-[calc(100vh-3rem)] w-full max-w-xl flex-col justify-center gap-6">
+          <div className="flex justify-end">{panelButton}</div>
+          <div className="text-center space-y-2">
+            <p className="text-gray-400 text-sm">Church: <span className="text-white">{churchId}</span></p>
+            <h1 className="text-2xl font-semibold">Translation Test</h1>
+            <p className="text-gray-500 text-sm">Speak in Spanish. Translation appears in real time.</p>
+            <p className="text-xs text-gray-600">
+              Preset: <span className="text-gray-300">{preset === 'quiet-room' ? 'Phone - Quiet Room' : preset === 'noisy-church' ? 'Phone - Noisy Church' : preset === 'near-speaker' ? 'Near Speaker / PA' : 'Manual'}</span>
+            </p>
+          </div>
         {versionsError ? (
           <p className="text-red-400 text-sm text-center">{versionsError}</p>
         ) : versions.length > 0 ? (
-          <div className="w-full max-w-xl">
+          <div className="w-full">
             <BibleVersionSelectors
               versions={versions}
               sourceVersion={sourceScriptureVersion}
@@ -199,16 +627,41 @@ export function MobileTest({ churchId }: MobileTestProps) {
             {versionsLoading && <p className="mt-2 text-xs text-gray-500 text-center">Loading versions…</p>}
           </div>
         ) : null}
+        <div className="rounded-2xl border border-gray-800 bg-gray-900 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500">Ready for mobile testing</p>
+          <p className="mt-2 text-sm text-gray-300">
+            Start with <span className="text-white">Phone - Noisy Church</span> unless the phone is very close to the speaker.
+          </p>
+        </div>
         {errorMsg && <p className="text-red-400 text-sm text-center">{errorMsg}</p>}
         <button
           onClick={start}
-          className="w-full max-w-xs py-4 rounded-2xl bg-green-600 hover:bg-green-500 active:bg-green-700 text-white text-lg font-semibold transition-colors"
+          className="w-full py-4 rounded-2xl bg-green-600 hover:bg-green-500 active:bg-green-700 text-white text-lg font-semibold transition-colors"
         >
           Start Recording
         </button>
-        <p className="text-gray-600 text-xs text-center">
-          This page uses your microphone and streams audio to the server.
-        </p>
+        <p className="text-gray-600 text-xs text-center">This page uses your microphone and streams audio to the server.</p>
+        </div>
+
+        <TranslationTestPanel
+          open={panelOpen}
+          onClose={() => setPanelOpen(false)}
+          preset={preset}
+          onPresetChange={handlePresetChange}
+          options={effectiveOptions}
+          onOptionChange={handleOptionChange}
+          diagnostics={diagnostics}
+          status={status}
+          displayConnected={displayConnected}
+          recordingActive={false}
+          now={now}
+          lastInterimSpanish={lastInterimSpanish}
+          lastFinalSpanish={lastFinalSpanish}
+          lastCommittedEnglish={lastCommittedEnglish}
+          lastInterimAt={lastInterimAt}
+          lastFinalAt={lastFinalAt}
+          lastTranslationAt={lastTranslationAt}
+        />
       </div>
     );
   }
@@ -224,8 +677,8 @@ export function MobileTest({ churchId }: MobileTestProps) {
 
   return (
     <div className="h-screen bg-gray-950 text-white flex flex-col overflow-hidden">
-      <div className="flex-none flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800">
-        <div className="flex items-center gap-2">
+      <div className="flex-none flex items-center justify-between gap-3 px-4 py-3 bg-gray-900 border-b border-gray-800">
+        <div className="flex min-w-0 items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${
             status === 'active'       ? 'bg-green-400 animate-pulse' :
             status === 'reconnecting' ? 'bg-yellow-400 animate-pulse' :
@@ -238,12 +691,34 @@ export function MobileTest({ churchId }: MobileTestProps) {
             <span className="text-xs text-yellow-500 ml-1">· reconnecting to server</span>
           )}
         </div>
-        <button
-          onClick={stop}
-          className="bg-red-600/80 hover:bg-red-600 active:bg-red-700 text-white text-xs font-medium px-3 py-1.5 rounded-full transition-colors"
-        >
-          End
-        </button>
+        <div className="flex items-center gap-2">
+          {panelButton}
+          <button
+            onClick={stop}
+            className="bg-red-600/80 hover:bg-red-600 active:bg-red-700 text-white text-xs font-medium px-3 py-2 rounded-full transition-colors"
+          >
+            End
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-none border-b border-gray-900 bg-gray-950/90 px-4 py-3">
+        <div className="flex flex-wrap gap-2 text-[11px]">
+          <span className={`rounded-full border px-2 py-1 ${diagnostics.speechDetected ? 'border-green-500/50 bg-green-500/10 text-green-200' : 'border-gray-800 bg-gray-900 text-gray-400'}`}>
+            {diagnostics.speechDetected ? 'Speech detected' : 'Listening for speech'}
+          </span>
+          <span className={`rounded-full border px-2 py-1 ${lastFinalAt && now - lastFinalAt < 10_000 ? 'border-sky-500/50 bg-sky-500/10 text-sky-200' : 'border-gray-800 bg-gray-900 text-gray-400'}`}>
+            STT final: {formatAge(now, lastFinalAt)}
+          </span>
+          <span className={`rounded-full border px-2 py-1 ${lastTranslationAt && now - lastTranslationAt < 12_000 ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200' : 'border-gray-800 bg-gray-900 text-gray-400'}`}>
+            English: {formatAge(now, lastTranslationAt)}
+          </span>
+          {diagnostics.clipping && (
+            <span className="rounded-full border border-red-500/50 bg-red-500/10 px-2 py-1 text-red-200">
+              Clipping detected
+            </span>
+          )}
+        </div>
       </div>
 
       <div
@@ -253,7 +728,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
       >
         <div className="min-h-full flex flex-col justify-end px-5 pt-12 pb-6 gap-4">
           {segments.length === 0 && !activeSpanish && !partialEnglish && (
-            <p className="text-gray-600 text-sm text-center mb-4">Waiting for speech...</p>
+            <p className="text-gray-500 text-sm text-center mb-4">{waitingHint}</p>
           )}
           {segments.map((s) => (
             <motion.div
@@ -326,6 +801,25 @@ export function MobileTest({ churchId }: MobileTestProps) {
           <p className="text-red-300 text-xs">{errorMsg}</p>
         </div>
       )}
+      <TranslationTestPanel
+        open={panelOpen}
+        onClose={() => setPanelOpen(false)}
+        preset={preset}
+        onPresetChange={handlePresetChange}
+        options={effectiveOptions}
+        onOptionChange={handleOptionChange}
+        diagnostics={diagnostics}
+        status={status}
+        displayConnected={displayConnected}
+        recordingActive
+        now={now}
+        lastInterimSpanish={lastInterimSpanish}
+        lastFinalSpanish={lastFinalSpanish}
+        lastCommittedEnglish={lastCommittedEnglish}
+        lastInterimAt={lastInterimAt}
+        lastFinalAt={lastFinalAt}
+        lastTranslationAt={lastTranslationAt}
+      />
       <ScripturePopover
         open={popover !== null}
         title={popover?.title ?? ''}

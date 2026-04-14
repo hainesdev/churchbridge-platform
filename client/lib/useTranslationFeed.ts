@@ -83,6 +83,12 @@ export interface TranslationFeed {
   suggestions: VerseSuggestion[];
   activeVerseTs: number | null;
   sermonMode: SermonMode;
+  lastInterimAt: number | null;
+  lastFinalAt: number | null;
+  lastTranslationAt: number | null;
+  lastInterimSpanish: string;
+  lastFinalSpanish: string;
+  lastCommittedEnglish: string;
 }
 
 export function useTranslationFeed(churchId: string): TranslationFeed {
@@ -96,6 +102,12 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   const [suggestions, setSuggestions] = useState<VerseSuggestion[]>([]);
   const [activeVerseTs, setActiveVerseTs] = useState<number | null>(null);
   const [sermonMode, setSermonMode] = useState<SermonMode>('exposition');
+  const [lastInterimAt, setLastInterimAt] = useState<number | null>(null);
+  const [lastFinalAt, setLastFinalAt] = useState<number | null>(null);
+  const [lastTranslationAt, setLastTranslationAt] = useState<number | null>(null);
+  const [lastInterimSpanish, setLastInterimSpanish] = useState('');
+  const [lastFinalSpanish, setLastFinalSpanish] = useState('');
+  const [lastCommittedEnglish, setLastCommittedEnglish] = useState('');
 
   const partialQueueRef = useRef('');
   const lastInterimTextRef = useRef<string | null>(null);
@@ -133,11 +145,17 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
         }
 
         if (msg.type === 'interim') {
-          setPartialSpanish(String(msg.text ?? ''));
+          const text = String(msg.text ?? '');
+          setPartialSpanish(text);
+          setLastInterimSpanish(text);
+          setLastInterimAt(Date.now());
 
         } else if (msg.type === 'stt_final') {
-          setSpanishLines(prev => [...prev, String(msg.text ?? '')].slice(-8));
+          const text = String(msg.text ?? '');
+          setSpanishLines(prev => [...prev, text].slice(-8));
           setPartialSpanish('');
+          setLastFinalSpanish(text);
+          setLastFinalAt(Date.now());
 
         } else if (msg.type === 'interim_translation') {
           const t = String(msg.text ?? '').trim();
@@ -149,6 +167,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           }
 
         } else if (msg.type === 'translation') {
+          const english = String(msg.english ?? '');
           setSegments(prev => {
             const ts = Number(msg.ts);
             const duplicateCount = prev.filter(s => s.id === ts).length;
@@ -156,17 +175,19 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
             if (duplicateCount > 0) {
               return prev.map(s =>
                 s.id === ts
-                  ? { ...s, spanish: String(msg.spanish ?? ''), english: String(msg.english ?? '') }
+                  ? { ...s, spanish: String(msg.spanish ?? ''), english }
                   : s
               );
             }
-            return [...prev.slice(-99), { id: ts, spanish: String(msg.spanish ?? ''), english: String(msg.english ?? '') }];
+            return [...prev.slice(-99), { id: ts, spanish: String(msg.spanish ?? ''), english }];
           });
           setSpanishLines([]);
           setPartialSpanish('');
           lastInterimTextRef.current = null;
           partialQueueRef.current = '';
           setPartialEnglish('');
+          setLastCommittedEnglish(english);
+          setLastTranslationAt(Date.now());
 
         } else if (msg.type === 'correction' || msg.type === 'translation_update') {
           // Both events update a committed segment's English text and flash it.
@@ -271,5 +292,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     connected, flashingId,
     verses, suggestions, activeVerseTs,
     sermonMode,
+    lastInterimAt, lastFinalAt, lastTranslationAt,
+    lastInterimSpanish, lastFinalSpanish, lastCommittedEnglish,
   };
 }
