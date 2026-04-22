@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import time
 from fastapi import WebSocket
@@ -20,6 +21,7 @@ from server.services.sentence_buffer import SentenceBuffer, _is_incomplete
 from server.services.sermon_state_tracker import SermonStateTracker
 from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
+from server.services.session_recorder import SessionRecorder, CaptureResult
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +241,7 @@ class ServiceSession:
         self._stt_noise_removed_count: int = 0
         self._source_scripture_version: str = "rvr1960"
         self._display_scripture_version: str = "kjv"
+        self._recorder: SessionRecorder | None = None
 
     async def start(
         self,
@@ -251,6 +254,12 @@ class ServiceSession:
         self._source_scripture_version = source_scripture_version or "rvr1960"
         self._display_scripture_version = display_scripture_version or "kjv"
         self._db_session_id = await create_service_session(self._church_id)
+
+        if os.getenv("SESSION_CAPTURE_ENABLED"):
+            self._recorder = SessionRecorder(self._db_session_id, self._church_id)
+            self._recorder.record_event("session_start", {
+                "church_id": self._church_id, "sample_rate": sample_rate,
+            })
 
         glossary = await get_glossary(self._church_id)
         church_terms = await load_church_terms(self._church_id)
@@ -315,10 +324,20 @@ class ServiceSession:
         """Receive a base64 Float32 chunk from the browser, resample, forward to Deepgram."""
         raw = base64_to_float32_bytes(audio_b64)
         pcm16 = resample_float32_to_pcm16(raw, self._sample_rate, dst_rate=16000)
+        if self._recorder:
+            self._recorder.record_audio(pcm16)
         if self._deepgram:
             await self._deepgram.send(pcm16)
 
     async def close(self):
+        if self._recorder:
+            try:
+                self._recorder.record_event("session_stop", {"duration_s": 0})
+                result = self._recorder.stop()
+                await _finalize_capture_in_db(result, self._db_session_id)
+            except Exception as e:
+                logger.warning("[session] Recorder stop failed: %s", e)
+            self._recorder = None
         if self._sentence_buffer:
             await self._sentence_buffer.stop()
         if self._deepgram:
@@ -347,6 +366,12 @@ class ServiceSession:
     async def _on_final(self, text: str, audio_start: float, audio_end: float):
         logger.info("[session:%s] STT final: %s", self._church_id, text)
         await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
+        if self._recorder:
+            _stt_ts = _now()
+            self._recorder.record_event("stt_final", {
+                "text": text, "audio_start": audio_start, "audio_end": audio_end, "ts": _stt_ts,
+            })
+            self._recorder.record_timing("stt", _stt_ts)
         # Clean noise artifacts before segmentation; broadcast keeps the raw text.
         clean = _clean_stt(text)
         if clean != text:
@@ -385,6 +410,12 @@ class ServiceSession:
     async def _on_sentence(self, text: str, audio_start: float, audio_end: float, flush_reason: str):
         ts = _now()
         terminal_incomplete = flush_reason == "session_close" and _is_incomplete(text)
+        if self._recorder:
+            self._recorder.record_event("sentence_flush", {
+                "text": text, "flush_reason": flush_reason,
+                "audio_start": audio_start, "audio_end": audio_end, "ts": ts,
+            })
+            self._recorder.record_timing("sentence", ts)
         logger.info("[session:%s] Sentence flushed: %s", self._church_id, text)
         await self._broadcast({
             "type": "final_spanish",
@@ -446,6 +477,9 @@ class ServiceSession:
         if timing.get("terminal_incomplete"):
             english = _format_deferred_release_text(english, english)
         logger.info("[session:%s] Translation: %s -> %s", self._church_id, spanish[:200], english[:200])
+        if self._recorder:
+            self._recorder.record_event("translation", {"spanish": spanish, "english": english, "ts": ts})
+            self._recorder.record_timing("translation", ts)
         await self._broadcast({
             "type": "translation",
             "spanish": spanish,
@@ -522,6 +556,9 @@ class ServiceSession:
         """LLM enrichment completed (with or without a translation change).
         Marks the sentence settled so late-arriving corrections are suppressed."""
         self._enrichment_settled.add(ts)
+        if self._recorder:
+            self._recorder.record_event("enrichment_settled", {"ts": ts})
+            self._recorder.record_timing("enrichment", ts)
 
     async def _hydrate_detected_verse(self, verse: dict) -> dict:
         payload = dict(verse)
@@ -682,6 +719,8 @@ class ServiceSession:
             "stt_noise_removed_count": self._stt_noise_removed_count,
             "_enrichment_settled_size": len(self._enrichment_settled),
             "session_id": self._db_session_id,
+            "latency_ms": self._recorder.compute_latency() if self._recorder else {},
+            "capture_active": self._recorder is not None,
         }
 
     async def _broadcast(self, event: dict):
@@ -692,6 +731,24 @@ class ServiceSession:
             await self._ws.send_json(msg)
         except Exception:
             pass
+
+
+async def _finalize_capture_in_db(result: CaptureResult, session_id: int | None) -> None:
+    """Persist capture file paths and metrics to the session_captures table."""
+    if not session_id:
+        return
+    from server.db.sessions import create_capture_record, finalize_capture
+    try:
+        capture_id = await create_capture_record(session_id)
+        await finalize_capture(
+            capture_id,
+            audio_path=result.audio_path or "",
+            events_path=result.events_path or "",
+            duration_s=result.duration_s,
+            segment_count=result.segment_count,
+        )
+    except Exception as e:
+        logger.warning("[session] DB capture finalize failed: %s", e)
 
 
 class SessionManager:

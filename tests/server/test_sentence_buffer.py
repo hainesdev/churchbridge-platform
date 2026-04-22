@@ -34,7 +34,7 @@ class Collector:
     def __init__(self):
         self.calls: list[tuple[str, float, float]] = []
 
-    async def on_sentence(self, text: str, audio_start: float, audio_end: float):
+    async def on_sentence(self, text: str, audio_start: float, audio_end: float, reason: str = ""):
         self.calls.append((text, audio_start, audio_end))
 
     @property

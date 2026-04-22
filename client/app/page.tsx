@@ -39,6 +39,12 @@ export default function Home() {
           >
             Translation Test
           </Link>
+          <Link
+            href="/diagnostics/default"
+            className="block w-full py-3 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg text-center font-medium transition-colors"
+          >
+            Diagnostics
+          </Link>
         </div>
       </div>
     </main>

@@ -30,3 +30,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Session capture outputs
+tests/audio/captured/
+logs/

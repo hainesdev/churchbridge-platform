@@ -12,7 +12,7 @@ from server.db.bible_text import (
 )
 from server.db.glossary import get_glossary, upsert_glossary_term, delete_glossary_term
 from server.db.church_terms import load_church_terms, upsert_term
-from server.db.sessions import get_full_transcript
+from server.db.sessions import get_full_transcript, list_captures_for_church
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/churches/{church_id}", tags=["services"])
@@ -123,6 +123,55 @@ async def get_session_stats(church_id: str):
     return session.get_stats()
 
 
+@router.get("/captures")
+async def list_captures(church_id: str, limit: int = 20):
+    """Return past session captures (audio + event log paths) for this church."""
+    captures = await list_captures_for_church(church_id, limit=min(limit, 100))
+    return {"captures": captures}
+
+
+@router.post("/capture/start")
+async def start_capture(church_id: str):
+    """Enable recording for the active session. No-op if already recording."""
+    if _session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+    session = _session_manager.get(church_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No active session for this church")
+    if session._recorder is not None:
+        return {"ok": True, "already_active": True}
+    from server.services.session_recorder import SessionRecorder
+    session._recorder = SessionRecorder(session._db_session_id, session._church_id)
+    session._recorder.record_event("session_start", {
+        "church_id": church_id, "sample_rate": session._sample_rate,
+    })
+    return {"ok": True, "already_active": False}
+
+
+@router.post("/capture/stop")
+async def stop_capture(church_id: str):
+    """Stop and flush the active capture for this church's session."""
+    if _session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+    session = _session_manager.get(church_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No active session for this church")
+    if session._recorder is None:
+        raise HTTPException(status_code=409, detail="No capture is active")
+    result = session._recorder.stop()
+    session._recorder = None
+    from server.services.session_manager import _finalize_capture_in_db
+    await _finalize_capture_in_db(result, session._db_session_id)
+    return {
+        "ok": True,
+        "audio_path": result.audio_path,
+        "events_path": result.events_path,
+        "duration_s": result.duration_s,
+        "segment_count": result.segment_count,
+        "latency_ms": result.latency_ms,
+    }
+
+
 @router.get("/sessions/{session_id}/transcript")
 async def get_transcript(church_id: str, session_id: int):
     """Return the full transcript for a session."""
@@ -137,6 +186,38 @@ async def get_transcript(church_id: str, session_id: int):
         raise HTTPException(status_code=404, detail="Session not found")
     segments = await get_full_transcript(session_id)
     return {"session_id": session_id, "segments": segments}
+
+
+@router.get("/sessions/{session_id}/verses")
+async def get_session_verses(church_id: str, session_id: int):
+    """Return all verse detections for a past session."""
+    from server.db.index import get_db
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT church_id FROM service_sessions WHERE id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+    if not row or row[0] != church_id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    from server.db.verses import get_session_verse_detections
+    verses = await get_session_verse_detections(session_id)
+    return {"session_id": session_id, "verses": verses}
+
+
+@router.get("/sessions/{session_id}/modes")
+async def get_session_modes(church_id: str, session_id: int):
+    """Return all sermon mode transitions for a past session."""
+    from server.db.index import get_db
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT church_id FROM service_sessions WHERE id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+    if not row or row[0] != church_id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    from server.db.modes import get_session_mode_transitions
+    transitions = await get_session_mode_transitions(session_id)
+    return {"session_id": session_id, "transitions": transitions}
 
 
 # —— Bible corpus API ————————————————————————————————————————————————————————————————

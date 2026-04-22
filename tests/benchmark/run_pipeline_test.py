@@ -75,18 +75,23 @@ MAX_DEFAULT_DURATION_S = 30.0
 
 def find_audio_files(audio_dir: Path) -> tuple[Path, Path]:
     mp3s = list(audio_dir.glob("*.mp3"))
+    wavs = list(audio_dir.glob("*.wav"))
     srts = list(audio_dir.glob("*.srt"))
-    if not mp3s:
-        raise FileNotFoundError(f"No .mp3 found in {audio_dir}")
+    audio_files = mp3s or wavs  # prefer MP3 if both present
+    if not audio_files:
+        raise FileNotFoundError(f"No .mp3 or .wav found in {audio_dir}")
     if not srts:
         raise FileNotFoundError(f"No .srt found in {audio_dir}")
-    return mp3s[0], srts[0]
+    return audio_files[0], srts[0]
 
 
 def clip_audio(mp3_path: Path, duration_s: float, start_offset_s: float = 0.0) -> tuple[np.ndarray, int]:
-    """Load an MP3 window and return (float32 mono samples, sample_rate)."""
+    """Load an MP3 or WAV window and return (float32 mono samples, sample_rate)."""
     print(f"Loading {mp3_path.name}...")
-    audio = AudioSegment.from_mp3(str(mp3_path))
+    if mp3_path.suffix.lower() == ".wav":
+        audio = AudioSegment.from_wav(str(mp3_path))
+    else:
+        audio = AudioSegment.from_mp3(str(mp3_path))
     total_duration_s = len(audio) / 1000
     if start_offset_s < 0:
         raise ValueError("start_offset_s must be >= 0")
