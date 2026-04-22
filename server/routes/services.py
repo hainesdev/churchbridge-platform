@@ -111,16 +111,16 @@ async def list_sessions(church_id: str, limit: int = 10):
 async def get_session_stats(church_id: str):
     """Return live operational metrics for the active session of this church.
 
-    Exposes sentence buffer flush counters, LLM enrichment metrics,
-    STT noise removal count, and enrichment_settled set size.
-    Returns 404 if no active session exists for this church.
+    Always returns 200. When no session is active, returns {"active": false}
+    so the diagnostics client can poll silently without triggering browser
+    console errors from 404 responses.
     """
     if _session_manager is None:
         raise HTTPException(status_code=503, detail="Session manager not initialized")
     session = _session_manager.get(church_id)
     if session is None:
-        raise HTTPException(status_code=404, detail="No active session for this church")
-    return session.get_stats()
+        return {"active": False}
+    return {"active": True, **session.get_stats()}
 
 
 @router.get("/captures")

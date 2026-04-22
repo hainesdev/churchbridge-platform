@@ -54,13 +54,14 @@ export function useSessionStats(churchId: string, intervalMs = 2000) {
         const res = await fetch(
           `${getApiBaseUrl()}/api/churches/${encodeURIComponent(churchId)}/stats`
         );
-        if (res.status === 404) {
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.active) {
           setStats(null);
           setIdle(true);
           return;
         }
-        if (!res.ok) return;
-        setStats(await res.json());
+        setStats(data);
         setIdle(false);
       } catch {
         // Keep stale data on transient network errors
