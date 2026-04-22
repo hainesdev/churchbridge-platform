@@ -17,9 +17,9 @@ The public proxy serves the site on `https://churchbridge.dhaines.dev`, routes `
 - `deploy/docker-compose.prod.yml`: production compose stack
 - `deploy/api.Dockerfile`: backend image
 - `deploy/web.Dockerfile`: frontend image
-- `deploy/nginx/churchbridge.dhaines.dev.conf`: vhost config to copy into the shared proxy
+- `deploy/nginx/churchbridge.dhaines.dev.conf`: vhost config for the shared Nginx proxy — **installed automatically by `deploy.sh`** into `/var/www/dhaines.dev/nginx/conf.d/churchbridge.conf` on every deploy. Also committed to the `dhaines.dev` repo as a belt-and-suspenders backup.
 - `deploy/.env.production.example`: production env template
-- `deploy/scripts/deploy.sh`: build and restart the stack
+- `deploy/scripts/deploy.sh`: build and restart the stack, install the nginx vhost config, and reload `dhaines_nginx`
 - `deploy/scripts/sync-db.sh`: copies `data/churchbridge.db` into the Docker volume before deploy when present
 - `deploy/scripts/deploy-ref.sh`: deploy a specific Git SHA/ref from `main`
 - `deploy/scripts/update-if-needed.sh`: pull `main` and redeploy when changed
@@ -32,12 +32,12 @@ The public proxy serves the site on `https://churchbridge.dhaines.dev`, routes `
 1. Clone this repo to `/var/www/churchbridge-ai`.
 2. Create `/var/www/churchbridge-ai/.env.production` from `deploy/.env.production.example`.
 3. Copy the production SQLite file to `/var/www/churchbridge-ai/data/churchbridge.db`.
-4. Copy `deploy/nginx/churchbridge.dhaines.dev.conf` into `/var/www/dhaines.dev/nginx/conf.d/`.
-5. Add the `churchbridge` DNS record in DigitalOcean pointing to `167.71.84.35`.
-6. Reload the shared Nginx container after the HTTP config is present.
-7. Issue a certificate with the existing Certbot container and webroot volume.
-8. Run `deploy/scripts/deploy.sh`.
-9. Install and enable the systemd timer for automatic updates.
+4. Add the `churchbridge` DNS record in DigitalOcean pointing to `167.71.84.35`.
+5. Issue a certificate with the existing Certbot container and webroot volume: `docker compose -f /var/www/dhaines.dev/docker-compose.yml run --rm certbot certonly --webroot -w /var/www/certbot -d churchbridge.dhaines.dev`.
+6. Run `deploy/scripts/deploy.sh` — this installs the nginx vhost config, reloads `dhaines_nginx`, and brings up the stack.
+7. Install and enable the systemd timer for automatic updates.
+
+> **Note:** Step 4 in the old bootstrap ("copy the nginx config manually") is now handled automatically by `deploy.sh`.
 
 ## GitHub Actions deployment
 
@@ -71,14 +71,25 @@ gh run view --log
 ## Useful commands
 
 ```bash
+# ChurchBridge containers
 cd /var/www/churchbridge-ai
 docker compose -f deploy/docker-compose.prod.yml ps
 docker compose -f deploy/docker-compose.prod.yml logs -f api
 docker compose -f deploy/docker-compose.prod.yml logs -f web
 ./deploy/scripts/deploy.sh
-./deploy/scripts/update-if-needed.sh
+
+# Auto-deploy timer
 systemctl status churchbridge-ai-autodeploy.timer
 journalctl -u churchbridge-ai-autodeploy.service -n 100 --no-pager
+./deploy/scripts/update-if-needed.sh
+
+# Shared Nginx proxy (dhaines_nginx)
+docker exec dhaines_nginx nginx -t              # test config before reload
+docker exec dhaines_nginx nginx -s reload       # reload config + re-resolve upstream IPs
+docker logs dhaines_nginx --tail 50             # nginx access/error logs
+
+# SSL certificates (via dhainesdev_certbot_conf volume)
+docker run --rm -v dhainesdev_certbot_conf:/etc/letsencrypt certbot/certbot:latest certificates
 ```
 
 ## Notes
@@ -88,3 +99,6 @@ journalctl -u churchbridge-ai-autodeploy.service -n 100 --no-pager
 - The Bible corpus should also exist at `/var/www/churchbridge-ai/data/churchbridge.db` on the server. `deploy/scripts/sync-db.sh` seeds the Docker volume from that file before each deploy.
 - The auto-deploy timer is pull-based. It checks `origin/main` every 5 minutes, hard-resets to that commit, and rebuilds only when the commit SHA changes.
 - The GitHub Actions workflow is a better default control plane than the polling timer because it deploys the exact pushed SHA immediately and gives you logs in GitHub. Keep the timer only as a fallback if you still want pull-based recovery.
+- **Nginx vhost config**: `deploy/nginx/churchbridge.dhaines.dev.conf` is the source of truth. `deploy.sh` copies it to `/var/www/dhaines.dev/nginx/conf.d/churchbridge.conf` on every deploy, so the file survives a re-clone or reset of the `dhaines.dev` directory. The same file is also committed to the `dhaines.dev` repo as a fallback.
+- **Nginx reload**: `deploy.sh` reloads `dhaines_nginx` after every `docker compose up`. This is required because container recreation assigns new IP addresses; without a reload, Nginx routes to the old (dead) IPs and returns 502.
+- **GitHub Actions health check timing**: The workflow fires the health check immediately after `docker compose up` returns. The API container has a Docker health check with `start_period: 20s` (so Compose waits for it), but the web container starts after the API and needs a few additional seconds. A transient 502 from the health check step does not mean the deploy failed — verify with `curl https://churchbridge.dhaines.dev/health` directly.
