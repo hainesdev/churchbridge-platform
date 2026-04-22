@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import base64
+import struct
 
 from server.routes import mobile_diagnostics
 from server.services.mobile_diagnostics import MobileDiagnosticsHub
@@ -80,3 +82,29 @@ def test_report_ingestion_updates_command_status_and_report_listing():
     reports = reports_response.json()["reports"]
     assert len(reports) == 1
     assert reports[0]["command_id"] == command["id"]
+
+
+def test_audio_chunk_analysis_reports_non_silent_signal():
+    client, _, _ = build_client()
+    samples = [0.0, 0.02, -0.03, 0.05, -0.04, 0.01, 0.0, -0.015] * 200
+    raw = struct.pack(f"<{len(samples)}f", *samples)
+    audio_base64 = base64.b64encode(raw).decode("ascii")
+
+    response = client.post(
+        "/api/churches/christ-fellowship/mobile-diagnostics/analyses/audio-chunk",
+        json={
+            "audio_base64": audio_base64,
+            "sample_rate": 16000,
+            "label": "probe-chunk",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["church_id"] == "christ-fellowship"
+    assert body["label"] == "probe-chunk"
+    assert body["byte_length"] == len(raw)
+    assert body["analysis"]["float32"]["sample_count"] == len(samples)
+    assert body["analysis"]["float32"]["looks_silent"] is False
+    assert body["analysis"]["float32"]["looks_like_speech_energy"] is True
+    assert body["analysis"]["pcm16"]["sample_count"] == len(samples)

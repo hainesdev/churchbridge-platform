@@ -1,8 +1,11 @@
 import logging
+import base64
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+from server.services.mobile_diagnostics import analyze_float32_audio_bytes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/churches/{church_id}/mobile-diagnostics", tags=["mobile-diagnostics"])
@@ -33,6 +36,12 @@ class DiagnosticsReportIn(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     device: dict[str, Any] = Field(default_factory=dict)
     app: dict[str, Any] = Field(default_factory=dict)
+
+
+class DiagnosticsAudioChunkIn(BaseModel):
+    audio_base64: str = Field(..., min_length=1)
+    sample_rate: int = Field(default=16_000, ge=1)
+    label: str | None = None
 
 
 @router.post("/commands")
@@ -85,3 +94,23 @@ async def ingest_mobile_diagnostics_report(church_id: str, body: DiagnosticsRepo
         report.get("command_id"),
     )
     return {"ok": True, "report": report}
+
+
+@router.post("/analyses/audio-chunk")
+async def analyze_mobile_diagnostics_audio_chunk(church_id: str, body: DiagnosticsAudioChunkIn):
+    try:
+        raw = base64.b64decode(body.audio_base64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 audio payload: {exc}") from exc
+
+    if not raw:
+        raise HTTPException(status_code=400, detail="Audio payload decoded to zero bytes")
+
+    analysis = analyze_float32_audio_bytes(raw, sample_rate=body.sample_rate)
+    return {
+        "church_id": church_id,
+        "label": body.label,
+        "sample_rate": body.sample_rate,
+        "byte_length": len(raw),
+        "analysis": analysis,
+    }

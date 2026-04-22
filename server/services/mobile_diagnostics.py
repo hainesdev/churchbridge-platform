@@ -6,9 +6,104 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
+
+from server.services.audio_utils import resample_float32_to_pcm16
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def analyze_float32_audio_bytes(data: bytes, sample_rate: int) -> dict[str, Any]:
+    """Analyze raw Float32 LE mono audio similar to the live ingest path."""
+
+    samples = np.frombuffer(data, dtype=np.float32)
+    finite_mask = np.isfinite(samples)
+    finite_samples = samples[finite_mask]
+
+    if finite_samples.size == 0:
+        float_stats = {
+            "sample_count": int(samples.size),
+            "duration_ms": 0.0,
+            "finite_sample_count": 0,
+            "nan_count": int(np.isnan(samples).sum()),
+            "inf_count": int(np.isinf(samples).sum()),
+            "rms": 0.0,
+            "peak": 0.0,
+            "mean_abs": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "near_zero_ratio": 1.0,
+            "clipping_ratio": 0.0,
+            "zero_crossing_ratio": 0.0,
+            "looks_silent": True,
+            "looks_clipped": False,
+            "looks_like_speech_energy": False,
+            "sample_preview": [],
+        }
+        pcm16_stats = {
+            "sample_count": 0,
+            "duration_ms": 0.0,
+            "rms": 0.0,
+            "peak": 0,
+            "mean_abs": 0.0,
+            "min": 0,
+            "max": 0,
+            "near_zero_ratio": 1.0,
+            "zero_crossing_ratio": 0.0,
+        }
+        return {"float32": float_stats, "pcm16": pcm16_stats}
+
+    abs_samples = np.abs(finite_samples)
+    rms = float(np.sqrt(np.mean(np.square(finite_samples))))
+    peak = float(abs_samples.max(initial=0.0))
+    near_zero_ratio = float(np.mean(abs_samples < 1e-3))
+    clipping_ratio = float(np.mean(abs_samples >= 0.98))
+    zero_crossing_ratio = 0.0
+    if finite_samples.size > 1:
+        zero_crossing_ratio = float(np.mean(np.diff(np.signbit(finite_samples)).astype(np.float32)))
+
+    pcm16 = np.frombuffer(
+        resample_float32_to_pcm16(data, src_rate=sample_rate, dst_rate=16000),
+        dtype=np.int16,
+    )
+    pcm16_abs = np.abs(pcm16.astype(np.int32)) if pcm16.size else np.array([], dtype=np.int32)
+    pcm16_zero_crossings = 0.0
+    if pcm16.size > 1:
+        pcm16_zero_crossings = float(np.mean(np.diff(np.signbit(pcm16)).astype(np.float32)))
+
+    float_stats = {
+        "sample_count": int(samples.size),
+        "duration_ms": round((float(samples.size) / max(sample_rate, 1)) * 1000, 2),
+        "finite_sample_count": int(finite_samples.size),
+        "nan_count": int(np.isnan(samples).sum()),
+        "inf_count": int(np.isinf(samples).sum()),
+        "rms": round(rms, 6),
+        "peak": round(peak, 6),
+        "mean_abs": round(float(abs_samples.mean()), 6),
+        "min": round(float(finite_samples.min(initial=0.0)), 6),
+        "max": round(float(finite_samples.max(initial=0.0)), 6),
+        "near_zero_ratio": round(near_zero_ratio, 6),
+        "clipping_ratio": round(clipping_ratio, 6),
+        "zero_crossing_ratio": round(zero_crossing_ratio, 6),
+        "looks_silent": bool(rms < 0.005 and near_zero_ratio > 0.9),
+        "looks_clipped": bool(clipping_ratio > 0.05),
+        "looks_like_speech_energy": bool(rms >= 0.01 and peak >= 0.03 and near_zero_ratio < 0.98),
+        "sample_preview": [round(float(value), 6) for value in finite_samples[:16]],
+    }
+    pcm16_stats = {
+        "sample_count": int(pcm16.size),
+        "duration_ms": round((float(pcm16.size) / 16000) * 1000, 2),
+        "rms": round(float(np.sqrt(np.mean(np.square(pcm16.astype(np.float32))))) if pcm16.size else 0.0, 3),
+        "peak": int(pcm16_abs.max(initial=0)) if pcm16.size else 0,
+        "mean_abs": round(float(pcm16_abs.mean()) if pcm16.size else 0.0, 3),
+        "min": int(pcm16.min(initial=0)) if pcm16.size else 0,
+        "max": int(pcm16.max(initial=0)) if pcm16.size else 0,
+        "near_zero_ratio": round(float(np.mean(pcm16_abs <= 16)) if pcm16.size else 1.0, 6),
+        "zero_crossing_ratio": round(pcm16_zero_crossings, 6),
+    }
+    return {"float32": float_stats, "pcm16": pcm16_stats}
 
 
 class MobileDiagnosticsHub:
