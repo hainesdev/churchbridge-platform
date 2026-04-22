@@ -9,8 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from server.db.index import init_db
 from server.services.broadcaster import Broadcaster
+from server.services.mobile_diagnostics import MobileDiagnosticsHub
 from server.services.session_manager import SessionManager
-from server.routes import stream, display, listen, services
+from server.routes import stream, display, listen, services, mobile_diagnostics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +27,7 @@ for key in REQUIRED:
         raise RuntimeError(f"Missing required environment variable: {key}")
 
 broadcaster = Broadcaster()
+mobile_diagnostics_hub = MobileDiagnosticsHub()
 session_manager: SessionManager | None = None
 
 
@@ -39,6 +41,8 @@ async def lifespan(app: FastAPI):
     services.set_session_manager(session_manager)
     display.set_broadcaster(broadcaster)
     listen.set_broadcaster(broadcaster)
+    mobile_diagnostics.set_broadcaster(broadcaster)
+    mobile_diagnostics.set_mobile_diagnostics_hub(mobile_diagnostics_hub)
     yield
     await broadcaster.disconnect()
 
@@ -56,6 +60,7 @@ app.include_router(stream.router)
 app.include_router(display.router)
 app.include_router(listen.router)
 app.include_router(services.router)
+app.include_router(mobile_diagnostics.router)
 
 
 @app.get("/health")
