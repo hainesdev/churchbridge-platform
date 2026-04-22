@@ -719,7 +719,11 @@ class ServiceSession:
             "stt_noise_removed_count": self._stt_noise_removed_count,
             "_enrichment_settled_size": len(self._enrichment_settled),
             "session_id": self._db_session_id,
-            "latency_ms": self._recorder.compute_latency() if self._recorder else {},
+            "latency_ms": self._recorder.compute_latency() if self._recorder else {
+                "stt_to_sentence": {"p50": None, "p90": None, "count": 0},
+                "sentence_to_translation": {"p50": None, "p90": None, "count": 0},
+                "translation_to_enrichment": {"p50": None, "p90": None, "count": 0},
+            },
             "capture_active": self._recorder is not None,
         }
 
