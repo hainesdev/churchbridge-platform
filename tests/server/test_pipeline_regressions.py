@@ -532,6 +532,7 @@ class TestSessionCloseIncompleteMetadata:
             session._pending_audio_timing = {}
             session._enrichment_settled = set()
             session._db_session_id = None
+            session._recorder = None
 
             await session._on_sentence(
                 "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
@@ -566,6 +567,7 @@ class TestSessionCloseIncompleteMetadata:
             session._broadcaster = _StubBroadcaster()
             session._db_session_id = None
             session._enrichment = None
+            session._recorder = None
             session._pending_audio_timing = {
                 1000: {
                     "audio_start": 0.0,

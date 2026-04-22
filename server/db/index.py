@@ -72,6 +72,17 @@ CREATE TABLE IF NOT EXISTS sermon_mode_transitions (
     occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS session_captures (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL REFERENCES service_sessions(id),
+    audio_path      TEXT NOT NULL DEFAULT '',
+    events_path     TEXT NOT NULL DEFAULT '',
+    duration_s      REAL,
+    segment_count   INTEGER,
+    started_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at        TEXT
+);
+
 CREATE TABLE IF NOT EXISTS bible_versions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     source_key        TEXT NOT NULL UNIQUE,
