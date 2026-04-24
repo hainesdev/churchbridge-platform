@@ -502,6 +502,7 @@ class ServiceSession:
             spanish=spanish,
             english=english,
             source="google",
+            phrase_alignment=None,
             delay_s=PREFERRED_COMMIT_DELAY_S,
         )
         if self._enrichment:
@@ -551,6 +552,7 @@ class ServiceSession:
         if ts in self._pending_feed_commits:
             self._pending_feed_commits[ts]["english"] = english
             self._pending_feed_commits[ts]["source"] = "google"
+            self._pending_feed_commits[ts]["phrase_alignment"] = None
             await self._broadcast_live_translation(
                 text=english,
                 source="google_correction",
@@ -563,6 +565,7 @@ class ServiceSession:
             english=english,
             source="google",
             reason="forward_context_correction",
+            phrase_alignment=None,
         )
 
     # --- LLM Enrichment callbacks ---
@@ -582,7 +585,7 @@ class ServiceSession:
                 "[session:%s] Buffer hold from enrichment: %s (%.1fs)", self._church_id, reason, hold_secs
             )
 
-    async def _on_translation_update(self, ts: int, english: str):
+    async def _on_translation_update(self, ts: int, english: str, phrase_alignment: list[dict] | None = None):
         """LLM-improved translation; replaces the Google translation on the display."""
         logger.info("[session:%s] Translation update ts=%d: %s", self._church_id, ts, english[:200])
         self._enrichment_settled.add(ts)
@@ -590,6 +593,7 @@ class ServiceSession:
             pending = self._pending_feed_commits[ts]
             pending["english"] = english
             pending["source"] = "llm"
+            pending["phrase_alignment"] = phrase_alignment
             await self._broadcast_live_translation(
                 text=english,
                 source="llm",
@@ -603,6 +607,7 @@ class ServiceSession:
             english=english,
             source="llm",
             reason="context_repair",
+            phrase_alignment=phrase_alignment,
         )
 
     async def _on_enrichment_settled(self, ts: int):
@@ -729,6 +734,7 @@ class ServiceSession:
             pending["spanish"] = merged_spanish
             pending["english"] = merged_english
             pending["source"] = "llm"
+            pending["phrase_alignment"] = None
             await self._broadcast_live_translation(
                 text=merged_english,
                 source="llm",
@@ -750,6 +756,7 @@ class ServiceSession:
                 spanish=merged_spanish,
                 source="llm",
                 reason="segmentation_repair",
+                phrase_alignment=None,
             )
 
     async def _on_segment_metadata(self, ts: int, metadata: dict):
@@ -831,6 +838,7 @@ class ServiceSession:
         spanish: str,
         english: str,
         source: str,
+        phrase_alignment: list[dict] | None,
         delay_s: float,
     ) -> None:
         await self._drop_pending_commit(segment_id)
@@ -839,6 +847,7 @@ class ServiceSession:
             "spanish": spanish,
             "english": english,
             "source": source,
+            "phrase_alignment": phrase_alignment,
             "task": task,
         }
 
@@ -870,6 +879,7 @@ class ServiceSession:
             spanish=pending["spanish"],
             english=pending["english"],
             source=pending["source"],
+            phrase_alignment=pending.get("phrase_alignment"),
         )
         await self._broadcast_live_translation_clear(reason="committed", segment_id=segment_id)
         self._committed_segment_ids.add(segment_id)
@@ -938,14 +948,18 @@ class ServiceSession:
         spanish: str,
         english: str,
         source: str,
+        phrase_alignment: list[dict] | None,
     ) -> None:
-        await self._broadcast({
+        payload = {
             "type": "feed_commit",
             "spanish": spanish,
             "english": english,
             "source": source,
             **self._segment_ref(segment_id),
-        })
+        }
+        if phrase_alignment:
+            payload["phrase_alignment"] = phrase_alignment
+        await self._broadcast(payload)
 
     async def _broadcast_feed_revision(
         self,
@@ -954,6 +968,7 @@ class ServiceSession:
         source: str,
         reason: str,
         spanish: str | None = None,
+        phrase_alignment: list[dict] | None = None,
     ) -> None:
         payload = {
             "type": "feed_revision",
@@ -964,6 +979,8 @@ class ServiceSession:
         }
         if spanish is not None:
             payload["spanish"] = spanish
+        if phrase_alignment:
+            payload["phrase_alignment"] = phrase_alignment
         await self._broadcast(payload)
 
     async def _send(self, msg: dict):

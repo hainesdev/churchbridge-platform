@@ -27,6 +27,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
   } | null>(null);
 
   const [scrolledUp, setScrolledUp] = useState(false);
+  const [revealedPhraseBySegment, setRevealedPhraseBySegment] = useState<Record<number, string | null>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
 
@@ -102,6 +103,62 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       ))}
     </div>
   ), []);
+
+  const togglePhraseReveal = useCallback((segmentId: number, phraseId: string) => {
+    setRevealedPhraseBySegment(prev => ({
+      ...prev,
+      [segmentId]: prev[segmentId] === phraseId ? null : phraseId,
+    }));
+  }, []);
+
+  const renderAlignedEnglish = useCallback((segment: typeof segments[number], tone: string) => {
+    const phraseAlignment = segment.phraseAlignment ?? [];
+    if (phraseAlignment.length === 0) {
+      return (
+        <p className={tone}>
+          {segment.english}
+        </p>
+      );
+    }
+
+    const revealedId = revealedPhraseBySegment[segment.id] ?? null;
+    const revealedPhrase = phraseAlignment.find((phrase) => `${phrase.english_text}|${phrase.spanish_text}` === revealedId);
+
+    return (
+      <div className="space-y-3">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-gray-500">
+          Tap English to reveal the Spanish phrase
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {phraseAlignment.map((phrase) => {
+            const phraseId = `${phrase.english_text}|${phrase.spanish_text}`;
+            const active = revealedId === phraseId;
+            return (
+              <button
+                key={phraseId}
+                onClick={() => togglePhraseReveal(segment.id, phraseId)}
+                className={`rounded-2xl border px-3 py-2 text-left text-sm font-semibold transition-colors ${
+                  active
+                    ? 'border-blue-200 bg-blue-100 text-black'
+                    : 'border-white/10 bg-white/5 text-white hover:bg-white/10'
+                }`}
+              >
+                {phrase.english_text}
+              </button>
+            );
+          })}
+        </div>
+        {revealedPhrase ? (
+          <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-gray-500">Spanish</p>
+            <p className="mt-2 text-base leading-snug text-gray-300">{revealedPhrase.spanish_text}</p>
+          </div>
+        ) : (
+          <p className="text-sm text-gray-500">Spanish stays hidden until you tap a phrase.</p>
+        )}
+      </div>
+    );
+  }, [revealedPhraseBySegment, togglePhraseReveal]);
 
   const liveDock = liveEnglish ? (
     <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-6 py-4 backdrop-blur">
@@ -199,15 +256,16 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                   className="space-y-1"
                 >
                   <p className="text-3xl font-semibold leading-snug">{segment.spanish}</p>
-                  <p className={`text-lg leading-snug transition-all duration-500 ${
-                    segment.pendingCompletion
-                      ? 'text-blue-300/50 italic'
-                      : flashingId === segment.id
-                        ? 'text-blue-100'
-                        : 'text-blue-300'
-                  }`}>
-                    {segment.english}
-                  </p>
+                  {renderAlignedEnglish(
+                    segment,
+                    `text-lg leading-snug transition-all duration-500 ${
+                      segment.pendingCompletion
+                        ? 'text-blue-300/50 italic'
+                        : flashingId === segment.id
+                          ? 'text-blue-100'
+                          : 'text-blue-300'
+                    }`,
+                  )}
                   {renderVerseChips(segment)}
                 </motion.div>
               ))}
@@ -242,17 +300,20 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                 animate={{ opacity: 1, transition: { duration: 0.4 } }}
                 className="space-y-1"
               >
-                <p className={`text-3xl font-semibold leading-snug transition-all duration-[600ms] ${
-                  segment.pendingCompletion
-                    ? 'text-white/40 italic'
-                    : flashingId === segment.id
-                      ? 'text-blue-200'
-                      : ''
-                }`}>
-                  {segment.english}
-                </p>
+                {renderAlignedEnglish(
+                  segment,
+                  `text-3xl font-semibold leading-snug transition-all duration-[600ms] ${
+                    segment.pendingCompletion
+                      ? 'text-white/40 italic'
+                      : flashingId === segment.id
+                        ? 'text-blue-200'
+                        : ''
+                  }`,
+                )}
                 {renderVerseChips(segment)}
-                <p className="text-base text-gray-500 leading-snug">{segment.spanish}</p>
+                {(!segment.phraseAlignment || segment.phraseAlignment.length === 0) && (
+                  <p className="text-base text-gray-500 leading-snug">{segment.spanish}</p>
+                )}
               </motion.div>
             ))}
           </div>

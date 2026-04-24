@@ -30,6 +30,11 @@ export interface VerseSuggestion {
   display_passage?: ScripturePassage | null;
 }
 
+export interface PhraseAlignment {
+  english_text: string;
+  spanish_text: string;
+}
+
 export interface ScripturePassageVerse {
   verse: number;
   text: string;
@@ -56,6 +61,7 @@ export interface Segment {
   id: number;
   spanish: string;
   english: string;
+  phraseAlignment?: PhraseAlignment[];
   verseDetected?: VerseDetection;
   verseSuggestions?: VerseSuggestion[];
   register?: TranslationRegister;
@@ -104,6 +110,19 @@ function messageMergeRef(msg: Record<string, unknown>): { keep: number | null; a
     keep: Number.isFinite(keep) ? keep : null,
     absorb: Number.isFinite(absorb) ? absorb : null,
   };
+}
+
+function messagePhraseAlignment(msg: Record<string, unknown>): PhraseAlignment[] | undefined {
+  const raw = msg.phrase_alignment;
+  if (!Array.isArray(raw)) return undefined;
+  const alignment = raw.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const english = typeof item.english_text === 'string' ? item.english_text.trim() : '';
+    const spanish = typeof item.spanish_text === 'string' ? item.spanish_text.trim() : '';
+    if (!english || !spanish) return [];
+    return [{ english_text: english, spanish_text: spanish }];
+  });
+  return alignment;
 }
 
 export function useTranslationFeed(churchId: string): TranslationFeed {
@@ -214,16 +233,17 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           }
           const english = String(msg.english ?? '');
           const spanish = String(msg.spanish ?? '');
+          const phraseAlignment = messagePhraseAlignment(msg) ?? [];
           setSegments(prev => {
             const existing = prev.some(segment => segment.id === segmentId);
             if (existing) {
               return prev.map(segment =>
                 segment.id === segmentId
-                  ? { ...segment, english, spanish, pendingCompletion: false }
+                  ? { ...segment, english, spanish, phraseAlignment, pendingCompletion: false }
                   : segment,
               );
             }
-            return [...prev.slice(-99), { id: segmentId, english, spanish }];
+            return [...prev.slice(-99), { id: segmentId, english, spanish, phraseAlignment }];
           });
           clearLiveIfMatches(segmentId);
           setLastCommittedEnglish(english);
@@ -239,6 +259,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           }
           const english = String(msg.english ?? '');
           const spanish = msg.spanish === undefined ? null : String(msg.spanish ?? '');
+          const phraseAlignment = messagePhraseAlignment(msg);
           let found = false;
           setSegments(prev => {
             const updated = prev.map(segment => {
@@ -248,6 +269,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
                 ...segment,
                 english,
                 spanish: spanish ?? segment.spanish,
+                phraseAlignment: phraseAlignment ?? segment.phraseAlignment,
                 pendingCompletion: false,
               };
             });
@@ -256,6 +278,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
               id: segmentId,
               english,
               spanish: spanish ?? '',
+              phraseAlignment: phraseAlignment ?? [],
               pendingCompletion: false,
             }];
           });
@@ -326,6 +349,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
                     ...segment,
                     english: String(msg.english ?? segment.english),
                     spanish: String(msg.spanish ?? segment.spanish),
+                    phraseAlignment: [],
                     pendingCompletion: false,
                     verseDetected: segment.verseDetected ?? absorbedSegment?.verseDetected,
                     verseSuggestions: segment.verseSuggestions ?? absorbedSegment?.verseSuggestions,

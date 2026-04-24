@@ -136,7 +136,19 @@ def make_json_result(
     thought_complete: bool = True,
     continuation_required: bool = False,
     discourse_tag: str = "statement",
+    phrase_alignment: list[tuple[str, str]] | None = None,
 ):
+    alignment_json = (
+        "[" +
+        ", ".join(
+            "{"
+            f"\"english_text\": {english!r}, "
+            f"\"spanish_text\": {spanish!r}"
+            "}"
+            for english, spanish in (phrase_alignment or [])
+        ) +
+        "]"
+    )
     return (
         "{"
         f"\"improved_translation\": {improved_translation!r}, "
@@ -150,6 +162,7 @@ def make_json_result(
         "\"translation_register\": \"expository\", "
         "\"sermon_mode\": \"exposition\", "
         f"\"display_ready\": {str(display_ready).lower()}, "
+        f"\"phrase_alignment\": {alignment_json}, "
         "\"verse_detected\": null"
         "}"
     ).replace("'", '"')
@@ -315,7 +328,7 @@ class TestDeferredRelease:
                 church_id="test",
                 church_terms={},
                 topic_tracker=StubTopicTracker(),
-                on_translation_update=lambda ts, english: updates.append((ts, english)) or asyncio.sleep(0),
+                on_translation_update=lambda ts, english, phrase_alignment=None: updates.append((ts, english, phrase_alignment)) or asyncio.sleep(0),
                 on_verse_detected=lambda *args: asyncio.sleep(0),
                 on_verse_range_update=lambda *args: asyncio.sleep(0),
                 on_verse_suggestion=lambda *args: asyncio.sleep(0),
@@ -329,7 +342,7 @@ class TestDeferredRelease:
             service._deferred_updates[123] = ("Same text", task)
             await asyncio.wait_for(task, timeout=7.5)
 
-            assert updates == [(123, "Same text")]
+            assert updates == [(123, "Same text", None)]
 
         run(run_())
 
@@ -340,7 +353,7 @@ class TestDeferredRelease:
                 church_id="test",
                 church_terms={},
                 topic_tracker=StubTopicTracker(),
-                on_translation_update=lambda ts, english: updates.append((ts, english)) or asyncio.sleep(0),
+                on_translation_update=lambda ts, english, phrase_alignment=None: updates.append((ts, english, phrase_alignment)) or asyncio.sleep(0),
                 on_verse_detected=lambda *args: asyncio.sleep(0),
                 on_verse_range_update=lambda *args: asyncio.sleep(0),
                 on_verse_suggestion=lambda *args: asyncio.sleep(0),
@@ -359,7 +372,7 @@ class TestDeferredRelease:
             await asyncio.wait_for(task, timeout=7.5)
 
             assert updates == [
-                (456, "Now, let's understand, phrase by phrase, word by word, what...")
+                (456, "Now, let's understand, phrase by phrase, word by word, what...", None)
             ]
 
         run(run_())
@@ -372,8 +385,8 @@ class TestTerminalIncompleteEnrichment:
             metadata = []
             settled = []
 
-            async def on_translation_update(ts, english):
-                updates.append((ts, english))
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
 
             async def on_segment_metadata(ts, payload):
                 metadata.append((ts, payload))
@@ -430,7 +443,7 @@ class TestTerminalIncompleteEnrichment:
             task = service._deferred_updates[1000][1]
             await asyncio.wait_for(task, timeout=7.5)
             assert updates == [
-                (1000, "Now, let's understand, phrase by phrase, word by word, what...")
+                (1000, "Now, let's understand, phrase by phrase, word by word, what...", None)
             ]
 
         run(run_())
@@ -483,8 +496,8 @@ class TestEnrichmentCloseDrain:
             updates = []
             settled = []
 
-            async def on_translation_update(ts, english):
-                updates.append((ts, english))
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
 
             async def on_enrichment_settled(ts):
                 settled.append(ts)
@@ -508,7 +521,7 @@ class TestEnrichmentCloseDrain:
             service.enrich("primero", "First", 1000)
             await service.close()
 
-            assert updates == [(1000, "Better First")]
+            assert updates == [(1000, "Better First", None)]
             assert settled == [1000]
 
         run(run_())
@@ -676,8 +689,8 @@ class TestTranslationRepairFallback:
             updates = []
             merges = []
 
-            async def on_translation_update(ts, english):
-                updates.append((ts, english))
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
 
             async def on_caption_merge(absorb_ts, keep_ts, merged_spanish, merged_english):
                 merges.append((absorb_ts, keep_ts, merged_spanish, merged_english))
@@ -743,6 +756,7 @@ class TestTranslationRepairFallback:
             assert updates[-1] == (
                 2000,
                 "What is the proof that we are in the light? We have fellowship with one another.",
+                None,
             )
 
         run(run_())
@@ -752,8 +766,8 @@ class TestTranslationRepairFallback:
             updates = []
             settled = []
 
-            async def on_translation_update(ts, english):
-                updates.append((ts, english))
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
 
             async def on_enrichment_settled(ts):
                 settled.append(ts)
@@ -795,7 +809,11 @@ class TestTranslationRepairFallback:
             )
 
             assert updates == [
-                (1000, "If we walk in the light, as he himself is in the light, we have fellowship with one another.")
+                (
+                    1000,
+                    "If we walk in the light, as he himself is in the light, we have fellowship with one another.",
+                    None,
+                )
             ]
             assert settled == [1000]
 
@@ -806,8 +824,8 @@ class TestTranslationRepairFallback:
             updates = []
             settled = []
 
-            async def on_translation_update(ts, english):
-                updates.append((ts, english))
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
 
             async def on_enrichment_settled(ts):
                 settled.append(ts)
@@ -848,5 +866,100 @@ class TestTranslationRepairFallback:
 
             assert updates == []
             assert settled == [1000]
+
+        run(run_())
+
+    def test_phrase_alignment_emits_when_translation_text_is_unchanged(self):
+        async def run_():
+            updates = []
+
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "Si andamos en luz, tenemos comunión unos con otros.": (
+                    0.01,
+                    make_json_result(
+                        "If we walk in the light, we have fellowship with one another.",
+                        phrase_alignment=[
+                            ("If we walk in the light", "Si andamos en luz"),
+                            ("we have fellowship", "tenemos comunión"),
+                            ("with one another", "unos con otros"),
+                        ],
+                    ),
+                ),
+            })
+
+            await service.enrich(
+                "Si andamos en luz, tenemos comunión unos con otros.",
+                "If we walk in the light, we have fellowship with one another.",
+                1000,
+            )
+
+            assert updates == [
+                (
+                    1000,
+                    "If we walk in the light, we have fellowship with one another.",
+                    [
+                        {"english_text": "If we walk in the light", "spanish_text": "Si andamos en luz"},
+                        {"english_text": "we have fellowship", "spanish_text": "tenemos comunión"},
+                        {"english_text": "with one another", "spanish_text": "unos con otros"},
+                    ],
+                )
+            ]
+
+        run(run_())
+
+    def test_invalid_phrase_alignment_is_dropped(self):
+        async def run_():
+            updates = []
+
+            async def on_translation_update(ts, english, phrase_alignment=None):
+                updates.append((ts, english, phrase_alignment))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "Tenemos comunión unos con otros.": (
+                    0.01,
+                    make_json_result(
+                        "We have fellowship with one another.",
+                        phrase_alignment=[
+                            ("Completely different", "tenemos comunión"),
+                            ("still wrong", "unos con otros"),
+                        ],
+                    ),
+                ),
+            })
+
+            await service.enrich(
+                "Tenemos comunión unos con otros.",
+                "We have fellowship with one another.",
+                1000,
+            )
+
+            assert updates == []
 
         run(run_())
