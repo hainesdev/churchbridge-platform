@@ -248,6 +248,8 @@ class ServiceSession:
         self._pending_feed_commits: dict[int, dict] = {}
         self._committed_segment_ids: set[int] = set()
         self._persisted_segment_ids: set[int] = set()
+        self._segment_text_cache: dict[int, dict[str, str]] = {}
+        self._segment_metadata_cache: dict[int, dict] = {}
         self._pending_segment_metadata: dict[int, dict] = {}
         self._pending_detected_verses: dict[int, dict] = {}
         self._pending_suggested_verses: dict[int, list[dict]] = {}
@@ -296,6 +298,7 @@ class ServiceSession:
             church_terms=church_terms,
             topic_tracker=self._topic_tracker,
             on_translation_update=self._on_translation_update,
+            on_phrase_alignment=self._on_phrase_alignment,
             on_verse_detected=self._on_verse_detected,
             on_verse_range_update=self._on_verse_range_update,
             on_verse_suggestion=self._on_verse_suggestion,
@@ -610,6 +613,23 @@ class ServiceSession:
             phrase_alignment=phrase_alignment,
         )
 
+    async def _on_phrase_alignment(self, ts: int, phrase_alignment: list[dict]):
+        if not phrase_alignment:
+            return
+        if ts in self._pending_feed_commits:
+            self._pending_feed_commits[ts]["phrase_alignment"] = phrase_alignment
+            return
+        cached = self._segment_text_cache.get(ts)
+        if not cached:
+            return
+        await self._broadcast_feed_revision(
+            segment_id=ts,
+            english=cached.get("english", ""),
+            source="llm",
+            reason="phrase_alignment",
+            phrase_alignment=phrase_alignment,
+        )
+
     async def _on_enrichment_settled(self, ts: int):
         """LLM enrichment completed (with or without a translation change).
         Marks the sentence settled so late-arriving corrections are suppressed."""
@@ -726,6 +746,8 @@ class ServiceSession:
         )
         keep_was_committed = keep_ts in self._committed_segment_ids
         await self._drop_pending_commit(absorb_ts)
+        self._segment_text_cache.pop(absorb_ts, None)
+        self._segment_metadata_cache.pop(absorb_ts, None)
         self._pending_segment_metadata.pop(absorb_ts, None)
         self._pending_detected_verses.pop(absorb_ts, None)
         self._pending_suggested_verses.pop(absorb_ts, None)
@@ -758,6 +780,15 @@ class ServiceSession:
                 reason="segmentation_repair",
                 phrase_alignment=None,
             )
+        if self._enrichment:
+            metadata = self._segment_metadata_cache.get(keep_ts, {})
+            self._enrichment.request_phrase_alignment(
+                ts=keep_ts,
+                spanish=merged_spanish,
+                english=merged_english,
+                source_quality=str(metadata.get("source_quality", "clean")),
+                translation_register=str(metadata.get("translation_register", "expository")),
+            )
 
     async def _on_segment_metadata(self, ts: int, metadata: dict):
         """Broadcast scaffolding metadata for a committed segment.
@@ -767,6 +798,7 @@ class ServiceSession:
         drive exact Bible verse text lookup once Bible versions are stored).
         """
         self._pending_segment_metadata[ts] = metadata
+        self._segment_metadata_cache[ts] = dict(metadata)
         if metadata.get("pending_completion") and ts in self._pending_feed_commits:
             pending = self._pending_feed_commits[ts]
             task = pending.get("task")
@@ -950,6 +982,10 @@ class ServiceSession:
         source: str,
         phrase_alignment: list[dict] | None,
     ) -> None:
+        self._segment_text_cache[segment_id] = {
+            "spanish": spanish,
+            "english": english,
+        }
         payload = {
             "type": "feed_commit",
             "spanish": spanish,
@@ -970,6 +1006,11 @@ class ServiceSession:
         spanish: str | None = None,
         phrase_alignment: list[dict] | None = None,
     ) -> None:
+        cached = self._segment_text_cache.get(segment_id, {})
+        self._segment_text_cache[segment_id] = {
+            "spanish": spanish if spanish is not None else cached.get("spanish", ""),
+            "english": english,
+        }
         payload = {
             "type": "feed_revision",
             "english": english,

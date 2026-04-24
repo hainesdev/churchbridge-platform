@@ -228,6 +228,8 @@ RULES:
     - If alignment is unclear or the source is too noisy, return []
     - The English side should reflect the displayed translation, not a literal gloss
 
+Alignment is handled in a separate follow-up step. Do not return phrase_alignment here.
+
 JSON schema (return exactly this shape):
 {
   "improved_translation": "string",
@@ -241,12 +243,6 @@ JSON schema (return exactly this shape):
   "translation_register": "scripture" | "expository" | "narrative" | "exhortation",
   "sermon_mode": "scripture" | "exposition" | "illustration" | "application" | "exhortation" | "procedural",
   "display_ready": true | false,
-  "phrase_alignment": [
-    {
-      "english_text": "string",
-      "spanish_text": "string"
-    }
-  ],
   "verse_detected": {
     "book": "string",
     "chapter": integer,
@@ -504,6 +500,43 @@ JSON schema:
 }
 """
 
+_ALIGNMENT_SYSTEM = """\
+You are a bilingual phrase-alignment assistant for a live church translation system.
+
+Return ONLY valid JSON. No prose, no markdown fences, no code blocks.
+
+Goal:
+- Given the final displayed English sentence and the original Spanish sentence,
+  return a short ordered phrase mapping for later reveal UI.
+- The displayed English is authoritative. If it is more polished than the Spanish,
+  use the Google English baseline and any scripture context only as grounding aids.
+
+Rules:
+- Return 1-8 items.
+- Prefer 2-6 items for normal sentences; 1 item is allowed only for very short lines.
+- Keep phrases short and readable: roughly 1-6 English words per item.
+- Preserve order from left to right.
+- Cover as much of the displayed English meaning as you reliably can.
+- The English side must reuse the displayed English wording, not a literal gloss.
+- The Spanish side must be the matching source wording from the spoken sentence.
+- Use the Google English baseline as a bridge when the displayed English has been polished.
+- If scripture context is provided, use it only to anchor wording that is already present.
+- Do not invent Spanish words that are not supported by the source sentence.
+- Do not return a whole sentence as one item unless the sentence is extremely short.
+- Avoid tiny standalone function-word fragments when they can be grouped naturally.
+- If alignment is unclear, noisy, or unreliable, return an empty list.
+
+JSON schema:
+{
+  "phrase_alignment": [
+    {
+      "english_text": "string",
+      "spanish_text": "string"
+    }
+  ]
+}
+"""
+
 
 def _strip_json_fences(raw: str) -> str:
     raw = raw.strip()
@@ -532,6 +565,42 @@ def _normalize_alignment_compare(text: str) -> str:
     return re.sub(r"[\W_]+", "", text.lower())
 
 
+def _ordered_alignment_coverage(chunks: list[str], chosen_english: str) -> float:
+    normalized_chosen = _normalize_alignment_compare(chosen_english)
+    if not normalized_chosen:
+        return 0.0
+    cursor = 0
+    matched = 0
+    for chunk in chunks:
+        normalized_chunk = _normalize_alignment_compare(chunk)
+        if not normalized_chunk:
+            continue
+        index = normalized_chosen.find(normalized_chunk, cursor)
+        if index < 0:
+            return 0.0
+        matched += len(normalized_chunk)
+        cursor = index + len(normalized_chunk)
+    return matched / len(normalized_chosen)
+
+
+def _alignment_allowed(
+    *,
+    source_quality: str,
+    translation_register: str,
+    discourse_tag: str,
+    verse_detected: dict | None,
+) -> bool:
+    if source_quality == "clean":
+        return True
+    if verse_detected:
+        return True
+    if translation_register == "scripture":
+        return True
+    if discourse_tag in {"scripture_quote", "quote_introduction"}:
+        return True
+    return False
+
+
 def _sanitize_phrase_alignment(raw_alignment: object, chosen_english: str) -> list[dict]:
     if not isinstance(raw_alignment, list):
         return []
@@ -551,18 +620,29 @@ def _sanitize_phrase_alignment(raw_alignment: object, chosen_english: str) -> li
             "spanish_text": spanish_text,
         })
 
-    if len(sanitized) < 2:
+    chosen_word_count = len(_translation_word_tokens(chosen_english))
+    minimum_items = 1 if chosen_word_count <= 4 else 2
+    if len(sanitized) < minimum_items:
         return []
 
-    alignment_english = " ".join(item["english_text"] for item in sanitized)
-    normalized_alignment = _normalize_alignment_compare(alignment_english)
-    normalized_chosen = _normalize_alignment_compare(chosen_english)
-    if not normalized_alignment or not normalized_chosen:
+    coverage_ratio = _ordered_alignment_coverage(
+        [item["english_text"] for item in sanitized],
+        chosen_english,
+    )
+    if coverage_ratio <= 0:
         return []
-    if normalized_alignment not in normalized_chosen and normalized_chosen not in normalized_alignment:
+    minimum_coverage = 0.35 if chosen_word_count <= 8 else 0.45
+    if coverage_ratio < minimum_coverage:
         return []
 
     return sanitized
+
+
+def _build_alignment_user_message(spanish: str, english: str) -> str:
+    return (
+        f"[SOURCE â€” Spanish original]\n{spanish}\n\n"
+        f"[DISPLAYED ENGLISH]\n{english}"
+    )
 
 
 def _translation_word_tokens(text: str) -> list[str]:
@@ -656,6 +736,41 @@ def _format_deferred_release_text(english: str, google_english: str) -> str:
     if release_text and _translation_looks_incomplete(release_text):
         release_text = release_text.rstrip(" ,;:") + "..."
     return release_text
+
+
+def _build_alignment_request_message(
+    spanish: str,
+    english: str,
+    *,
+    google_english: str = "",
+    source_quality: str = "clean",
+    translation_register: str = "expository",
+    discourse_tag: str = "statement",
+    verse_detected: dict | None = None,
+) -> str:
+    parts = [
+        f"[SOURCE — Spanish original]\n{spanish}",
+        f"[DISPLAYED ENGLISH]\n{english}",
+    ]
+    if google_english:
+        parts.append(f"[GOOGLE ENGLISH BASELINE]\n{google_english}")
+    parts.append(f"[SOURCE QUALITY]\n{source_quality}")
+    parts.append(f"[TRANSLATION REGISTER]\n{translation_register}")
+    parts.append(f"[DISCOURSE TAG]\n{discourse_tag}")
+    if verse_detected:
+        reference = str(verse_detected.get("reference", "")).strip()
+        canonical_english = str(verse_detected.get("canonical_english", "")).strip()
+        spanish_quote = str(verse_detected.get("spanish_text", "")).strip()
+        verse_lines: list[str] = []
+        if reference:
+            verse_lines.append(f"reference: {reference}")
+        if spanish_quote:
+            verse_lines.append(f"quoted_spanish: {spanish_quote}")
+        if canonical_english:
+            verse_lines.append(f"canonical_english: {canonical_english}")
+        if verse_lines:
+            parts.append("[SCRIPTURE CONTEXT]\n" + "\n".join(verse_lines))
+    return "\n\n".join(parts)
 
 
 def _build_system_prompt(church_terms: dict[str, str]) -> str:
@@ -777,6 +892,7 @@ class LLMEnrichmentService:
         on_verse_range_update: Callable[[int, dict], Awaitable[None]],
         on_verse_suggestion: Callable[[int, list[dict]], Awaitable[None]],
         on_enrichment_settled: Callable[[int], Awaitable[None]],
+        on_phrase_alignment: Callable[[int, list[dict]], Awaitable[None]] | None = None,
         on_buffer_hold: Callable[[str, float], Awaitable[None]] | None = None,
         on_caption_merge: Callable[[int, int, str, str], Awaitable[None]] | None = None,
         on_segment_metadata: Callable[[int, dict], Awaitable[None]] | None = None,
@@ -787,6 +903,7 @@ class LLMEnrichmentService:
         self._topic_tracker = topic_tracker
         self._state_tracker = state_tracker
         self._on_translation_update = on_translation_update
+        self._on_phrase_alignment = on_phrase_alignment
         self._on_verse_detected = on_verse_detected
         self._on_verse_range_update = on_verse_range_update
         self._on_verse_suggestion = on_verse_suggestion
@@ -883,6 +1000,71 @@ class LLMEnrichmentService:
         self._tasks.append(task)
         return task
 
+    def _schedule_phrase_alignment(
+        self,
+        *,
+        ts: int,
+        spanish: str,
+        english: str,
+        google_english: str = "",
+        source_quality: str,
+        translation_register: str = "expository",
+        discourse_tag: str = "statement",
+        verse_detected: dict | None = None,
+        merge_with_previous: bool = False,
+    ) -> None:
+        if not self._on_phrase_alignment:
+            return
+        if merge_with_previous:
+            return
+        if not _alignment_allowed(
+            source_quality=source_quality,
+            translation_register=translation_register,
+            discourse_tag=discourse_tag,
+            verse_detected=verse_detected,
+        ):
+            return
+        if english.endswith("...") or len(english.split()) < 2:
+            return
+        task = asyncio.create_task(
+            self._generate_phrase_alignment(
+                ts=ts,
+                spanish=spanish,
+                english=english,
+                google_english=google_english,
+                source_quality=source_quality,
+                translation_register=translation_register,
+                discourse_tag=discourse_tag,
+                verse_detected=verse_detected,
+            )
+        )
+        self._tasks = [t for t in self._tasks if not t.done()]
+        self._tasks.append(task)
+
+    def request_phrase_alignment(
+        self,
+        *,
+        ts: int,
+        spanish: str,
+        english: str,
+        google_english: str = "",
+        source_quality: str = "clean",
+        translation_register: str = "expository",
+        discourse_tag: str = "statement",
+        verse_detected: dict | None = None,
+    ) -> None:
+        self._schedule_phrase_alignment(
+            ts=ts,
+            spanish=spanish,
+            english=english,
+            google_english=google_english,
+            source_quality=source_quality,
+            translation_register=translation_register,
+            discourse_tag=discourse_tag,
+            verse_detected=verse_detected,
+            merge_with_previous=False,
+        )
+
     async def _create_json_response(
         self,
         *,
@@ -947,6 +1129,55 @@ class LLMEnrichmentService:
             "literal_translation": str(result.get("literal_translation", "")).strip(),
             "natural_translation": str(result.get("natural_translation", "")).strip(),
         }
+
+    async def _generate_phrase_alignment(
+        self,
+        *,
+        ts: int,
+        spanish: str,
+        english: str,
+        google_english: str = "",
+        source_quality: str = "clean",
+        translation_register: str = "expository",
+        discourse_tag: str = "statement",
+        verse_detected: dict | None = None,
+    ) -> None:
+        try:
+            result = await self._create_json_response(
+                system=_ALIGNMENT_SYSTEM,
+                user_message=_build_alignment_request_message(
+                    spanish,
+                    english,
+                    google_english=google_english,
+                    source_quality=source_quality,
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    verse_detected=verse_detected,
+                ),
+                ts=ts,
+                stage="alignment",
+                max_tokens=500,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[enrichment:%s] alignment generation failed for ts=%d: %s", self._church_id, ts, e)
+            return
+
+        if result is None:
+            return
+
+        phrase_alignment = _sanitize_phrase_alignment(
+            result.get("phrase_alignment"),
+            english,
+        )
+        if not phrase_alignment:
+            return
+
+        try:
+            await self._on_phrase_alignment(ts, phrase_alignment)
+        except Exception as e:
+            logger.warning("[enrichment:%s] on_phrase_alignment failed: %s", self._church_id, e)
 
     def _select_best_translation(
         self,
@@ -1174,13 +1405,6 @@ class LLMEnrichmentService:
         best_english = chosen_english
         if terminal_incomplete:
             best_english = _format_deferred_release_text(best_english, google_english)
-        phrase_alignment = _sanitize_phrase_alignment(
-            result.get("phrase_alignment"),
-            best_english,
-        )
-        if not phrase_alignment:
-            phrase_alignment = None
-        alignment_count = len(phrase_alignment or [])
         if chosen_source == "google_fallback":
             logger.warning(
                 "[enrichment:%s] translation_guard_fallback_google ts=%d "
@@ -1258,15 +1482,15 @@ class LLMEnrichmentService:
 
             if display_ready:
                 # Sentence is finalised — emit translation update immediately.
-                if best_english != _normalize_translation(google_english) or phrase_alignment:
+                if best_english != _normalize_translation(google_english):
                     logger.info(
                         "[enrichment:%s] decision=immediate_translation_update ts=%d "
-                        "source=%s alignment=%d:\n"
+                        "source=%s:\n"
                         "  google: %s\n     llm: %s",
-                        self._church_id, ts, chosen_source, alignment_count, google_english[:80], best_english[:80],
+                        self._church_id, ts, chosen_source, google_english[:80], best_english[:80],
                     )
                     try:
-                        await self._on_translation_update(ts, best_english, phrase_alignment)
+                        await self._on_translation_update(ts, best_english, None)
                         self._last_emitted_translation[ts] = best_english
                     except Exception as e:
                         logger.warning("[enrichment:%s] on_translation_update failed: %s", self._church_id, e)
@@ -1280,7 +1504,25 @@ class LLMEnrichmentService:
                 # Sentence is not display_ready — suppress translation update and defer.
                 # The deferred release fires after DEFERRED_RELEASE_S if no merge arrives.
                 defer_task = asyncio.create_task(
-                    self._deferred_translation_release(ts, best_english, google_english, phrase_alignment)
+                    self._deferred_translation_release(
+                        ts,
+                        best_english,
+                        google_english,
+                        phrase_alignment=None,
+                        spanish=spanish,
+                        allow_alignment=(
+                            not merge_with_previous
+                            and _alignment_allowed(
+                                source_quality=source_quality,
+                                translation_register=translation_register,
+                                discourse_tag=discourse_tag,
+                                verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                            )
+                        ),
+                        translation_register=translation_register,
+                        discourse_tag=discourse_tag,
+                        verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                    )
                 )
                 self._deferred_updates[ts] = (best_english, defer_task)
                 logger.info(
@@ -1297,6 +1539,19 @@ class LLMEnrichmentService:
 
             # Append to sentence history using the best available translation
             self._sentence_history.append((spanish, best_english))
+
+            if display_ready:
+                self._schedule_phrase_alignment(
+                    ts=ts,
+                    spanish=spanish,
+                    english=best_english,
+                    google_english=google_english,
+                    source_quality=source_quality,
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                    merge_with_previous=merge_with_previous,
+                )
 
             # --- Caption merge (head-anchored chain) ---
             # The repair chain is always anchored to the EARLIEST visible segment (head_ts = ts_keep).
@@ -1534,7 +1789,16 @@ class LLMEnrichmentService:
         return True
 
     async def _deferred_translation_release(
-        self, ts: int, english: str, google_english: str, phrase_alignment: list[dict] | None = None
+        self,
+        ts: int,
+        english: str,
+        google_english: str,
+        phrase_alignment: list[dict] | None = None,
+        spanish: str | None = None,
+        allow_alignment: bool = False,
+        translation_register: str = "expository",
+        discourse_tag: str = "statement",
+        verse_detected: dict | None = None,
     ) -> None:
         """Fallback: release a suppressed translation after DEFERRED_RELEASE_S if no segmentation repair arrived.
 
@@ -1558,6 +1822,18 @@ class LLMEnrichmentService:
                 if release_text:
                     try:
                         await self._on_translation_update(ts, release_text, phrase_alignment)
+                        if allow_alignment and spanish:
+                            self._schedule_phrase_alignment(
+                                ts=ts,
+                                spanish=spanish,
+                                english=release_text,
+                                google_english=google_english,
+                                source_quality="clean",
+                                translation_register=translation_register,
+                                discourse_tag=discourse_tag,
+                                verse_detected=verse_detected,
+                                merge_with_previous=False,
+                            )
                     except Exception as e:
                         logger.warning(
                             "[enrichment:%s] deferred translation_update failed ts=%d: %s",

@@ -52,6 +52,11 @@ from pydub import AudioSegment
 ROOT = Path(__file__).parent.parent.parent
 load_dotenv(ROOT / ".env")
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, str(ROOT))
 from tests.benchmark.orchestrator import run_evaluation_cycle  # noqa: E402
 from tests.benchmark.llm_translation_quality import evaluate_translation_quality  # noqa: E402
@@ -307,6 +312,17 @@ def build_result(
             }
             for m in translations
         ],
+        "translations": [
+            {
+                "spanish": m.get("spanish"),
+                "english": m.get("english"),
+                "segment_id": m.get("segment_id"),
+                "ts": m.get("ts"),
+                "source": m.get("source"),
+                "elapsed_s": m.get("_elapsed_s"),
+            }
+            for m in translations
+        ],
         "feed_revisions": [
             {
                 "type": m["type"],
@@ -316,6 +332,21 @@ def build_result(
                 "ts": m.get("ts"),
                 "source": m.get("source"),
                 "reason": m.get("reason"),
+                "phrase_alignment": m.get("phrase_alignment"),
+                "elapsed_s": m.get("_elapsed_s"),
+            }
+            for m in corrections
+        ],
+        "llm_corrections": [
+            {
+                "type": m["type"],
+                "english": m.get("english"),
+                "spanish": m.get("spanish"),
+                "segment_id": m.get("segment_id"),
+                "ts": m.get("ts"),
+                "source": m.get("source"),
+                "reason": m.get("reason"),
+                "phrase_alignment": m.get("phrase_alignment"),
                 "elapsed_s": m.get("_elapsed_s"),
             }
             for m in corrections
@@ -380,6 +411,8 @@ def print_report(result: dict) -> None:
                 f"    [{item['elapsed_s']:5.1f}s] "
                 f"[{item.get('reason', item['type'])}] {item['english']}"
             )
+            if item.get("phrase_alignment"):
+                print(f"            alignment: {len(item['phrase_alignment'])} phrase(s)")
 
     verses = result["layers"]["verse_events"]
     if verses:

@@ -18,7 +18,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 from server.services.google_translate_service import GoogleTranslateService
 from server.services.deepgram_session import DeepgramSession
-from server.services.llm_enrichment_service import LLMEnrichmentService
+from server.services.llm_enrichment_service import LLMEnrichmentService, _build_alignment_request_message
 
 
 class SlowFakeGoogleTranslateService(GoogleTranslateService):
@@ -468,6 +468,7 @@ class TestCorrectionSuppressedEvent:
             session._broadcaster = _StubBroadcaster()
             session._enrichment_settled = {1000}
             session._pending_feed_commits = {}
+            session._segment_text_cache = {}
             session._last_segment_id = 0
 
             # ts=1000 is settled → should emit correction_suppressed
@@ -594,6 +595,8 @@ class TestSessionCloseIncompleteMetadata:
             session._pending_feed_commits = {}
             session._committed_segment_ids = set()
             session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {}
             session._pending_segment_metadata = {}
             session._pending_detected_verses = {}
             session._pending_suggested_verses = {}
@@ -637,6 +640,295 @@ class TestSessionCloseIncompleteMetadata:
         run(run_())
 
 
+class TestFollowUpPhraseAlignment:
+    def test_follow_up_alignment_emits_revision_payload(self):
+        async def run_():
+            alignments = []
+
+            async def on_phrase_alignment(ts, phrase_alignment):
+                alignments.append((ts, phrase_alignment))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_phrase_alignment=on_phrase_alignment,
+                state_tracker=StubStateTracker(),
+            )
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    (
+                        "{"
+                        "\"phrase_alignment\": ["
+                        "{\"english_text\": \"If we walk in the light\", \"spanish_text\": \"Si andamos en luz\"}, "
+                        "{\"english_text\": \"we have fellowship\", \"spanish_text\": \"tenemos comuniÃ³n\"}, "
+                        "{\"english_text\": \"with one another\", \"spanish_text\": \"unos con otros\"}"
+                        "]"
+                        "}"
+                    ),
+                ),
+            ])
+
+            await service._generate_phrase_alignment(
+                ts=1000,
+                spanish="Si andamos en luz, tenemos comuniÃ³n unos con otros.",
+                english="If we walk in the light, we have fellowship with one another.",
+                google_english="If we walk in the light, we have communion with each other.",
+                source_quality="clean",
+                translation_register="scripture",
+                discourse_tag="scripture_quote",
+                verse_detected={
+                    "reference": "1 John 1:7",
+                    "canonical_english": "But if we walk in the light, as he is in the light, we have fellowship one with another.",
+                    "spanish_text": "Si andamos en luz",
+                },
+            )
+
+            assert alignments == [
+                (
+                    1000,
+                    [
+                        {"english_text": "If we walk in the light", "spanish_text": "Si andamos en luz"},
+                        {"english_text": "we have fellowship", "spanish_text": "tenemos comuniÃ³n"},
+                        {"english_text": "with one another", "spanish_text": "unos con otros"},
+                    ],
+                )
+            ]
+
+        run(run_())
+
+    def test_invalid_follow_up_alignment_is_dropped(self):
+        async def run_():
+            alignments = []
+
+            async def on_phrase_alignment(ts, phrase_alignment):
+                alignments.append((ts, phrase_alignment))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_phrase_alignment=on_phrase_alignment,
+                state_tracker=StubStateTracker(),
+            )
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    (
+                        "{"
+                        "\"phrase_alignment\": ["
+                        "{\"english_text\": \"Completely different\", \"spanish_text\": \"tenemos comuniÃ³n\"}, "
+                        "{\"english_text\": \"still wrong\", \"spanish_text\": \"unos con otros\"}"
+                        "]"
+                        "}"
+                    ),
+                ),
+            ])
+
+            await service._generate_phrase_alignment(
+                ts=1000,
+                spanish="Tenemos comuniÃ³n unos con otros.",
+                english="We have fellowship with one another.",
+                google_english="We have communion with one another.",
+                source_quality="clean",
+                translation_register="expository",
+                discourse_tag="statement",
+            )
+
+            assert alignments == []
+
+        run(run_())
+
+    def test_alignment_request_message_includes_grounding_context(self):
+        message = _build_alignment_request_message(
+            "Si andamos en luz, tenemos comuniÃ³n unos con otros.",
+            "If we walk in the light, we have fellowship with one another.",
+            google_english="If we walk in the light, we have communion with each other.",
+            source_quality="clean",
+            translation_register="scripture",
+            discourse_tag="scripture_quote",
+            verse_detected={
+                "reference": "1 John 1:7",
+                "canonical_english": "But if we walk in the light, as he is in the light, we have fellowship one with another.",
+                "spanish_text": "Si andamos en luz",
+            },
+        )
+
+        assert "[GOOGLE ENGLISH BASELINE]" in message
+        assert "[SCRIPTURE CONTEXT]" in message
+        assert "reference: 1 John 1:7" in message
+
+    def test_noisy_scripture_alignment_is_still_scheduled(self):
+        async def run_():
+            alignments = []
+
+            async def on_phrase_alignment(ts, phrase_alignment):
+                alignments.append((ts, phrase_alignment))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_phrase_alignment=on_phrase_alignment,
+                state_tracker=StubStateTracker(),
+            )
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    (
+                        "{"
+                        "\"phrase_alignment\": ["
+                        "{\"english_text\": \"I have touched him, I have seen him\", \"spanish_text\": \"yo lo he tocado, yo lo he visto\"}, "
+                        "{\"english_text\": \"I have heard him\", \"spanish_text\": \"yo lo he oído\"}"
+                        "]"
+                        "}"
+                    ),
+                ),
+            ])
+
+            service.request_phrase_alignment(
+                ts=1000,
+                spanish="yo lo he tocado, yo lo he visto, yo lo he oído",
+                english="I have touched him, I have seen him, I have heard him.",
+                google_english="I have touched him, I have seen him, I have heard him.",
+                source_quality="noisy",
+                translation_register="expository",
+                discourse_tag="statement",
+                verse_detected={
+                    "reference": "1 John 1:1",
+                    "canonical_english": "That which we have heard, which we have seen with our eyes...",
+                    "spanish_text": "yo lo he tocado, yo lo he visto, yo lo he oído",
+                },
+            )
+            await asyncio.sleep(0.05)
+
+            assert alignments == [
+                (
+                    1000,
+                    [
+                        {"english_text": "I have touched him, I have seen him", "spanish_text": "yo lo he tocado, yo lo he visto"},
+                        {"english_text": "I have heard him", "spanish_text": "yo lo he oído"},
+                    ],
+                )
+            ]
+
+        run(run_())
+
+    def test_noisy_non_scripture_alignment_stays_suppressed(self):
+        async def run_():
+            alignments = []
+
+            async def on_phrase_alignment(ts, phrase_alignment):
+                alignments.append((ts, phrase_alignment))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_phrase_alignment=on_phrase_alignment,
+                state_tracker=StubStateTracker(),
+            )
+            service._client = SequentialFakeAnthropicClient([
+                (
+                    0.01,
+                    "{\"phrase_alignment\": [{\"english_text\": \"unused\", \"spanish_text\": \"unused\"}]}",
+                ),
+            ])
+
+            service.request_phrase_alignment(
+                ts=1000,
+                spanish="porque hay mucha gente dice",
+                english="Because many people say",
+                google_english="Because many people say",
+                source_quality="noisy",
+                translation_register="expository",
+                discourse_tag="statement",
+            )
+            await asyncio.sleep(0.05)
+
+            assert alignments == []
+
+        run(run_())
+
+
+class TestMergeAlignmentReschedule:
+    def test_caption_merge_requests_fresh_alignment_for_kept_segment(self):
+        async def run_():
+            events = []
+            alignment_requests = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubEnrichment:
+                def request_phrase_alignment(self, **kwargs):
+                    alignment_requests.append(kwargs)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._enrichment = _StubEnrichment()
+            session._db_session_id = None
+            session._recorder = None
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = {1000}
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {
+                1000: {"spanish": "previo", "english": "Previous"},
+                2000: {"spanish": "actual", "english": "Current"},
+            }
+            session._segment_metadata_cache = {
+                1000: {"translation_register": "scripture", "source_quality": "clean"}
+            }
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._pending_suggested_verses = {}
+
+            await session._on_caption_merge(
+                2000,
+                1000,
+                "Si decimos que tenemos comuniÃ³n con Ã©l, pero andamos en tinieblas, mentimos.",
+                "If we say that we have fellowship with him, but walk in darkness, we lie.",
+            )
+
+            assert alignment_requests == [
+                {
+                    "ts": 1000,
+                    "spanish": "Si decimos que tenemos comuniÃ³n con Ã©l, pero andamos en tinieblas, mentimos.",
+                    "english": "If we say that we have fellowship with him, but walk in darkness, we lie.",
+                    "source_quality": "clean",
+                    "translation_register": "scripture",
+                }
+            ]
+            assert any(event["type"] == "caption_merge" for event in events)
+
+        run(run_())
+
+
 class TestTranslationRepairFallback:
     def test_llm_revision_commits_pending_segment_without_visible_rewrite(self):
         async def run_():
@@ -658,6 +950,8 @@ class TestTranslationRepairFallback:
             session._pending_feed_commits = {}
             session._committed_segment_ids = set()
             session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {}
             session._pending_segment_metadata = {}
             session._pending_detected_verses = {}
             session._pending_suggested_verses = {}
@@ -869,7 +1163,9 @@ class TestTranslationRepairFallback:
 
         run(run_())
 
-    def test_phrase_alignment_emits_when_translation_text_is_unchanged(self):
+    def test_phrase_alignment_emits_as_follow_up_revision(self):
+        import pytest
+        pytest.skip("obsolete alignment coverage replaced by follow-up alignment tests below")
         async def run_():
             updates = []
 
@@ -923,6 +1219,8 @@ class TestTranslationRepairFallback:
         run(run_())
 
     def test_invalid_phrase_alignment_is_dropped(self):
+        import pytest
+        pytest.skip("obsolete alignment coverage replaced by follow-up alignment tests below")
         async def run_():
             updates = []
 
