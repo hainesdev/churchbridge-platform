@@ -26,7 +26,9 @@ from server.services.session_recorder import SessionRecorder, CaptureResult
 
 logger = logging.getLogger(__name__)
 
-PREFERRED_COMMIT_DELAY_S = 0.7
+# Hold the dock-to-feed handoff briefly so the interpreted area can prefer
+# enriched English when it lands soon after the Google sentence.
+PREFERRED_COMMIT_DELAY_S = 1.25
 
 # Splits a Deepgram final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
