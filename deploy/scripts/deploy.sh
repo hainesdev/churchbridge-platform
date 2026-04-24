@@ -13,6 +13,17 @@ fi
 
 bash "${SCRIPT_DIR}/sync-db.sh"
 
+# Legacy cleanup: older production revisions pinned fixed container names
+# (`churchbridge_api`, `churchbridge_web`). Those names can conflict with
+# compose-managed recreation and leave the API offline behind nginx.
+for legacy_name in churchbridge_api churchbridge_web; do
+  legacy_id="$(docker ps -aq --filter "name=^/${legacy_name}$" | head -1)"
+  if [[ -n "${legacy_id}" ]]; then
+    echo "Removing legacy container ${legacy_name} (${legacy_id})..."
+    docker rm -f "${legacy_id}"
+  fi
+done
+
 docker compose -f deploy/docker-compose.prod.yml up -d --build --remove-orphans
 
 # Keep the shared Nginx proxy vhost config in sync.  The dhaines_nginx container

@@ -11,6 +11,7 @@ This project is deployed to `churchbridge.dhaines.dev` on the Ubuntu droplet at 
 - Persistent database volume: `churchbridge_data`
 
 The public proxy serves the site on `https://churchbridge.dhaines.dev`, routes `/api/*` to the FastAPI container, and routes everything else to the Next.js container.
+Compose now uses Docker network aliases (`churchbridge_api`, `churchbridge_web`) for those upstream names instead of fixed `container_name` values, which avoids recreate-time name conflicts while keeping the nginx config stable.
 
 ## Files in this repo
 
@@ -19,7 +20,7 @@ The public proxy serves the site on `https://churchbridge.dhaines.dev`, routes `
 - `deploy/web.Dockerfile`: frontend image
 - `deploy/nginx/churchbridge.dhaines.dev.conf`: vhost config for the shared Nginx proxy — **installed automatically by `deploy.sh`** into `/var/www/dhaines.dev/nginx/conf.d/churchbridge.conf` on every deploy. Also committed to the `dhaines.dev` repo as a belt-and-suspenders backup.
 - `deploy/.env.production.example`: production env template
-- `deploy/scripts/deploy.sh`: build and restart the stack, install the nginx vhost config, and reload `dhaines_nginx`
+- `deploy/scripts/deploy.sh`: build and restart the stack, remove legacy fixed-name containers if present, install the nginx vhost config, and reload `dhaines_nginx`
 - `deploy/scripts/sync-db.sh`: copies `data/churchbridge.db` into the Docker volume before deploy when present
 - `deploy/scripts/deploy-ref.sh`: deploy a specific Git SHA/ref from `main`
 - `deploy/scripts/update-if-needed.sh`: pull `main` and redeploy when changed
