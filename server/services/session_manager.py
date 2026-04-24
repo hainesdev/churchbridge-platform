@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -24,6 +25,8 @@ from server.services.broadcaster import Broadcaster
 from server.services.session_recorder import SessionRecorder, CaptureResult
 
 logger = logging.getLogger(__name__)
+
+PREFERRED_COMMIT_DELAY_S = 0.7
 
 # Splits a Deepgram final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
@@ -242,6 +245,13 @@ class ServiceSession:
         self._source_scripture_version: str = "rvr1960"
         self._display_scripture_version: str = "kjv"
         self._recorder: SessionRecorder | None = None
+        self._pending_feed_commits: dict[int, dict] = {}
+        self._committed_segment_ids: set[int] = set()
+        self._persisted_segment_ids: set[int] = set()
+        self._pending_segment_metadata: dict[int, dict] = {}
+        self._pending_detected_verses: dict[int, dict] = {}
+        self._pending_suggested_verses: dict[int, list[dict]] = {}
+        self._last_segment_id: int = 0
 
     async def start(
         self,
@@ -346,6 +356,7 @@ class ServiceSession:
             await self._translation.close()
         if self._enrichment:
             await self._enrichment.close()
+        await self._flush_all_pending_commits()
         if self._topic_tracker:
             await self._topic_tracker.stop()
         if self._db_session_id:
@@ -408,21 +419,21 @@ class ServiceSession:
     # --- Sentence buffer callback ---
 
     async def _on_sentence(self, text: str, audio_start: float, audio_end: float, flush_reason: str):
-        ts = _now()
+        ts = self._next_segment_id()
         terminal_incomplete = flush_reason == "session_close" and _is_incomplete(text)
         if self._recorder:
             self._recorder.record_event("sentence_flush", {
                 "text": text, "flush_reason": flush_reason,
-                "audio_start": audio_start, "audio_end": audio_end, "ts": ts,
+                "audio_start": audio_start, "audio_end": audio_end, "ts": ts, "segment_id": ts,
             })
             self._recorder.record_timing("sentence", ts)
         logger.info("[session:%s] Sentence flushed: %s", self._church_id, text)
         await self._broadcast({
             "type": "final_spanish",
             "text": text,
-            "ts": ts,
             "flush_reason": flush_reason,
             "terminal_incomplete": terminal_incomplete,
+            **self._segment_ref(ts),
         })
         if self._topic_tracker:
             mode = self._state_tracker.settled_mode if self._state_tracker else "exposition"
@@ -480,14 +491,19 @@ class ServiceSession:
         if self._recorder:
             self._recorder.record_event("translation", {"spanish": spanish, "english": english, "ts": ts})
             self._recorder.record_timing("translation", ts)
-        await self._broadcast({
-            "type": "translation",
-            "spanish": spanish,
-            "english": english,
-            "ts": ts,
-        })
-        if self._db_session_id:
-            await append_segment(self._db_session_id, spanish, english)
+        await self._broadcast_live_translation(
+            text=english,
+            source="google_sentence",
+            display_ready=False,
+            segment_id=ts,
+        )
+        await self._queue_feed_commit(
+            segment_id=ts,
+            spanish=spanish,
+            english=english,
+            source="google",
+            delay_s=PREFERRED_COMMIT_DELAY_S,
+        )
         if self._enrichment:
             # Pop timing; defaults to (0.0, 0.0) if translation was retried after
             # the entry aged out (extremely rare — session would need to be very long).
@@ -512,7 +528,12 @@ class ServiceSession:
             )
 
     async def _on_interim_translation(self, text: str):
-        await self._broadcast({"type": "interim_translation", "text": text, "ts": _now()})
+        await self._broadcast_live_translation(
+            text=text,
+            source="google_fragment",
+            display_ready=False,
+            live_ts=_now(),
+        )
 
     async def _on_correction(self, ts: int, english: str):
         """Silently update a previously broadcast translation with better context.
@@ -525,9 +546,24 @@ class ServiceSession:
                 "[session:%s] Correction suppressed ts=%d — enrichment already settled",
                 self._church_id, ts,
             )
-            await self._broadcast({"type": "correction_suppressed", "ts": ts})
+            await self._broadcast({"type": "correction_suppressed", **self._segment_ref(ts)})
             return
-        await self._broadcast({"type": "correction", "ts": ts, "english": english})
+        if ts in self._pending_feed_commits:
+            self._pending_feed_commits[ts]["english"] = english
+            self._pending_feed_commits[ts]["source"] = "google"
+            await self._broadcast_live_translation(
+                text=english,
+                source="google_correction",
+                display_ready=False,
+                segment_id=ts,
+            )
+            return
+        await self._broadcast_feed_revision(
+            segment_id=ts,
+            english=english,
+            source="google",
+            reason="forward_context_correction",
+        )
 
     # --- LLM Enrichment callbacks ---
 
@@ -550,7 +586,24 @@ class ServiceSession:
         """LLM-improved translation; replaces the Google translation on the display."""
         logger.info("[session:%s] Translation update ts=%d: %s", self._church_id, ts, english[:200])
         self._enrichment_settled.add(ts)
-        await self._broadcast({"type": "translation_update", "ts": ts, "english": english})
+        if ts in self._pending_feed_commits:
+            pending = self._pending_feed_commits[ts]
+            pending["english"] = english
+            pending["source"] = "llm"
+            await self._broadcast_live_translation(
+                text=english,
+                source="llm",
+                display_ready=True,
+                segment_id=ts,
+            )
+            await self._commit_pending_segment(ts)
+            return
+        await self._broadcast_feed_revision(
+            segment_id=ts,
+            english=english,
+            source="llm",
+            reason="context_repair",
+        )
 
     async def _on_enrichment_settled(self, ts: int):
         """LLM enrichment completed (with or without a translation change).
@@ -631,12 +684,18 @@ class ServiceSession:
     async def _on_verse_detected(self, ts: int, verse: dict):
         verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse detected: %s", self._church_id, verse.get("reference"))
-        await self._broadcast({"type": "verse_detected", "ts": ts, "verse": verse})
+        if ts not in self._committed_segment_ids:
+            self._pending_detected_verses[ts] = verse
+            return
+        await self._broadcast({"type": "verse_detected", "verse": verse, **self._segment_ref(ts)})
 
     async def _on_verse_range_update(self, ts: int, verse: dict):
         verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse range update: %s", self._church_id, verse.get("reference"))
-        await self._broadcast({"type": "verse_range_update", "ts": ts, "verse": verse})
+        if ts not in self._committed_segment_ids:
+            self._pending_detected_verses[ts] = verse
+            return
+        await self._broadcast({"type": "verse_range_update", "verse": verse, **self._segment_ref(ts)})
 
     async def _on_verse_suggestion(self, ts: int, suggestions: list[dict]):
         suggestions = [await self._hydrate_suggested_verse(s) for s in suggestions]
@@ -644,26 +703,54 @@ class ServiceSession:
             "[session:%s] Verse suggestions for ts=%d: %s",
             self._church_id, ts, [s["reference"] for s in suggestions],
         )
-        await self._broadcast({"type": "verse_suggestion", "ts": ts, "suggestions": suggestions})
+        if ts not in self._committed_segment_ids:
+            self._pending_suggested_verses[ts] = suggestions
+            return
+        await self._broadcast({"type": "verse_suggestion", "suggestions": suggestions, **self._segment_ref(ts)})
 
     async def _on_caption_merge(self, absorb_ts: int, keep_ts: int, merged_spanish: str, merged_english: str):
-        """LLM signals that two segments should be merged into one display caption.
+        """LLM signals that two segments should be merged to repair a bad stream split.
 
         The chain is head-anchored: keep_ts is always the earliest visible segment
         (the anchor); absorb_ts is the fragment being folded into it.
-        Broadcasts caption_merge so the client removes ts_absorb and updates ts_keep.
+        Broadcasts caption_merge as a segmentation-repair event.
         """
         logger.info(
             "[session:%s] Caption merge: keep=%d absorbs=%d",
             self._church_id, keep_ts, absorb_ts,
         )
+        keep_was_committed = keep_ts in self._committed_segment_ids
+        await self._drop_pending_commit(absorb_ts)
+        self._pending_segment_metadata.pop(absorb_ts, None)
+        self._pending_detected_verses.pop(absorb_ts, None)
+        self._pending_suggested_verses.pop(absorb_ts, None)
+        if keep_ts in self._pending_feed_commits:
+            pending = self._pending_feed_commits[keep_ts]
+            pending["spanish"] = merged_spanish
+            pending["english"] = merged_english
+            pending["source"] = "llm"
+            await self._broadcast_live_translation(
+                text=merged_english,
+                source="llm",
+                display_ready=True,
+                segment_id=keep_ts,
+            )
+            await self._commit_pending_segment(keep_ts)
         await self._broadcast({
             "type": "caption_merge",
-            "ts_keep": keep_ts,
-            "ts_absorb": absorb_ts,
+            "reason": "segmentation_repair",
             "spanish": merged_spanish,
             "english": merged_english,
+            **self._merge_ref(keep_ts, absorb_ts),
         })
+        if keep_was_committed:
+            await self._broadcast_feed_revision(
+                segment_id=keep_ts,
+                english=merged_english,
+                spanish=merged_spanish,
+                source="llm",
+                reason="segmentation_repair",
+            )
 
     async def _on_segment_metadata(self, ts: int, metadata: dict):
         """Broadcast scaffolding metadata for a committed segment.
@@ -672,11 +759,19 @@ class ServiceSession:
         The frontend stores these for future display logic (e.g. register will
         drive exact Bible verse text lookup once Bible versions are stored).
         """
-        await self._broadcast({
-            "type": "segment_metadata",
-            "ts": ts,
-            **metadata,
-        })
+        self._pending_segment_metadata[ts] = metadata
+        if metadata.get("pending_completion") and ts in self._pending_feed_commits:
+            pending = self._pending_feed_commits[ts]
+            task = pending.get("task")
+            if task:
+                task.cancel()
+                pending["task"] = None
+        if ts in self._committed_segment_ids:
+            await self._broadcast({
+                "type": "segment_metadata",
+                **metadata,
+                **self._segment_ref(ts),
+            })
 
     async def _on_mode_change(self, old_mode: str, new_mode: str, ts: int):
         """Fired when the settled sermon mode transitions."""
@@ -693,7 +788,7 @@ class ServiceSession:
             "type": "mode_change",
             "from": old_mode,
             "to": new_mode,
-            "ts": ts,
+            **self._segment_ref(ts),
         })
 
     # --- Helpers ---
@@ -730,11 +825,175 @@ class ServiceSession:
     async def _broadcast(self, event: dict):
         await self._broadcaster.publish(self._church_id, event)
 
+    async def _queue_feed_commit(
+        self,
+        segment_id: int,
+        spanish: str,
+        english: str,
+        source: str,
+        delay_s: float,
+    ) -> None:
+        await self._drop_pending_commit(segment_id)
+        task = asyncio.create_task(self._delayed_feed_commit(segment_id, delay_s))
+        self._pending_feed_commits[segment_id] = {
+            "spanish": spanish,
+            "english": english,
+            "source": source,
+            "task": task,
+        }
+
+    async def _drop_pending_commit(self, segment_id: int) -> None:
+        pending = self._pending_feed_commits.pop(segment_id, None)
+        if not pending:
+            return
+        task = pending.get("task")
+        if task:
+            task.cancel()
+
+    async def _delayed_feed_commit(self, segment_id: int, delay_s: float) -> None:
+        try:
+            await asyncio.sleep(delay_s)
+            await self._commit_pending_segment(segment_id)
+        except asyncio.CancelledError:
+            return
+
+    async def _commit_pending_segment(self, segment_id: int) -> None:
+        pending = self._pending_feed_commits.pop(segment_id, None)
+        if not pending:
+            return
+        is_first_commit = segment_id not in self._committed_segment_ids
+        task = pending.get("task")
+        if task and task is not asyncio.current_task():
+            task.cancel()
+        await self._broadcast_feed_commit(
+            segment_id=segment_id,
+            spanish=pending["spanish"],
+            english=pending["english"],
+            source=pending["source"],
+        )
+        await self._broadcast_live_translation_clear(reason="committed", segment_id=segment_id)
+        self._committed_segment_ids.add(segment_id)
+        if self._db_session_id and is_first_commit and segment_id not in self._persisted_segment_ids:
+            await append_segment(self._db_session_id, pending["spanish"], pending["english"])
+            self._persisted_segment_ids.add(segment_id)
+        await self._flush_buffered_segment_state(segment_id)
+
+    async def _flush_buffered_segment_state(self, segment_id: int) -> None:
+        metadata = self._pending_segment_metadata.pop(segment_id, None)
+        if metadata is not None:
+            await self._broadcast({
+                "type": "segment_metadata",
+                **metadata,
+                **self._segment_ref(segment_id),
+            })
+        verse = self._pending_detected_verses.pop(segment_id, None)
+        if verse is not None:
+            await self._broadcast({"type": "verse_detected", "verse": verse, **self._segment_ref(segment_id)})
+        suggestions = self._pending_suggested_verses.pop(segment_id, None)
+        if suggestions is not None:
+            await self._broadcast({"type": "verse_suggestion", "suggestions": suggestions, **self._segment_ref(segment_id)})
+
+    async def _flush_all_pending_commits(self) -> None:
+        for segment_id in list(self._pending_feed_commits.keys()):
+            await self._commit_pending_segment(segment_id)
+
+    async def _broadcast_live_translation(
+        self,
+        text: str,
+        source: str,
+        display_ready: bool,
+        live_ts: int | None = None,
+        segment_id: int | None = None,
+    ) -> None:
+        payload = {
+            "type": "live_translation",
+            "text": text,
+            "source": source,
+            "display_ready": display_ready,
+        }
+        if segment_id is not None:
+            payload.update(self._segment_ref(segment_id))
+        else:
+            payload["ts"] = live_ts if live_ts is not None else _now()
+        await self._broadcast(payload)
+
+    async def _broadcast_live_translation_clear(
+        self,
+        reason: str,
+        segment_id: int | None = None,
+    ) -> None:
+        payload = {
+            "type": "live_translation_clear",
+            "reason": reason,
+        }
+        if segment_id is not None:
+            payload.update(self._segment_ref(segment_id))
+        else:
+            payload["ts"] = _now()
+        await self._broadcast(payload)
+
+    async def _broadcast_feed_commit(
+        self,
+        segment_id: int,
+        spanish: str,
+        english: str,
+        source: str,
+    ) -> None:
+        await self._broadcast({
+            "type": "feed_commit",
+            "spanish": spanish,
+            "english": english,
+            "source": source,
+            **self._segment_ref(segment_id),
+        })
+
+    async def _broadcast_feed_revision(
+        self,
+        segment_id: int,
+        english: str,
+        source: str,
+        reason: str,
+        spanish: str | None = None,
+    ) -> None:
+        payload = {
+            "type": "feed_revision",
+            "english": english,
+            "source": source,
+            "reason": reason,
+            **self._segment_ref(segment_id),
+        }
+        if spanish is not None:
+            payload["spanish"] = spanish
+        await self._broadcast(payload)
+
     async def _send(self, msg: dict):
         try:
             await self._ws.send_json(msg)
         except Exception:
             pass
+
+    def _next_segment_id(self) -> int:
+        now = _now()
+        if now <= self._last_segment_id:
+            now = self._last_segment_id + 1
+        self._last_segment_id = now
+        return now
+
+    def _segment_ref(self, segment_id: int) -> dict:
+        """Emit canonical segment identity alongside the legacy timestamp field."""
+        return {
+            "segment_id": segment_id,
+            "ts": segment_id,
+        }
+
+    def _merge_ref(self, keep_segment_id: int, absorb_segment_id: int) -> dict:
+        """Emit merge compatibility fields while preserving canonical IDs."""
+        return {
+            "segment_id_keep": keep_segment_id,
+            "segment_id_absorb": absorb_segment_id,
+            "ts_keep": keep_segment_id,
+            "ts_absorb": absorb_segment_id,
+        }
 
 
 async def _finalize_capture_in_db(result: CaptureResult, session_id: int | None) -> None:

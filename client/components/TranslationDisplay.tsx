@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ScripturePopover } from './ScripturePopover';
 import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
@@ -11,8 +11,12 @@ interface TranslationDisplayProps {
 
 export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDisplayProps) {
   const {
-    segments, spanishLines, partialSpanish, partialEnglish,
-    connected, flashingId,
+    segments,
+    spanishLines,
+    partialSpanish,
+    liveEnglish,
+    connected,
+    flashingId,
   } = useTranslationFeed(churchId);
   const [popover, setPopover] = useState<{
     title: string;
@@ -38,9 +42,9 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     if (!atBottomRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [segments, partialEnglish, partialSpanish, spanishLines]);
+  }, [segments, partialSpanish, spanishLines]);
 
-  const scrollToLive = useCallback(() => {
+  const scrollToLatest = useCallback(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, []);
 
@@ -58,10 +62,10 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
 
   const liveButton = scrolledUp && (
     <button
-      onClick={scrollToLive}
+      onClick={scrollToLatest}
       className="absolute bottom-6 right-6 z-20 bg-white/10 hover:bg-white/20 backdrop-blur-sm text-white text-sm px-4 py-2 rounded-full border border-white/20 transition-colors"
     >
-      ↓ Live
+      Latest
     </button>
   );
 
@@ -99,35 +103,48 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     </div>
   ), []);
 
-  // ── Lower-thirds overlay — no verse panel (OBS/projection use) ───────────────
+  const liveDock = liveEnglish ? (
+    <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-6 py-4 backdrop-blur">
+      <p className="text-[11px] uppercase tracking-[0.24em] text-gray-500">Live Translation</p>
+      <p className="mt-2 text-2xl font-semibold leading-snug text-white">
+        {liveEnglish}
+        <span className="animate-pulse text-blue-400 ml-1">▌</span>
+      </p>
+    </div>
+  ) : (
+    <div className="flex-none border-t border-gray-900 bg-gray-950/80 px-6 py-3">
+      <p className="text-sm text-gray-500">Waiting for live translation...</p>
+    </div>
+  );
+
   if (mode === 'lowerthird') {
     return (
       <div className="fixed bottom-0 left-0 right-0 p-6 space-y-2">
         <AnimatePresence mode="popLayout">
-          {segments.slice(-2).map((s) => (
+          {segments.slice(-2).map((segment) => (
             <motion.div
-              key={s.id}
+              key={segment.id}
               initial={{ opacity: 0 }}
               animate={{ opacity: 1, transition: { duration: 0.3 } }}
               exit={{ opacity: 0, transition: { duration: 0.2 } }}
               className={`bg-black/70 px-4 py-2 rounded text-2xl font-medium transition-opacity duration-300 ${
-                s.pendingCompletion ? 'text-white/50 italic' : 'text-white'
+                segment.pendingCompletion ? 'text-white/50 italic' : 'text-white'
               }`}
             >
-              {s.english}
+              {segment.english}
             </motion.div>
           ))}
         </AnimatePresence>
-        {partialEnglish && (
-          <div className="bg-black/70 px-4 py-2 rounded text-white/70 text-2xl italic">
-            {partialEnglish}<span className="animate-pulse">▌</span>
+        {liveEnglish && (
+          <div className="bg-black/70 px-4 py-2 rounded text-white/80 text-2xl italic">
+            {liveEnglish}
+            <span className="animate-pulse ml-1">▌</span>
           </div>
         )}
       </div>
     );
   }
 
-  // ── Spanish captions ──────────────────────────────────────────────────────────
   if (mode === 'spanish') {
     return (
       <div className="h-full flex bg-black text-white overflow-hidden relative">
@@ -135,15 +152,15 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
           {statusBar('En vivo')}
           <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
             <div className="min-h-full flex flex-col justify-end px-10 pt-20 pb-8 gap-4">
-              {segments.map((s) => (
+              {segments.map((segment) => (
                 <motion.div
-                  key={s.id}
+                  key={segment.id}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1, transition: { duration: 0.4 } }}
                   className="space-y-2"
                 >
-                  <span className="block text-4xl font-semibold leading-snug">{s.spanish}</span>
-                  {renderVerseChips(s)}
+                  <span className="block text-4xl font-semibold leading-snug">{segment.spanish}</span>
+                  {renderVerseChips(segment)}
                 </motion.div>
               ))}
               <p className="text-4xl font-semibold leading-snug text-gray-400 min-h-[3rem]">
@@ -167,7 +184,6 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     );
   }
 
-  // ── Bilingual: Spanish primary + English secondary ────────────────────────────
   if (mode === 'bilingual') {
     return (
       <div className="h-full flex bg-black text-white overflow-hidden relative">
@@ -175,37 +191,29 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
           {statusBar('Live')}
           <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
             <div className="min-h-full flex flex-col justify-end px-10 pt-20 pb-8 gap-5">
-              {segments.map((s) => (
+              {segments.map((segment) => (
                 <motion.div
-                  key={s.id}
+                  key={segment.id}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1, transition: { duration: 0.4 } }}
                   className="space-y-1"
                 >
-                  <p className="text-3xl font-semibold leading-snug">{s.spanish}</p>
-                  <div className="flex items-baseline gap-3">
-                    <p className={`text-lg leading-snug transition-all duration-500 ${
-                      s.pendingCompletion
-                        ? 'text-blue-300/50 italic'
-                        : flashingId === s.id
-                          ? 'text-blue-100'
-                          : 'text-blue-300'
-                    }`}>{s.english}</p>
-                  </div>
-                  {renderVerseChips(s)}
+                  <p className="text-3xl font-semibold leading-snug">{segment.spanish}</p>
+                  <p className={`text-lg leading-snug transition-all duration-500 ${
+                    segment.pendingCompletion
+                      ? 'text-blue-300/50 italic'
+                      : flashingId === segment.id
+                        ? 'text-blue-100'
+                        : 'text-blue-300'
+                  }`}>
+                    {segment.english}
+                  </p>
+                  {renderVerseChips(segment)}
                 </motion.div>
               ))}
-              <div className="space-y-1 min-h-[4rem]">
-                <p className="text-3xl font-semibold leading-snug text-gray-400">
-                  {activeSpanish}
-                  {activeSpanish && <span className="animate-pulse text-yellow-500 ml-0.5">▌</span>}
-                </p>
-                {partialEnglish && (
-                  <p className="text-lg text-blue-400/60 leading-snug">{partialEnglish}</p>
-                )}
-              </div>
             </div>
           </div>
+          {liveDock}
           {liveButton}
         </div>
         <ScripturePopover
@@ -221,45 +229,35 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     );
   }
 
-  // ── Full mode: English primary ────────────────────────────────────────────────
   return (
     <div className="h-full flex bg-black text-white overflow-hidden relative">
       <div className="flex-1 flex flex-col overflow-hidden">
         {statusBar('Live')}
         <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
           <div className="min-h-full flex flex-col justify-end px-10 pt-20 pb-8 gap-5">
-            {segments.map((s) => (
+            {segments.map((segment) => (
               <motion.div
-                key={s.id}
+                key={segment.id}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1, transition: { duration: 0.4 } }}
                 className="space-y-1"
               >
-                <div className="flex items-baseline gap-3">
-                  <p className={`text-3xl font-semibold leading-snug transition-all duration-[600ms] ${
-                    s.pendingCompletion
-                      ? 'text-white/40 italic'
-                      : flashingId === s.id
-                        ? 'text-blue-200'
-                        : ''
-                  }`}>
-                    {s.english}
-                  </p>
-                </div>
-                {renderVerseChips(s)}
-                <p className="text-base text-gray-500 leading-snug">{s.spanish}</p>
+                <p className={`text-3xl font-semibold leading-snug transition-all duration-[600ms] ${
+                  segment.pendingCompletion
+                    ? 'text-white/40 italic'
+                    : flashingId === segment.id
+                      ? 'text-blue-200'
+                      : ''
+                }`}>
+                  {segment.english}
+                </p>
+                {renderVerseChips(segment)}
+                <p className="text-base text-gray-500 leading-snug">{segment.spanish}</p>
               </motion.div>
             ))}
-            <div className="min-h-[2.5rem]">
-              {partialEnglish && (
-                <p className="text-3xl font-semibold leading-snug text-gray-400">
-                  {partialEnglish}
-                  <span className="animate-pulse text-blue-400 ml-0.5">▌</span>
-                </p>
-              )}
-            </div>
           </div>
         </div>
+        {liveDock}
         {liveButton}
       </div>
       <ScripturePopover

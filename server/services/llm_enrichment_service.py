@@ -160,33 +160,30 @@ RULES:
     (e.g. "Porque anoche se acuerdan que él", "Si nosotros decimos que", "Y la razón es").
     false: sentence is a complete unit, even if brief.
 
-12. merge_with_previous: true if this sentence should be combined with the immediately
-    preceding sentence into a single display caption. Any one criterion is sufficient:
-    - discourse_tag is "answer_to_question" AND previous was "rhetorical_question"
-    - discourse_tag is "scripture_quote" AND previous was "quote_introduction"
-    - previous [PREVIOUS SENTENCE DISCOURSE] had continuation_required: true AND
-      this sentence continues or resolves that incomplete thought
-    - previous [PREVIOUS SENTENCE DISCOURSE] had source_quality: "fragmented" AND
-      this sentence grammatically continues it (open clause, dangling copula, incomplete list)
-    - this sentence's source_quality is "fragmented" AND it attaches to the previous
-    - this sentence grammatically completes a dangling predicate from the previous sentence,
-      regardless of whether the previous call set continuation_required: true —
-      misclassification on the prior call is possible; judge structural continuation
-      from the Spanish text independently.
-      Examples: previous "Tiene peso, tiene significado, es" → current completes the predicate
-                previous "¿Cuántos de ustedes, los hermanos que" → current closes the question
-    - previous [PREVIOUS SENTENCE DISCOURSE] had display_ready: false AND this sentence
-      clearly resolves or continues the prior thought
-    - this sentence is a SHORT FRAGMENT (≤ 3 words, e.g. "Jesucristo.", "la luz.", "el amor.")
-      AND the previous sentence is a scripture quote, quote introduction, or scripture context —
-      the fragment is the conclusion of the quote and should not float as a standalone caption.
+12. merge_with_previous: true ONLY when the caption stream was segmented incorrectly and the
+    current sentence must be merged with the immediately preceding sentence to repair that split.
+    This is a segmentation-repair signal, not a normal discourse or stylistic signal.
+    Use true only when the previous and current sentences were split at the wrong boundary and would
+    mislead the user if shown as separate captions.
+    Strong positive cases:
+    - previous [PREVIOUS SENTENCE DISCOURSE] had source_quality: "fragmented" AND this sentence
+      grammatically continues it
+    - this sentence's source_quality is "fragmented" AND it clearly attaches to the previous
+    - this sentence grammatically completes a dangling predicate or unfinished clause from the previous
+      sentence, regardless of whether the previous call set continuation_required: true
+    - previous [PREVIOUS SENTENCE DISCOURSE] had display_ready: false AND this sentence clearly
+      resolves the bad split rather than merely continuing the sermon naturally
+    - the current sentence is a very short fragment that only exists because the stream split a single
+      utterance incorrectly
+    Negative cases — set false:
+    - rhetorical question followed by its answer, if both are acceptable standalone captions
+    - quote introduction followed by scripture quote, if both are acceptable standalone captions
+    - any case where separate stable segments plus in-place revision are acceptable
+    - any case where merge would be stylistic preference rather than segmentation repair
     All other cases → false.
     When true, you MUST write improved_translation as a fluent English rendering of the COMPLETE
-    merged unit — the [PREVIOUS SENTENCE — PENDING MERGE] text PLUS the current sentence,
-    treated as a single utterance. Do not translate only the current sentence.
-    Example: if previous was "Tiene peso, tiene significado, es" and current is "el amor de Dios",
-    improved_translation must render "It has weight, it has meaning — it is the love of God."
-    The previous sentence's translation was suppressed awaiting this merge.
+    repaired unit — the [PREVIOUS SENTENCE — PENDING MERGE] text PLUS the current sentence,
+    treated as one utterance. Do not translate only the current sentence.
 
 13. paragraph_break: true if this sentence opens a new major section, topic shift, or
     rhetorical phase. Triggers a visual separator on the display.
@@ -390,7 +387,7 @@ def _if_clause_validator(text: str) -> str:
 
     Currently logs a warning for audit but does not auto-correct, since
     auto-correction would risk silently losing theological content. The
-    merge_with_previous LLM logic is the primary fix path.
+    merge_with_previous LLM logic is the segmentation-repair path.
 
     Detects: "If we say that we have [X], I am [Y]."
     where the subject shifts between protasis and apodosis — a sign that
@@ -410,7 +407,7 @@ def _if_clause_validator(text: str) -> str:
                 "[translation] Possible subject-shift conditional: subject '%s' → '%s' in: %s",
                 subj1, subj2, text[:80],
             )
-    return text  # no auto-correction — LLM handles the merge
+    return text  # no auto-correction — LLM handles segmentation repair when needed
 
 
 def _normalize_translation(text: str, reference_english: str = "") -> str:
@@ -677,8 +674,9 @@ def _build_user_message(
                 f"[PREVIOUS SENTENCE — PENDING MERGE]\n"
                 f"  ES: {prev_sp}\n"
                 f"  EN: {prev_en}\n"
-                f"If merge_with_previous is true, improved_translation MUST cover both "
-                f"this previous sentence AND the current sentence as one complete unit."
+                f"If merge_with_previous is true, treat it as segmentation repair only. "
+                f"improved_translation MUST cover both this previous sentence AND the current sentence "
+                f"as one repaired unit."
             )
 
     word_count = len(spanish.split())
@@ -759,13 +757,13 @@ class LLMEnrichmentService:
         self._shown_suggestions: set[str] = set()
         # Discourse output of the previous enriched sentence — injected as forward context
         self._prev_discourse: dict | None = None
-        # Timestamp of the previously enriched sentence — used for caption_merge targeting
+        # Timestamp of the previously enriched sentence — used for segmentation-repair targeting
         self._prev_sentence_ts: int | None = None
         # Deferred translation updates: ts → (english, asyncio.Task)
-        # When display_ready is false, translation_update is held pending merge or timeout.
+        # When display_ready is false, translation_update is held pending segmentation repair or timeout.
         self._deferred_updates: dict[int, tuple[str, asyncio.Task]] = {}
-        # Chain-aware merge. Anchored to the EARLIEST visible segment so the caption
-        # stays at a stable screen position as fragments accumulate.
+        # Chain-aware segmentation repair. Anchored to the EARLIEST visible segment so the caption
+        # stays at a stable screen position if a bad split must be repaired.
         # {
         #   "head_ts": int,   # oldest visible segment (ts_keep in every merge)
         #   "tail_ts": int,   # most recently absorbed fragment (used to detect chain extension)
@@ -776,7 +774,7 @@ class LLMEnrichmentService:
         # Rolling sermon mode trajectory (last 3 modes) — injected into prompt for
         # better mode classification at rhetorical transitions.
         self._recent_modes: deque[str] = deque(maxlen=3)
-        # Last translation emitted per ts — guards against redundant caption_merge
+        # Last translation emitted per ts — guards against redundant segmentation-repair
         # emissions when chain extends (prevents UI flickering on the head segment).
         self._last_emitted_translation: dict[int, str] = {}
 
@@ -1235,7 +1233,7 @@ class LLMEnrichmentService:
             self._sentence_history.append((spanish, best_english))
 
             # --- Caption merge (head-anchored chain) ---
-            # The chain is always anchored to the EARLIEST visible segment (head_ts = ts_keep).
+            # The repair chain is always anchored to the EARLIEST visible segment (head_ts = ts_keep).
             # Every subsequent fragment is absorbed INTO the head so the caption stays at a
             # stable screen position as the chain grows.
             #
@@ -1247,7 +1245,7 @@ class LLMEnrichmentService:
 
                 chain = self._merge_chain_head
                 if chain is not None and prev_ts == chain["tail_ts"]:
-                    # Extending an active chain — absorb current ts into the head anchor.
+                    # Extending an active segmentation-repair chain — absorb current ts into the head anchor.
                     chain_spanish = chain["spanish"] + " " + spanish
                     chain_len = chain["length"] + 1
                     head_ts = chain["head_ts"]
@@ -1294,7 +1292,7 @@ class LLMEnrichmentService:
                         )
 
                 else:
-                    # Starting a new chain — prev_ts becomes the head anchor; current ts absorbed.
+                    # Starting a new segmentation-repair chain — prev_ts becomes the head anchor; current ts absorbed.
                     prev_spanish = hist[-2][0] if len(hist) >= 2 else spanish
                     chain_spanish = prev_spanish + " " + spanish
 
@@ -1472,9 +1470,9 @@ class LLMEnrichmentService:
     async def _deferred_translation_release(
         self, ts: int, english: str, google_english: str
     ) -> None:
-        """Fallback: release a suppressed translation after DEFERRED_RELEASE_S if no merge arrived.
+        """Fallback: release a suppressed translation after DEFERRED_RELEASE_S if no segmentation repair arrived.
 
-        Called when display_ready was false. If caption_merge fires first, this task
+        Called when display_ready was false. If caption_merge fires first as segmentation repair, this task
         is cancelled. If no merge arrives within the timeout, the best available
         translation is emitted so the caption is not permanently blank.
         """

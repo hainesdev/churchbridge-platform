@@ -62,7 +62,7 @@ def _make_result(seg_metadata=None, extra_msgs=None):
     """Minimal result dict for scorecard tests."""
     base_msgs = [
         {"type": "final_spanish", "ts": 1000, "text": "hola", "_elapsed_s": 1.0},
-        {"type": "translation", "ts": 1000, "english": "hello", "_elapsed_s": 1.5},
+        {"type": "feed_commit", "segment_id": 1000, "ts": 1000, "english": "hello", "_elapsed_s": 1.5},
     ]
     if extra_msgs:
         base_msgs.extend(extra_msgs)
@@ -71,8 +71,8 @@ def _make_result(seg_metadata=None, extra_msgs=None):
         "layers": {
             "raw_deepgram": {},
             "committed_sentences": {"sentence_count": 1},
-            "translations": [{"ts": 1000, "english": "hello", "elapsed_s": 1.5}],
-            "llm_corrections": [],
+            "feed_commits": [{"segment_id": 1000, "ts": 1000, "english": "hello", "elapsed_s": 1.5}],
+            "feed_revisions": [],
             "verse_events": [],
             "segment_metadata": seg_metadata or [],
             "mode_changes": [],
@@ -93,18 +93,18 @@ def test_deferred_release_count_uses_pending_completion():
     assert scorecard["latency"]["deferred_release_timeout_count"] == 0
 
 
-def test_deferred_release_timeout_count_fires_when_translation_update_arrives():
-    """deferred_release_timeout_count increments when timeout fires (translation_update, no merge)."""
+def test_deferred_release_timeout_count_fires_when_feed_revision_arrives():
+    """deferred_release_timeout_count increments when timeout fires (feed_revision, no merge)."""
     result = _make_result(
         seg_metadata=[
             {"type": "segment_metadata", "ts": 1000, "pending_completion": True, "_elapsed_s": 2.0},
         ],
         extra_msgs=[
-            {"type": "translation_update", "ts": 1000, "english": "hello world", "_elapsed_s": 8.0},
+            {"type": "feed_revision", "segment_id": 1000, "ts": 1000, "english": "hello world", "_elapsed_s": 8.0},
         ],
     )
-    result["layers"]["llm_corrections"] = [
-        {"type": "translation_update", "ts": 1000, "english": "hello world", "elapsed_s": 8.0}
+    result["layers"]["feed_revisions"] = [
+        {"type": "feed_revision", "segment_id": 1000, "ts": 1000, "english": "hello world", "elapsed_s": 8.0}
     ]
     scorecard = build_scorecard(result)
     assert scorecard["latency"]["deferred_release_count"] == 1
@@ -144,11 +144,11 @@ def test_client_visible_rewrite_count_only_counts_actual_text_changes():
         "layers": {
             "raw_deepgram": {},
             "committed_sentences": {"sentence_count": 1},
-            "translations": [{"ts": 1000, "english": "hello", "elapsed_s": 1.0}],
-            "llm_corrections": [
-                {"type": "translation_update", "ts": 1000, "english": "hello", "elapsed_s": 1.5},
-                {"type": "translation_update", "ts": 1000, "english": "hello there", "elapsed_s": 2.0},
-                {"type": "translation_update", "ts": 2000, "english": "orphan", "elapsed_s": 2.5},
+            "feed_commits": [{"segment_id": 1000, "ts": 1000, "english": "hello", "elapsed_s": 1.0}],
+            "feed_revisions": [
+                {"type": "feed_revision", "segment_id": 1000, "ts": 1000, "english": "hello", "elapsed_s": 1.5},
+                {"type": "feed_revision", "segment_id": 1000, "ts": 1000, "english": "hello there", "elapsed_s": 2.0},
+                {"type": "feed_revision", "segment_id": 2000, "ts": 2000, "english": "orphan", "elapsed_s": 2.5},
             ],
             "verse_events": [],
             "segment_metadata": [],
@@ -156,10 +156,10 @@ def test_client_visible_rewrite_count_only_counts_actual_text_changes():
         },
         "all_messages": [
             {"type": "final_spanish", "ts": 1000, "text": "hola"},
-            {"type": "translation", "ts": 1000, "english": "hello", "_elapsed_s": 1.0},
-            {"type": "translation_update", "ts": 1000, "english": "hello", "_elapsed_s": 1.5},
-            {"type": "translation_update", "ts": 1000, "english": "hello there", "_elapsed_s": 2.0},
-            {"type": "translation_update", "ts": 2000, "english": "orphan", "_elapsed_s": 2.5},
+            {"type": "feed_commit", "segment_id": 1000, "ts": 1000, "english": "hello", "_elapsed_s": 1.0},
+            {"type": "feed_revision", "segment_id": 1000, "ts": 1000, "english": "hello", "_elapsed_s": 1.5},
+            {"type": "feed_revision", "segment_id": 1000, "ts": 1000, "english": "hello there", "_elapsed_s": 2.0},
+            {"type": "feed_revision", "segment_id": 2000, "ts": 2000, "english": "orphan", "_elapsed_s": 2.5},
         ],
     }
 

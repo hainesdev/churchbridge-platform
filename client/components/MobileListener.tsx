@@ -6,16 +6,48 @@ interface MobileListenerProps {
   churchId: string;
 }
 
+interface ListenerLine {
+  id: number;
+  text: string;
+}
+
+function messageSegmentId(msg: Record<string, unknown>): number | null {
+  const raw = msg.segment_id ?? msg.ts;
+  if (raw === undefined || raw === null) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function MobileListener({ churchId }: MobileListenerProps) {
-  const [lines, setLines] = useState<{ id: number; text: string }[]>([]);
-  const [partial, setPartial] = useState('');
+  const [lines, setLines] = useState<ListenerLine[]>([]);
+  const [liveText, setLiveText] = useState('');
+  const [liveSegmentId, setLiveSegmentId] = useState<number | null>(null);
   const [connected, setConnected] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const lastInterimTextRef = useRef<string | null>(null);
+  const liveSegmentRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    liveSegmentRef.current = liveSegmentId;
+  }, [liveSegmentId]);
 
   useEffect(() => {
     let ws: WebSocket;
     let stopped = false;
+
+    const clearLiveIfMatches = (segmentId: number | null) => {
+      setLiveText(prev => {
+        if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
+          return '';
+        }
+        return prev;
+      });
+      setLiveSegmentId(prev => {
+        if (segmentId === null || prev === null || segmentId === prev) {
+          return null;
+        }
+        return prev;
+      });
+    };
 
     const connect = () => {
       if (stopped) return;
@@ -29,20 +61,45 @@ export function MobileListener({ churchId }: MobileListenerProps) {
 
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'interim_translation') {
-          const t = String(msg.text ?? '').trim();
-          if (t && t !== lastInterimTextRef.current) {
-            lastInterimTextRef.current = t;
-            setPartial((prev) => (prev ? prev + ' ' + t : t));
-          }
-        } else if (msg.type === 'translation') {
-          lastInterimTextRef.current = null;
-          setLines((prev) => [...prev.slice(-50), { id: msg.ts, text: msg.english }]);
-          setPartial('');
-        } else if (msg.type === 'correction') {
-          setLines((prev) =>
-            prev.map((l) => l.id === msg.ts ? { ...l, text: msg.english } : l)
-          );
+
+        if (msg.type === 'live_translation') {
+          setLiveText(String(msg.text ?? ''));
+          setLiveSegmentId(messageSegmentId(msg));
+          return;
+        }
+
+        if (msg.type === 'live_translation_clear') {
+          clearLiveIfMatches(messageSegmentId(msg));
+          return;
+        }
+
+        if (msg.type === 'feed_commit') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) return;
+          const english = String(msg.english ?? '');
+          setLines(prev => {
+            const existing = prev.some(line => line.id === segmentId);
+            if (existing) {
+              return prev.map(line => line.id === segmentId ? { ...line, text: english } : line);
+            }
+            return [...prev.slice(-50), { id: segmentId, text: english }];
+          });
+          clearLiveIfMatches(segmentId);
+          return;
+        }
+
+        if (msg.type === 'feed_revision') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) return;
+          const english = String(msg.english ?? '');
+          setLines(prev => {
+            const existing = prev.some(line => line.id === segmentId);
+            if (existing) {
+              return prev.map(line => line.id === segmentId ? { ...line, text: english } : line);
+            }
+            return [...prev.slice(-50), { id: segmentId, text: english }];
+          });
+          return;
         }
       };
     };
@@ -53,11 +110,10 @@ export function MobileListener({ churchId }: MobileListenerProps) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [lines, partial]);
+  }, [lines, liveText]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-white flex flex-col">
-      {/* Header */}
       <div className="flex-none bg-gray-900 px-4 py-3 flex items-center gap-2">
         <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
         <span className="text-sm text-gray-400">
@@ -65,9 +121,8 @@ export function MobileListener({ churchId }: MobileListenerProps) {
         </span>
       </div>
 
-      {/* Translation lines */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-        {lines.length === 0 && !partial && (
+        {lines.length === 0 && !liveText && (
           <p className="text-gray-600 text-center mt-12 text-base">
             Translation will appear here when the service begins.
           </p>
@@ -79,10 +134,10 @@ export function MobileListener({ churchId }: MobileListenerProps) {
           </p>
         ))}
 
-        {partial && (
+        {liveText && (
           <p className="text-xl leading-relaxed text-gray-400 italic">
-            {partial}
-            <span className="animate-pulse">▌</span>
+            {liveText}
+            <span className="animate-pulse ml-1">▌</span>
           </p>
         )}
 

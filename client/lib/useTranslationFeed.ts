@@ -58,25 +58,22 @@ export interface Segment {
   english: string;
   verseDetected?: VerseDetection;
   verseSuggestions?: VerseSuggestion[];
-  // TODO: use register to pull exact verse text once Bible versions are stored
   register?: TranslationRegister;
   paragraphBreak?: boolean;
   sourceQuality?: 'clean' | 'noisy' | 'fragmented';
-  /** True while the segment is pending a merge or deferred translation release.
-   *  Set by segment_metadata when display_ready=false; cleared on translation_update or caption_merge. */
   pendingCompletion?: boolean;
-  /** True when the buffer had to flush an incomplete tail because the audio chunk/session ended. */
   terminalIncomplete?: boolean;
 }
 
-const PARTIAL_FLUSH_MS = 80;
 const FLASH_MS = 600;
 
 export interface TranslationFeed {
   segments: Segment[];
   spanishLines: string[];
   partialSpanish: string;
-  partialEnglish: string;
+  liveEnglish: string;
+  liveSegmentId: number | null;
+  liveUpdatedAt: number | null;
   connected: boolean;
   flashingId: number | null;
   verses: VerseDetection[];
@@ -91,11 +88,31 @@ export interface TranslationFeed {
   lastCommittedEnglish: string;
 }
 
+function messageSegmentId(msg: Record<string, unknown>): number | null {
+  const raw = msg.segment_id ?? msg.ts;
+  if (raw === undefined || raw === null) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function messageMergeRef(msg: Record<string, unknown>): { keep: number | null; absorb: number | null } {
+  const keepRaw = msg.segment_id_keep ?? msg.ts_keep;
+  const absorbRaw = msg.segment_id_absorb ?? msg.ts_absorb;
+  const keep = keepRaw === undefined || keepRaw === null ? null : Number(keepRaw);
+  const absorb = absorbRaw === undefined || absorbRaw === null ? null : Number(absorbRaw);
+  return {
+    keep: Number.isFinite(keep) ? keep : null,
+    absorb: Number.isFinite(absorb) ? absorb : null,
+  };
+}
+
 export function useTranslationFeed(churchId: string): TranslationFeed {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [spanishLines, setSpanishLines] = useState<string[]>([]);
   const [partialSpanish, setPartialSpanish] = useState('');
-  const [partialEnglish, setPartialEnglish] = useState('');
+  const [liveEnglish, setLiveEnglish] = useState('');
+  const [liveSegmentId, setLiveSegmentId] = useState<number | null>(null);
+  const [liveUpdatedAt, setLiveUpdatedAt] = useState<number | null>(null);
   const [connected, setConnected] = useState(false);
   const [flashingId, setFlashingId] = useState<number | null>(null);
   const [verses, setVerses] = useState<VerseDetection[]>([]);
@@ -109,23 +126,39 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   const [lastFinalSpanish, setLastFinalSpanish] = useState('');
   const [lastCommittedEnglish, setLastCommittedEnglish] = useState('');
 
-  const partialQueueRef = useRef('');
-  const lastInterimTextRef = useRef<string | null>(null);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mergedIntoRef = useRef<Map<number, number>>(new Map());
+  const liveSegmentRef = useRef<number | null>(null);
 
-  // Flush buffered partial tokens to state on a fixed interval
   useEffect(() => {
-    const timer = setInterval(() => {
-      const q = partialQueueRef.current;
-      setPartialEnglish(prev => prev !== q ? q : prev);
-    }, PARTIAL_FLUSH_MS);
-    return () => clearInterval(timer);
-  }, []);
+    liveSegmentRef.current = liveSegmentId;
+  }, [liveSegmentId]);
 
   useEffect(() => {
     let ws: WebSocket;
     let stopped = false;
+
+    const flashSegment = (segmentId: number) => {
+      setFlashingId(segmentId);
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+      flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
+    };
+
+    const clearLiveIfMatches = (segmentId: number | null) => {
+      setLiveEnglish(prev => {
+        if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
+          return '';
+        }
+        return prev;
+      });
+      setLiveSegmentId(prev => {
+        if (segmentId === null || prev === null || segmentId === prev) {
+          return null;
+        }
+        return prev;
+      });
+      setLiveUpdatedAt(Date.now());
+    };
 
     const connect = () => {
       if (stopped) return;
@@ -149,131 +182,181 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           setPartialSpanish(text);
           setLastInterimSpanish(text);
           setLastInterimAt(Date.now());
+          return;
+        }
 
-        } else if (msg.type === 'stt_final') {
+        if (msg.type === 'stt_final') {
           const text = String(msg.text ?? '');
           setSpanishLines(prev => [...prev, text].slice(-8));
           setPartialSpanish('');
           setLastFinalSpanish(text);
           setLastFinalAt(Date.now());
+          return;
+        }
 
-        } else if (msg.type === 'interim_translation') {
-          const t = String(msg.text ?? '').trim();
-          if (t && t !== lastInterimTextRef.current) {
-            lastInterimTextRef.current = t;
-            partialQueueRef.current = partialQueueRef.current
-              ? partialQueueRef.current + ' ' + t
-              : t;
+        if (msg.type === 'live_translation') {
+          setLiveEnglish(String(msg.text ?? ''));
+          setLiveSegmentId(messageSegmentId(msg));
+          setLiveUpdatedAt(Date.now());
+          return;
+        }
+
+        if (msg.type === 'live_translation_clear') {
+          clearLiveIfMatches(messageSegmentId(msg));
+          return;
+        }
+
+        if (msg.type === 'feed_commit') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) {
+            console.warn('[useTranslationFeed] feed_commit missing segment_id:', msg);
+            return;
           }
-
-        } else if (msg.type === 'translation') {
           const english = String(msg.english ?? '');
+          const spanish = String(msg.spanish ?? '');
           setSegments(prev => {
-            const ts = Number(msg.ts);
-            const duplicateCount = prev.filter(s => s.id === ts).length;
-            // Deduplicate by ts to keep React keys stable when duplicate delivery/replay occurs.
-            if (duplicateCount > 0) {
-              return prev.map(s =>
-                s.id === ts
-                  ? { ...s, spanish: String(msg.spanish ?? ''), english }
-                  : s
+            const existing = prev.some(segment => segment.id === segmentId);
+            if (existing) {
+              return prev.map(segment =>
+                segment.id === segmentId
+                  ? { ...segment, english, spanish, pendingCompletion: false }
+                  : segment,
               );
             }
-            return [...prev.slice(-99), { id: ts, spanish: String(msg.spanish ?? ''), english }];
+            return [...prev.slice(-99), { id: segmentId, english, spanish }];
           });
-          setSpanishLines([]);
-          setPartialSpanish('');
-          lastInterimTextRef.current = null;
-          partialQueueRef.current = '';
-          setPartialEnglish('');
+          clearLiveIfMatches(segmentId);
           setLastCommittedEnglish(english);
           setLastTranslationAt(Date.now());
+          return;
+        }
 
-        } else if (msg.type === 'correction' || msg.type === 'translation_update') {
-          // Both events update a committed segment's English text and flash it.
-          // translation_update is the LLM-improved version (or deferred release); correction is Google's dual-pass.
-          // Clear pendingCompletion — the segment is now finalised.
-          const english = String(msg.english ?? '');
-          setSegments(prev => prev.map(s =>
-            s.id === msg.ts ? { ...s, english, pendingCompletion: false } : s
-          ));
-          const isMergedRebaseline = msg.type === 'correction' && msg.reason === 'merged_rebaseline';
-          if (!isMergedRebaseline) {
-            setFlashingId(Number(msg.ts));
-            if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-            flashTimerRef.current = setTimeout(() => setFlashingId(null), FLASH_MS);
+        if (msg.type === 'feed_revision') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) {
+            console.warn('[useTranslationFeed] feed_revision missing segment_id:', msg);
+            return;
           }
-
-        } else if (msg.type === 'verse_detected') {
-          const verse = msg.verse as VerseDetection;
-          const targetTs = resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts));
-          setSegments(prev => attachVerseToVisibleSegment(prev, targetTs, verse));
-          setVerses(prev => [...prev, verse]);
-          setActiveVerseTs(targetTs);
-
-        } else if (msg.type === 'verse_range_update') {
-          const verse = msg.verse as VerseDetection;
-          const targetTs = resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts));
-          // Replace the existing verse entry for this book+chapter with the
-          // expanded range as the scratch pad accumulates more detections.
-          setVerses(prev => prev.map(v =>
-            v.book === verse.book && v.chapter === verse.chapter
-              ? verse
-              : v
-          ));
-          setSegments(prev => attachVerseToVisibleSegment(prev, targetTs, verse));
-
-        } else if (msg.type === 'verse_suggestion') {
-          const nextSuggestions = msg.suggestions as VerseSuggestion[];
-          const targetTs = resolveMergedSegmentId(mergedIntoRef.current, Number(msg.ts));
-          setSuggestions(nextSuggestions);
-          setSegments(prev => prev.map(s =>
-            s.id === targetTs ? { ...s, verseSuggestions: nextSuggestions } : s
-          ));
-          setActiveVerseTs(targetTs);
-
-        } else if (msg.type === 'caption_merge') {
-          // Remove the absorbed segment and update the kept segment with merged content.
-          // Clear pendingCompletion on the kept segment — it is now the merged final caption.
+          const english = String(msg.english ?? '');
+          const spanish = msg.spanish === undefined ? null : String(msg.spanish ?? '');
+          let found = false;
           setSegments(prev => {
-            const tsKeep = Number(msg.ts_keep);
-            const tsAbsorb = Number(msg.ts_absorb);
-            const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, tsKeep);
-            const carriedVerse = prev.find(s => s.id === tsAbsorb)?.verseDetected;
-            const carriedSuggestions = prev.find(s => s.id === tsAbsorb)?.verseSuggestions;
-            mergedIntoRef.current.set(tsAbsorb, resolvedKeep);
-            const filtered = prev.filter(s => s.id !== tsAbsorb);
-            return filtered.map(s =>
-              s.id === resolvedKeep
+            const updated = prev.map(segment => {
+              if (segment.id !== segmentId) return segment;
+              found = true;
+              return {
+                ...segment,
+                english,
+                spanish: spanish ?? segment.spanish,
+                pendingCompletion: false,
+              };
+            });
+            if (found) return updated;
+            return [...updated.slice(-99), {
+              id: segmentId,
+              english,
+              spanish: spanish ?? '',
+              pendingCompletion: false,
+            }];
+          });
+          setLastCommittedEnglish(english);
+          setLastTranslationAt(Date.now());
+          flashSegment(segmentId);
+          return;
+        }
+
+        if (msg.type === 'verse_detected') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) return;
+          const verse = msg.verse as VerseDetection;
+          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+          setSegments(prev => attachVerseToVisibleSegment(prev, targetSegmentId, verse));
+          setVerses(prev => [...prev, verse]);
+          setActiveVerseTs(targetSegmentId);
+          return;
+        }
+
+        if (msg.type === 'verse_range_update') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) return;
+          const verse = msg.verse as VerseDetection;
+          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+          setVerses(prev => prev.map(existing =>
+            existing.book === verse.book && existing.chapter === verse.chapter
+              ? verse
+              : existing,
+          ));
+          setSegments(prev => attachVerseToVisibleSegment(prev, targetSegmentId, verse));
+          return;
+        }
+
+        if (msg.type === 'verse_suggestion') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) return;
+          const nextSuggestions = msg.suggestions as VerseSuggestion[];
+          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+          setSuggestions(nextSuggestions);
+          setSegments(prev => prev.map(segment =>
+            segment.id === targetSegmentId
+              ? { ...segment, verseSuggestions: nextSuggestions }
+              : segment,
+          ));
+          setActiveVerseTs(targetSegmentId);
+          return;
+        }
+
+        if (msg.type === 'caption_merge') {
+          if (msg.reason && msg.reason !== 'segmentation_repair') {
+            console.warn('[useTranslationFeed] Ignoring unexpected caption_merge reason:', msg.reason);
+            return;
+          }
+          const { keep, absorb } = messageMergeRef(msg);
+          if (keep === null || absorb === null) {
+            console.warn('[useTranslationFeed] caption_merge missing segment refs:', msg);
+            return;
+          }
+          setSegments(prev => {
+            const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, keep);
+            const absorbedSegment = prev.find(segment => segment.id === absorb);
+            mergedIntoRef.current.set(absorb, resolvedKeep);
+            const filtered = prev.filter(segment => segment.id !== absorb);
+            return filtered.map(segment =>
+              segment.id === resolvedKeep
                 ? {
-                    ...s,
-                    spanish: msg.spanish as string,
-                    english: msg.english as string,
+                    ...segment,
+                    english: String(msg.english ?? segment.english),
+                    spanish: String(msg.spanish ?? segment.spanish),
                     pendingCompletion: false,
-                    verseDetected: s.verseDetected ?? carriedVerse,
-                    verseSuggestions: s.verseSuggestions ?? carriedSuggestions,
+                    verseDetected: segment.verseDetected ?? absorbedSegment?.verseDetected,
+                    verseSuggestions: segment.verseSuggestions ?? absorbedSegment?.verseSuggestions,
                   }
-                : s
+                : segment,
             );
           });
+          flashSegment(keep);
+          return;
+        }
 
-        } else if (msg.type === 'segment_metadata') {
-          // Update a segment with scaffolding fields.
-          // pendingCompletion drives visual dimming until merge or deferred release fires.
-          setSegments(prev => prev.map(s =>
-            s.id === msg.ts
+        if (msg.type === 'segment_metadata') {
+          const segmentId = messageSegmentId(msg);
+          if (segmentId === null) return;
+          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+          setSegments(prev => prev.map(segment =>
+            segment.id === targetSegmentId
               ? {
-                  ...s,
+                  ...segment,
                   register: msg.translation_register as TranslationRegister | undefined,
                   paragraphBreak: msg.paragraph_break as boolean | undefined,
                   sourceQuality: msg.source_quality as 'clean' | 'noisy' | 'fragmented' | undefined,
                   pendingCompletion: msg.pending_completion as boolean | undefined,
-                  terminalIncomplete: (msg.terminal_incomplete as boolean | undefined) ?? s.terminalIncomplete,
+                  terminalIncomplete: (msg.terminal_incomplete as boolean | undefined) ?? segment.terminalIncomplete,
                 }
-              : s
+              : segment,
           ));
+          return;
+        }
 
-        } else if (msg.type === 'mode_change') {
+        if (msg.type === 'mode_change') {
           setSermonMode(msg.to as SermonMode);
         }
       };
@@ -288,11 +371,23 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   }, [churchId]);
 
   return {
-    segments, spanishLines, partialSpanish, partialEnglish,
-    connected, flashingId,
-    verses, suggestions, activeVerseTs,
+    segments,
+    spanishLines,
+    partialSpanish,
+    liveEnglish,
+    liveSegmentId,
+    liveUpdatedAt,
+    connected,
+    flashingId,
+    verses,
+    suggestions,
+    activeVerseTs,
     sermonMode,
-    lastInterimAt, lastFinalAt, lastTranslationAt,
-    lastInterimSpanish, lastFinalSpanish, lastCommittedEnglish,
+    lastInterimAt,
+    lastFinalAt,
+    lastTranslationAt,
+    lastInterimSpanish,
+    lastFinalSpanish,
+    lastCommittedEnglish,
   };
 }

@@ -512,7 +512,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
     segments,
     spanishLines,
     partialSpanish,
-    partialEnglish,
+    liveEnglish,
     connected: displayConnected,
     flashingId,
     lastInterimAt,
@@ -563,7 +563,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
     if (!atBottomRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [segments, partialEnglish, partialSpanish, spanishLines]);
+  }, [segments, partialSpanish, spanishLines]);
 
   const scrollToLive = useCallback(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -727,7 +727,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
         className="flex-1 overflow-y-auto relative"
       >
         <div className="min-h-full flex flex-col justify-end px-5 pt-12 pb-6 gap-4">
-          {segments.length === 0 && !activeSpanish && !partialEnglish && (
+          {segments.length === 0 && !activeSpanish && !liveEnglish && (
             <p className="text-gray-500 text-sm text-center mb-4">{waitingHint}</p>
           )}
           {segments.map((s) => (
@@ -774,16 +774,6 @@ export function MobileTest({ churchId }: MobileTestProps) {
               <p className="text-sm text-gray-500 leading-snug">{s.spanish}</p>
             </motion.div>
           ))}
-          <div className="space-y-0.5 min-h-[2rem]">
-            {partialEnglish && (
-              <p className="text-xl font-semibold leading-snug text-gray-400">
-                {partialEnglish}<span className="animate-pulse text-blue-400 ml-0.5">▌</span>
-              </p>
-            )}
-            {activeSpanish && (
-              <p className="text-sm text-gray-600 leading-snug">{activeSpanish}</p>
-            )}
-          </div>
         </div>
 
         {scrolledUp && (
@@ -793,6 +783,17 @@ export function MobileTest({ churchId }: MobileTestProps) {
           >
             ↓ Live
           </button>
+        )}
+      </div>
+
+      <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-4 py-4 backdrop-blur">
+        <p className="text-[11px] uppercase tracking-[0.24em] text-gray-500">Live Translation</p>
+        {liveEnglish ? (
+          <p className="mt-2 text-xl font-semibold leading-snug text-white">
+            {liveEnglish}<span className="animate-pulse text-blue-400 ml-1">▌</span>
+          </p>
+        ) : (
+          <p className="mt-2 text-sm text-gray-500">Waiting for live translation...</p>
         )}
       </div>
 

@@ -12,7 +12,7 @@ full production pipeline:
     -> Google Translate -> LLM enrichment -> broadcaster -> display WebSocket
 
 All events received by the display WebSocket are stored in the result JSON,
-including interim results, committed sentences, translations, LLM corrections,
+including live dock updates, committed sentences, feed commits, feed revisions,
 verse detections, segment metadata, and mode changes.
 
 Concurrent runs must be isolated. If you run multiple pipeline benchmarks at
@@ -260,8 +260,8 @@ def build_result(
 ) -> dict:
     stt_finals = [m for m in messages if m["type"] == "stt_final"]
     committed = [m for m in messages if m["type"] == "final_spanish"]
-    translations = [m for m in messages if m["type"] == "translation"]
-    corrections = [m for m in messages if m["type"] in ("correction", "translation_update")]
+    translations = [m for m in messages if m["type"] == "feed_commit"]
+    corrections = [m for m in messages if m["type"] == "feed_revision"]
     verses = [m for m in messages if m["type"] in ("verse_detected", "verse_range_update", "verse_suggestion")]
     seg_metadata = [m for m in messages if m["type"] == "segment_metadata"]
     mode_changes = [m for m in messages if m["type"] == "mode_change"]
@@ -296,24 +296,30 @@ def build_result(
                 "text": committed_text,
                 "wer": compute_wer(ref_text, committed_text) if committed_text else None,
             },
-            "translations": [
-                {
-                    "spanish": m.get("spanish"),
-                    "english": m.get("english"),
-                    "ts": m.get("ts"),
-                    "elapsed_s": m.get("_elapsed_s"),
-                }
-                for m in translations
-            ],
-            "llm_corrections": [
-                {
-                    "type": m["type"],
-                    "english": m.get("english"),
-                    "ts": m.get("ts"),
-                    "elapsed_s": m.get("_elapsed_s"),
-                }
-                for m in corrections
-            ],
+        "feed_commits": [
+            {
+                "spanish": m.get("spanish"),
+                "english": m.get("english"),
+                "segment_id": m.get("segment_id"),
+                "ts": m.get("ts"),
+                "source": m.get("source"),
+                "elapsed_s": m.get("_elapsed_s"),
+            }
+            for m in translations
+        ],
+        "feed_revisions": [
+            {
+                "type": m["type"],
+                "english": m.get("english"),
+                "spanish": m.get("spanish"),
+                "segment_id": m.get("segment_id"),
+                "ts": m.get("ts"),
+                "source": m.get("source"),
+                "reason": m.get("reason"),
+                "elapsed_s": m.get("_elapsed_s"),
+            }
+            for m in corrections
+        ],
             "verse_events": verses,
             "segment_metadata": seg_metadata,
             "mode_changes": mode_changes,
@@ -359,18 +365,21 @@ def print_report(result: dict) -> None:
     for i, sentence in enumerate(committed["sentences"], 1):
         print(f"    {i}. {sentence}")
 
-    translations = result["layers"]["translations"]
+    translations = result["layers"]["feed_commits"]
     if translations:
-        print(f"\n  Translations  ({len(translations)}):")
+        print(f"\n  Feed Commits  ({len(translations)}):")
         for item in translations:
             print(f"    [{item['elapsed_s']:5.1f}s] ES: {item['spanish']}")
-            print(f"            EN: {item['english']}")
+            print(f"            EN: {item['english']}  ({item.get('source', 'unknown')})")
 
-    llm = result["layers"]["llm_corrections"]
+    llm = result["layers"]["feed_revisions"]
     if llm:
-        print(f"\n  LLM Corrections  ({len(llm)}):")
+        print(f"\n  Feed Revisions  ({len(llm)}):")
         for item in llm:
-            print(f"    [{item['elapsed_s']:5.1f}s] [{item['type']}] {item['english']}")
+            print(
+                f"    [{item['elapsed_s']:5.1f}s] "
+                f"[{item.get('reason', item['type'])}] {item['english']}"
+            )
 
     verses = result["layers"]["verse_events"]
     if verses:

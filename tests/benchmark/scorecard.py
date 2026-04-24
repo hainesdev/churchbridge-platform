@@ -165,16 +165,16 @@ def build_scorecard(result: dict) -> dict:
 
     raw_layer       = layers.get("raw_deepgram", {})
     committed_layer = layers.get("committed_sentences", {})
-    translations    = layers.get("translations", [])      # list of dicts
-    corrections     = layers.get("llm_corrections", [])   # list of dicts
+    translations    = layers.get("feed_commits", layers.get("translations", []))      # list of dicts
+    corrections     = layers.get("feed_revisions", layers.get("llm_corrections", []))   # list of dicts
     verse_events    = layers.get("verse_events", [])
     mode_changes    = layers.get("mode_changes", [])
     seg_metadata    = layers.get("segment_metadata", [])
 
     # Rebuild message lists from all_messages (needed for _elapsed_s on committed)
     committed_msgs   = [m for m in all_msgs if m.get("type") == "final_spanish"]
-    translation_msgs = [m for m in all_msgs if m.get("type") == "translation"]
-    correction_msgs  = [m for m in all_msgs if m.get("type") in ("correction", "translation_update")]
+    translation_msgs = [m for m in all_msgs if m.get("type") in ("feed_commit", "translation")]
+    correction_msgs  = [m for m in all_msgs if m.get("type") in ("feed_revision", "correction", "translation_update")]
 
     # ── A. Accuracy ────────────────────────────────────────────────────────────
 
@@ -204,9 +204,9 @@ def build_scorecard(result: dict) -> dict:
 
     # ── B. Latency and Flow ────────────────────────────────────────────────────
 
-    time_to_first_translation = _first_elapsed(all_msgs, "translation")
+    time_to_first_translation = _first_elapsed(all_msgs, "feed_commit", "translation")
     time_to_first_committed   = _first_elapsed(all_msgs, "final_spanish")
-    time_to_first_correction  = _first_elapsed(all_msgs, "correction", "translation_update")
+    time_to_first_correction  = _first_elapsed(all_msgs, "feed_revision", "correction", "translation_update")
 
     trans_lat_pairs  = _translation_latencies(committed_msgs, translation_msgs)
     corr_lat_pairs   = _correction_latencies(translation_msgs, correction_msgs)
@@ -218,9 +218,9 @@ def build_scorecard(result: dict) -> dict:
     }
 
     # deferred timeouts: suppressed sentences where the 6-second timeout fired.
-    # Identified by a translation_update arriving for the ts without a prior
+    # Identified by a feed_revision arriving for the ts without a prior
     # caption_merge absorbing it (when a merge absorbs the ts, the deferred
-    # task is cancelled and no translation_update is emitted for that ts).
+    # task is cancelled and no feed_revision is emitted for that ts).
     caption_merge_absorbed_ts = {
         m.get("ts_absorb") for m in all_msgs if m.get("type") == "caption_merge"
     }

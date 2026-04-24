@@ -454,6 +454,8 @@ class TestCorrectionSuppressedEvent:
             session._church_id = "test"
             session._broadcaster = _StubBroadcaster()
             session._enrichment_settled = {1000}
+            session._pending_feed_commits = {}
+            session._last_segment_id = 0
 
             # ts=1000 is settled → should emit correction_suppressed
             await session._on_correction(1000, "Late Google correction")
@@ -461,8 +463,15 @@ class TestCorrectionSuppressedEvent:
             await session._on_correction(2000, "Normal correction")
 
             assert events == [
-                {"type": "correction_suppressed", "ts": 1000},
-                {"type": "correction", "ts": 2000, "english": "Normal correction"},
+                {"type": "correction_suppressed", "segment_id": 1000, "ts": 1000},
+                {
+                    "type": "feed_revision",
+                    "segment_id": 2000,
+                    "ts": 2000,
+                    "english": "Normal correction",
+                    "source": "google",
+                    "reason": "forward_context_correction",
+                },
             ]
 
         run(run_())
@@ -533,6 +542,7 @@ class TestSessionCloseIncompleteMetadata:
             session._enrichment_settled = set()
             session._db_session_id = None
             session._recorder = None
+            session._last_segment_id = 0
 
             await session._on_sentence(
                 "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
@@ -568,6 +578,12 @@ class TestSessionCloseIncompleteMetadata:
             session._db_session_id = None
             session._enrichment = None
             session._recorder = None
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._pending_suggested_verses = {}
             session._pending_audio_timing = {
                 1000: {
                     "audio_start": 0.0,
@@ -582,20 +598,79 @@ class TestSessionCloseIncompleteMetadata:
                 "Now, let's understand, phrase by phrase, word by word, what",
                 1000,
             )
+            await session._flush_all_pending_commits()
 
-            assert events == [
-                {
-                    "type": "translation",
-                    "spanish": "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
-                    "english": "Now, let's understand, phrase by phrase, word by word, what...",
-                    "ts": 1000,
-                }
+            assert [event["type"] for event in events] == [
+                "live_translation",
+                "feed_commit",
+                "live_translation_clear",
             ]
+            assert events[0]["text"] == "Now, let's understand, phrase by phrase, word by word, what..."
+            assert events[1] == {
+                "type": "feed_commit",
+                "spanish": "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
+                "english": "Now, let's understand, phrase by phrase, word by word, what...",
+                "source": "google",
+                "segment_id": 1000,
+                "ts": 1000,
+            }
+            assert events[2] == {
+                "type": "live_translation_clear",
+                "reason": "committed",
+                "segment_id": 1000,
+                "ts": 1000,
+            }
 
         run(run_())
 
 
 class TestTranslationRepairFallback:
+    def test_llm_revision_commits_pending_segment_without_visible_rewrite(self):
+        async def run_():
+            events = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._db_session_id = None
+            session._enrichment = None
+            session._recorder = None
+            session._enrichment_settled = set()
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._pending_suggested_verses = {}
+            session._pending_audio_timing = {
+                1000: {
+                    "audio_start": 0.0,
+                    "audio_end": 1.0,
+                    "terminal_incomplete": False,
+                    "flush_reason": "timer",
+                }
+            }
+
+            await session._on_translation("uno", "One", 1000)
+            await session._on_translation_update(1000, "The first one")
+
+            assert [event["type"] for event in events] == [
+                "live_translation",
+                "live_translation",
+                "feed_commit",
+                "live_translation_clear",
+            ]
+            assert events[2]["english"] == "The first one"
+            assert events[2]["source"] == "llm"
+
+        run(run_())
+
     def test_merge_candidate_is_checked_against_full_merged_unit(self):
         async def run_():
             updates = []

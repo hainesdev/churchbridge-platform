@@ -1,4 +1,5 @@
 'use client';
+import { useState } from 'react';
 
 export interface ModeTransition {
   from_mode: string;
@@ -25,8 +26,9 @@ interface ModeTimelineProps {
 }
 
 export function ModeTimeline({ transitions, sessionStart, sessionEnd }: ModeTimelineProps) {
+  const [renderedAt] = useState(() => Date.now());
   const startMs = new Date(sessionStart).getTime();
-  const endMs = sessionEnd ? new Date(sessionEnd).getTime() : Date.now();
+  const endMs = sessionEnd ? new Date(sessionEnd).getTime() : renderedAt;
   const spanMs = Math.max(endMs - startMs, 1);
 
   if (transitions.length === 0) {
