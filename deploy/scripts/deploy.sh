@@ -24,7 +24,10 @@ for legacy_name in churchbridge_api churchbridge_web; do
   fi
 done
 
-docker compose -f deploy/docker-compose.prod.yml up -d --build --remove-orphans
+echo "Stopping current compose stack to avoid recreate-time container name conflicts..."
+docker compose -f deploy/docker-compose.prod.yml down --remove-orphans
+
+docker compose -f deploy/docker-compose.prod.yml up -d --build
 
 # Keep the shared Nginx proxy vhost config in sync.  The dhaines_nginx container
 # mounts /var/www/dhaines.dev/nginx/conf.d from the host; this file must be there
