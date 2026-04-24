@@ -72,9 +72,9 @@ RULES:
    Common Spanish Pentecostal sermon interjections ("Santo", "Aleluya", "Gloria", "Amén") that appear
    mid-sentence and disrupt grammatical flow should be silently removed from the translation — they are
    STT artifacts of the preaching register, not content words.
-   When [PREVIOUS SENTENCE DISCOURSE] shows thought_complete: false, check whether the current sentence
-   completes that prior thought. If so, unify them naturally in improved_translation rather than
-   treating the current sentence in isolation.
+   When [PREVIOUS SENTENCE DISCOURSE] shows thought_complete: false, use that as context to interpret
+   the current sentence correctly. Do NOT include prior sentence content in improved_translation
+   unless merge_with_previous is true and [PREVIOUS SENTENCE — PENDING MERGE] is provided.
    When [PREVIOUS SENTENCE DISCOURSE] shows discourse_tag: "rhetorical_question", the current sentence
    is likely the answer. Keep improved_translation crisp and direct — it answers the previous question.
    When [PREVIOUS SENTENCE DISCOURSE] shows introduces_quote: true, the current sentence is quoted
@@ -211,24 +211,6 @@ RULES:
     Set to true only when ALL of the above are absent.
     When false, the translation is suppressed until a merge arrives or a fallback timeout fires.
     Be accurate — this drives whether the caption appears on screen.
-
-17. phrase_alignment: provide 2-8 ordered English phrase chunks that map the improved English
-    to the original Spanish. This powers tap-to-reveal Spanish in the client.
-    Each item must be a short phrase, not a whole sentence and not a single character.
-    The English phrases should read in order from left to right and cover the main meaning of the
-    displayed English sentence. The Spanish phrase should be the matching source wording.
-    Prefer natural phrase groupings like:
-    - "walk in the light" ↔ "andamos en luz"
-    - "we have fellowship" ↔ "tenemos comunión"
-    - "with one another" ↔ "unos con otros"
-    Rules:
-    - Keep phrases short and tappable: roughly 1-6 English words per item
-    - Preserve order
-    - Do not include empty items
-    - If alignment is unclear or the source is too noisy, return []
-    - The English side should reflect the displayed translation, not a literal gloss
-
-Alignment is handled in a separate follow-up step. Do not return phrase_alignment here.
 
 JSON schema (return exactly this shape):
 {
