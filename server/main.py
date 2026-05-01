@@ -21,7 +21,7 @@ logging.basicConfig(
 for _name in ("server.services", "server.db", "server.routes"):
     logging.getLogger(_name).setLevel(logging.INFO)
 
-REQUIRED = ["DEEPGRAM_API_KEY", "GOOGLE_TRANSLATE_API_KEY", "ANTHROPIC_API_KEY"]
+REQUIRED = ["GOOGLE_TRANSLATE_API_KEY", "ANTHROPIC_API_KEY"]
 for key in REQUIRED:
     if not os.getenv(key):
         raise RuntimeError(f"Missing required environment variable: {key}")

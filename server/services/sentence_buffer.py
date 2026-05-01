@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from typing import Any
 from typing import Callable, Awaitable
 
 logger = logging.getLogger(__name__)
@@ -109,11 +110,11 @@ def _is_incomplete(text: str) -> bool:
 
 
 class SentenceBuffer:
-    """Accumulates Deepgram final segments and flushes at sentence boundaries.
+    """Accumulates STT final segments and flushes at sentence boundaries.
 
     Primary flush signals (in priority order):
     1. Terminal punctuation at end of combined text (. ? ! … ;)
-    2. utterance_end() called by the session when Deepgram fires UtteranceEnd —
+    2. utterance_end() called by the session when STT voice activity ends —
        applies an incomplete-tail soft guard first; flushes if tail looks complete.
     3. Accumulated word count reaches MAX_WORDS (safety valve)
     4. Fallback timer (FLUSH_DELAY_S) with incomplete-tail guard:
@@ -130,7 +131,7 @@ class SentenceBuffer:
 
     Audio timing
     ------------
-    Each fragment carries Deepgram sermon-relative (audio_start, audio_end) floats.
+    Each fragment carries sermon-relative (audio_start, audio_end) floats from STT.
     The buffer tracks the span of the accumulated sentence:
       - audio_start: set from the first fragment in the sentence
       - audio_end:   updated with each fragment; reflects the last spoken word
@@ -138,9 +139,10 @@ class SentenceBuffer:
     sermon timeline for verse consolidation.
     """
 
-    def __init__(self, on_sentence: Callable[[str, float, float, str], Awaitable[None]]):
+    def __init__(self, on_sentence: Callable[[str, float, float, str, dict[str, Any]], Awaitable[None]]):
         self._on_sentence = on_sentence
         self._parts: list[str] = []
+        self._part_meta: list[dict[str, Any]] = []
         self._timer: asyncio.Task | None = None
         self._extension_count: int = 0  # number of timer extensions granted so far
         # Extra hold requested by the session for the next delayed flush
@@ -168,9 +170,16 @@ class SentenceBuffer:
             self._hold_reason = reason
         logger.debug("[sentence_buffer] Hold queued: %s (%.1fs)", reason, hold_secs)
 
-    async def add(self, text: str, audio_start: float = 0.0, audio_end: float = 0.0):
+    async def add(
+        self,
+        text: str,
+        audio_start: float = 0.0,
+        audio_end: float = 0.0,
+        stt_meta: dict[str, Any] | None = None,
+    ):
         self._cancel_timer()
         self._parts.append(text)
+        self._part_meta.append(dict(stt_meta or {}))
         # Pin audio_start to the first fragment; advance audio_end with each new one
         if self._audio_start is None:
             self._audio_start = audio_start
@@ -185,7 +194,7 @@ class SentenceBuffer:
             self._timer = asyncio.create_task(self._delayed_flush())
 
     async def utterance_end(self):
-        """Flush triggered by Deepgram's UtteranceEnd VAD event.
+        """Flush triggered by the STT voice-activity end event.
 
         UtteranceEnd is the strongest "speaker stopped" signal we have, but
         preachers frequently pause mid-clause for emphasis. If the accumulated
@@ -210,7 +219,7 @@ class SentenceBuffer:
     async def _utterance_end_guard(self):
         """Short hold after UtteranceEnd on an incomplete tail.
 
-        Waits UTTERANCE_END_GUARD_S for the next Deepgram final. If new content
+        Waits UTTERANCE_END_GUARD_S for the next STT final. If new content
         arrives (via add()), this task is cancelled and the buffer continues
         normally. If nothing arrives and the text is still incomplete, extend
         again (up to MAX_EXTENSIONS). Only flush once the text is complete or
@@ -355,7 +364,9 @@ class SentenceBuffer:
             sentence = ' '.join(self._parts)
             audio_start = self._audio_start or 0.0
             audio_end = self._audio_end
+            stt_meta = _merge_stt_meta(self._part_meta)
             self._parts = []
+            self._part_meta = []
             self._audio_start = None
             self._audio_end = 0.0
             self._extension_count = 0
@@ -366,9 +377,46 @@ class SentenceBuffer:
                 "[sentence_buffer] decision=%s words=%d text=%s",
                 reason, len(sentence.split()), sentence[:80],
             )
-            await self._on_sentence(sentence, audio_start, audio_end, reason)
+            await self._on_sentence(sentence, audio_start, audio_end, reason, stt_meta)
 
     def _cancel_timer(self):
         if self._timer and not self._timer.done():
             self._timer.cancel()
         self._timer = None
+
+
+def _merge_stt_meta(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not parts:
+        return {}
+
+    languages: list[str] = []
+    speaker_tags: set[int] = set()
+    confidences: list[float] = []
+    total_word_count = 0
+    low_confidence = False
+
+    for item in parts:
+        lang = str(item.get("detected_language") or "").strip()
+        if lang and lang not in languages:
+            languages.append(lang)
+        for tag in item.get("speaker_tags") or []:
+            if isinstance(tag, int):
+                speaker_tags.add(tag)
+        confidence = item.get("avg_confidence")
+        if isinstance(confidence, (int, float)):
+            confidences.append(float(confidence))
+        word_count = item.get("word_count")
+        if isinstance(word_count, int):
+            total_word_count += word_count
+        if item.get("low_confidence") is True:
+            low_confidence = True
+
+    return {
+        "stt_primary_language": languages[0] if languages else "",
+        "stt_detected_languages": languages,
+        "stt_speaker_tags": sorted(speaker_tags),
+        "stt_speaker_count": len(speaker_tags),
+        "stt_avg_confidence": round(sum(confidences) / len(confidences), 4) if confidences else None,
+        "stt_word_count": total_word_count,
+        "stt_low_confidence": low_confidence,
+    }

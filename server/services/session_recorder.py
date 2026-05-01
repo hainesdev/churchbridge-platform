@@ -7,7 +7,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-AUDIO_SAMPLE_RATE = 16000  # PCM16 mono, matches Deepgram input
+AUDIO_SAMPLE_RATE = 16000  # PCM16 mono, matches Google Speech input
 
 
 @dataclass

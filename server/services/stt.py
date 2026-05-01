@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+def _default_model() -> str:
+    return os.getenv("GOOGLE_SPEECH_MODEL", "chirp_3").strip() or "chirp_3"
+
+
+def _default_language_codes() -> tuple[str, ...]:
+    primary = os.getenv("GOOGLE_SPEECH_LANGUAGE", "es-US").strip() or "es-US"
+    return (primary,)
+
+
+def _default_location() -> str:
+    return os.getenv("GOOGLE_CLOUD_LOCATION", "us").strip() or "us"
+
+
+def _default_recognizer() -> str:
+    return os.getenv("GOOGLE_SPEECH_RECOGNIZER", "_").strip() or "_"
+
+
+def _parse_language_codes(payload: dict) -> tuple[str, ...]:
+    raw_codes = payload.get("languageCodes")
+    if isinstance(raw_codes, (list, tuple)):
+        cleaned = tuple(str(code).strip() for code in raw_codes if str(code).strip())
+        if cleaned:
+            return cleaned
+
+    legacy_language = str(payload.get("language") or "").strip()
+    if legacy_language:
+        return (legacy_language,)
+
+    return _default_language_codes()
+
+
+@dataclass(frozen=True)
+class STTConfig:
+    model: str = _default_model()
+    language_codes: tuple[str, ...] = field(default_factory=_default_language_codes)
+    interim_results: bool = True
+    utterance_end_ms: int = 2000
+    vad_events: bool = True
+    smart_format: bool = True
+    punctuate: bool = True
+    confidence_hold_threshold: float = 0.72
+    low_confidence_hold_secs: float = 2.5
+    location: str = _default_location()
+    recognizer: str = _default_recognizer()
+    diarization_enabled: bool = False
+    diarization_min_speakers: int = 2
+    diarization_max_speakers: int = 2
+
+    @classmethod
+    def from_payload(cls, payload: dict | None) -> "STTConfig":
+        payload = payload or {}
+        location = str(payload.get("location") or "").strip() or _default_location()
+        recognizer = str(payload.get("recognizer") or "").strip() or _default_recognizer()
+        return cls(
+            model=str(payload.get("model") or "").strip() or _default_model(),
+            language_codes=_parse_language_codes(payload),
+            interim_results=bool(payload.get("interimResults", cls.interim_results)),
+            utterance_end_ms=max(500, int(payload.get("utteranceEndMs", cls.utterance_end_ms))),
+            vad_events=bool(payload.get("vadEvents", cls.vad_events)),
+            smart_format=bool(payload.get("smartFormat", cls.smart_format)),
+            punctuate=bool(payload.get("punctuate", cls.punctuate)),
+            confidence_hold_threshold=float(payload.get("confidenceHoldThreshold", cls.confidence_hold_threshold)),
+            low_confidence_hold_secs=float(payload.get("lowConfidenceHoldSecs", cls.low_confidence_hold_secs)),
+            location=location,
+            recognizer=recognizer,
+            diarization_enabled=bool(payload.get("diarizationEnabled", cls.diarization_enabled)),
+            diarization_min_speakers=max(1, int(payload.get("diarizationMinSpeakers", cls.diarization_min_speakers))),
+            diarization_max_speakers=max(1, int(payload.get("diarizationMaxSpeakers", cls.diarization_max_speakers))),
+        )
+
+    def public_payload(self) -> dict:
+        primary_language = self.language_codes[0] if self.language_codes else ""
+        return {
+            "model": self.model,
+            "language": primary_language,
+            "languageCodes": list(self.language_codes),
+            "location": self.location,
+            "recognizer": self.recognizer,
+            "utteranceEndMs": self.utterance_end_ms,
+            "confidenceHoldThreshold": self.confidence_hold_threshold,
+            "lowConfidenceHoldSecs": self.low_confidence_hold_secs,
+            "diarizationEnabled": self.diarization_enabled,
+            "diarizationMinSpeakers": self.diarization_min_speakers,
+            "diarizationMaxSpeakers": self.diarization_max_speakers,
+        }

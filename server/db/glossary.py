@@ -12,7 +12,7 @@ DEFAULT_GLOSSARY = {
 
 
 async def get_glossary(church_id: str) -> dict[str, int]:
-    """Returns {term: boost_weight} for Deepgram keyword injection."""
+    """Returns {term: boost_weight} for STT adaptation / keyterm injection."""
     async with get_db() as db:
         cursor = await db.execute(
             "SELECT term, boost FROM church_glossary WHERE church_id = ? OR church_id = 'default' "

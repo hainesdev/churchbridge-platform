@@ -41,8 +41,8 @@ The repository now has two benchmark workflows:
 
 | Set | Status |
 |---|---|
-| `tests/audio/1` | 3 runs recorded; latest review action is `investigate` |
-| `tests/audio/2` | 3 runs recorded; latest review action is `promote` |
+| `tests/audio/1` | Inspect `tests/benchmark/results/1/pipeline/trajectory.json` plus the latest review artifact |
+| `tests/audio/2` | Inspect `tests/benchmark/results/2/pipeline/trajectory.json` plus the latest review artifact |
 
 Important:
 - The shared root-level `SELF_IMPROVEMENT_REPORT.md` reflects only the most recently evaluated legacy run.
@@ -52,19 +52,16 @@ Important:
 
 | Set | Status |
 |---|---|
-| `tests/audio/1` | 3 staggered runs captured/evaluated at offsets `0s`, `30s`, and `60s`, each with `--duration 5` |
-| `tests/audio/2` | 3 staggered runs captured/evaluated at offsets `0s`, `30s`, and `60s`, each with `--duration 5` |
+| `tests/audio/1` | Verify whether capture-only artifacts or fully evaluated artifacts are present before drawing conclusions |
+| `tests/audio/2` | Verify whether capture-only artifacts or fully evaluated artifacts are present before drawing conclusions |
 
 The staggered lane is a fresh regime. Its histories were intentionally reset so
 old 85-second and 30-second legacy runs do not pollute trend analysis.
 
-Current staggered action:
-- mixed by set: `collect_more_runs` for `tests/audio/1`, `promote` for `tests/audio/2`
-
-Why:
-- Both sets now have 3 comparable runs, so trend labels are available.
-- The staggered report summarizes all sets in the regime, but its top-level action still reflects the most recently evaluated set.
-- Review both per-set trajectories before acting on the report headline.
+Important:
+- A staggered regime-local report exists only after sequential evaluation has been run.
+- Capture-only staggered runs are not enough to claim an evaluated regime.
+- `promote` is now intentionally blocked until at least two staggered benchmark sets each contain comparable `0s` baseline and non-zero offset windows.
 
 ---
 
@@ -184,6 +181,11 @@ Primary files:
 - `tests/benchmark/results/staggered/<audio_dir>/pipeline/trajectory.json`
 - `tests/benchmark/results/staggered/<audio_dir>/pipeline/reviews/<run_id>.md`
 - `tests/benchmark/results/staggered/SELF_IMPROVEMENT_REPORT.md`
+
+Interpretation guardrails:
+- Treat this regime as a server-pipeline replay benchmark, not a client-capture benchmark.
+- Do not use staggered stress windows alone as evidence that iPhone/browser capture robustness is solved.
+- Do not treat a single set or a single clean window as sufficient evidence for promotion.
 
 ---
 

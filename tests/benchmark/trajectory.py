@@ -71,6 +71,8 @@ LOWER_IS_BETTER = {
     "deferred_release_count",
     "deferred_release_timeout_count",
     "stale_correction_suppression_count",
+    "low_confidence_final_count",
+    "low_confidence_final_rate",
     "out_of_order_event_count",
     "orphan_correction_count",
     "fragment_leak_count",
@@ -118,6 +120,11 @@ TIER = {
     "time_to_first_committed_sentence_s": 2,
     # Tier 3 — supportive diagnostics
     "wer_raw_pct":                    3,
+    "stt_final_count":                3,
+    "avg_stt_confidence":             3,
+    "min_stt_confidence":             3,
+    "low_confidence_final_count":     3,
+    "low_confidence_final_rate":      3,
     "committed_sentence_count":       3,
     "wall_time_s":                    3,
     "llm_correction_count":           3,
@@ -238,6 +245,10 @@ def _extract_series(scorecards: list[dict]) -> dict[str, list[float | None]]:
         series.setdefault("clip_duration_s", []).append(
             cd if isinstance(cd, (int, float)) else None
         )
+        offset = sc.get("clip_start_offset_s")
+        series.setdefault("clip_start_offset_s", []).append(
+            offset if isinstance(offset, (int, float)) else None
+        )
     return series
 
 
@@ -257,6 +268,31 @@ def _clip_duration_regime_changed(clip_durations: list[float | None]) -> bool:
     if prior_mean == 0:
         return False
     return abs(latest - prior_mean) / prior_mean > _CLIP_DURATION_CHANGE_THRESHOLD
+
+
+def _coverage_summary(scorecards: list[dict]) -> dict[str, Any]:
+    """Summarize clip-window diversity for this benchmark set."""
+    offsets = [
+        round(float(sc["clip_start_offset_s"]), 3)
+        for sc in scorecards
+        if isinstance(sc.get("clip_start_offset_s"), (int, float))
+    ]
+    distinct_offsets = sorted(set(offsets))
+    quality_eval_run_count = sum(
+        1
+        for sc in scorecards
+        if isinstance(
+            (sc.get("quality") or {}).get("translation_quality_rating"),
+            (int, float),
+        )
+    )
+    return {
+        "distinct_clip_offsets_s": distinct_offsets,
+        "distinct_clip_offset_count": len(distinct_offsets),
+        "has_zero_offset_baseline": any(abs(offset) < 1e-9 for offset in distinct_offsets),
+        "has_nonzero_offset_window": any(abs(offset) >= 1e-9 for offset in distinct_offsets),
+        "quality_eval_run_count": quality_eval_run_count,
+    }
 
 
 # ── Per-set trajectory ─────────────────────────────────────────────────────────
@@ -328,6 +364,7 @@ def compute_trajectory(pipeline_dir: Path) -> dict:
         "n_runs":             n_runs,
         "run_ids":            run_ids,
         "clip_regime_changed": clip_regime_changed,
+        "coverage":           _coverage_summary(scorecards),
         "confidence":  confidence,
         "metrics":     metrics,
     }

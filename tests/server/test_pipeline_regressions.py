@@ -5,7 +5,6 @@ These tests target bugs that are easy to miss in sequential unit tests:
 - committed sentence translations being cancelled by later sentences
 - enrichment state being applied in completion order instead of sentence order
 - deferred-release captions never clearing pending state
-- Deepgram reconnect timestamp drift after multiple reconnects
 """
 import asyncio
 import os
@@ -17,8 +16,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 from server.services.google_translate_service import GoogleTranslateService
-from server.services.deepgram_session import DeepgramSession
+from server.services.google_speech_session import (
+    GoogleSpeechSession,
+    _build_adaptation,
+    _build_recognition_config,
+)
 from server.services.llm_enrichment_service import LLMEnrichmentService, _build_alignment_request_message
+from server.services.stt import STTConfig
 
 
 class SlowFakeGoogleTranslateService(GoogleTranslateService):
@@ -218,54 +222,6 @@ class TestGoogleSentenceConcurrency:
 
             assert translations == [
                 (1000, "uno", "First"),
-            ]
-
-        run(run_())
-
-
-class TestDeepgramReconnectTimestamps:
-    def test_multiple_reconnects_keep_monotonic_non_duplicated_audio_offsets(self):
-        async def run_():
-            finals = []
-
-            async def on_final(text, audio_start, audio_end):
-                finals.append((text, audio_start, audio_end))
-
-            session = DeepgramSession(
-                church_id="test",
-                on_interim=lambda text: asyncio.sleep(0),
-                on_final=on_final,
-            )
-
-            await session._handle_transcript({
-                "channel": {"alternatives": [{"transcript": "uno"}]},
-                "start": 0.0,
-                "duration": 5.0,
-                "is_final": True,
-            })
-            session._stream_offset += session._last_stream_audio_end
-            session._last_stream_audio_end = 0.0
-
-            await session._handle_transcript({
-                "channel": {"alternatives": [{"transcript": "dos"}]},
-                "start": 0.0,
-                "duration": 5.0,
-                "is_final": True,
-            })
-            session._stream_offset += session._last_stream_audio_end
-            session._last_stream_audio_end = 0.0
-
-            await session._handle_transcript({
-                "channel": {"alternatives": [{"transcript": "tres"}]},
-                "start": 0.5,
-                "duration": 1.0,
-                "is_final": True,
-            })
-
-            assert finals == [
-                ("uno", 0.0, 5.0),
-                ("dos", 5.0, 10.0),
-                ("tres", 10.5, 11.5),
             ]
 
         run(run_())
@@ -636,6 +592,149 @@ class TestSessionCloseIncompleteMetadata:
                 "segment_id": 1000,
                 "ts": 1000,
             }
+
+        run(run_())
+
+
+class TestGoogleSttConfig:
+    def test_google_defaults_target_chirp_three(self):
+        config = STTConfig.from_payload({})
+
+        assert config.model == "chirp_3"
+        assert config.language_codes == ("es-US",)
+        assert config.location == "us"
+        assert config.recognizer == "_"
+        assert config.confidence_hold_threshold == 0.72
+        assert config.low_confidence_hold_secs == 2.5
+
+    def test_google_stt_config_accepts_multiple_language_codes(self):
+        config = STTConfig.from_payload({
+            "languageCodes": ["es-US", "en-US"],
+            "diarizationEnabled": True,
+            "diarizationMinSpeakers": 2,
+            "diarizationMaxSpeakers": 3,
+            "utteranceEndMs": 1500,
+            "confidenceHoldThreshold": 0.65,
+            "lowConfidenceHoldSecs": 3.0,
+        })
+
+        assert config.language_codes == ("es-US", "en-US")
+        assert config.diarization_enabled is True
+        assert config.diarization_min_speakers == 2
+        assert config.diarization_max_speakers == 3
+        assert config.utterance_end_ms == 1500
+        assert config.confidence_hold_threshold == 0.65
+        assert config.low_confidence_hold_secs == 3.0
+
+
+class TestGoogleSpeechConfig:
+    def test_google_recognition_config_includes_chirp_and_glossary_adaptation(self):
+        config = STTConfig.from_payload({
+            "model": "chirp_3",
+            "languageCodes": ["es-MX"],
+            "location": "us",
+        })
+
+        recognition = _build_recognition_config(config, 16000, {"Juan": 9, "Pentecostés": 6})
+
+        assert recognition.model == "chirp_3"
+        assert list(recognition.language_codes) == ["es-MX"]
+        assert recognition.features.enable_automatic_punctuation is True
+        assert recognition.adaptation.phrase_sets[0].inline_phrase_set.phrases[0].value == "Juan"
+
+    def test_google_glossary_adaptation_omits_empty_terms(self):
+        adaptation = _build_adaptation({"Juan": 8, "": 5})
+
+        phrases = adaptation.phrase_sets[0].inline_phrase_set.phrases
+        assert len(phrases) == 1
+        assert phrases[0].value == "Juan"
+        assert phrases[0].boost == 8.0
+
+    def test_google_recognition_config_supports_diarization_knobs(self):
+        config = STTConfig.from_payload({
+            "languageCodes": ["es-US"],
+            "diarizationEnabled": True,
+            "diarizationMinSpeakers": 2,
+            "diarizationMaxSpeakers": 4,
+        })
+
+        recognition = _build_recognition_config(config, 16000, {})
+
+        assert recognition.features.diarization_config.min_speaker_count == 2
+        assert recognition.features.diarization_config.max_speaker_count == 4
+
+    def test_google_speech_session_is_constructible(self):
+        session = GoogleSpeechSession(
+            church_id="test",
+            on_interim=lambda text: asyncio.sleep(0),
+            on_final=lambda text, start, end, meta: asyncio.sleep(0),
+            on_utterance_end=lambda: asyncio.sleep(0),
+        )
+
+        assert isinstance(session, GoogleSpeechSession)
+
+
+class TestLowConfidenceHold:
+    def test_low_confidence_final_requests_buffer_hold(self):
+        async def run_():
+            hold_calls = []
+            add_calls = []
+            translation_calls = []
+            broadcasts = []
+
+            class _StubSentenceBuffer:
+                def hold_next(self, reason, hold_secs=3.0):
+                    hold_calls.append((reason, hold_secs))
+
+                async def add(self, text, audio_start, audio_end, stt_meta=None):
+                    add_calls.append((text, audio_start, audio_end, dict(stt_meta or {})))
+
+            class _StubTranslation:
+                async def translate_fragment(self, text):
+                    translation_calls.append(text)
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    broadcasts.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._recorder = None
+            session._translation = _StubTranslation()
+            session._sentence_buffer = _StubSentenceBuffer()
+            session._stt_config = STTConfig(confidence_hold_threshold=0.72, low_confidence_hold_secs=2.5)
+            session._stt_noise_removed_count = 0
+
+            await session._on_final(
+                "Vamos al texto biblico",
+                1.0,
+                2.0,
+                {
+                    "avg_confidence": 0.5,
+                    "word_count": 4,
+                    "confidence_threshold": 0.72,
+                    "low_confidence": True,
+                },
+            )
+
+            assert hold_calls == [("low_confidence_stt", 2.5)]
+            assert translation_calls == ["Vamos al texto biblico"]
+            assert add_calls == [(
+                "Vamos al texto biblico",
+                1.0,
+                2.0,
+                {
+                    "avg_confidence": 0.5,
+                    "word_count": 4,
+                    "confidence_threshold": 0.72,
+                    "low_confidence": True,
+                },
+            )]
+            assert broadcasts[0]["type"] == "stt_final"
+            assert broadcasts[0]["low_confidence"] is True
 
         run(run_())
 

@@ -55,7 +55,7 @@ from tests.benchmark.cycle_log    import (
     record_cycle, load_cycle_log, open_proposals,
     pending_directive_proposals, cycle_summary_text, cycles_for_audio_dir,
 )
-from tests.benchmark.storage import load_json_with_fallback
+from tests.benchmark.storage import LEGACY_RESULTS_ROOT, load_json_with_fallback
 
 REPORT_PATH = ROOT / "SELF_IMPROVEMENT_REPORT.md"
 
@@ -72,6 +72,38 @@ _LLM_ACTIONS = {
     "promote",
     "propose_directive_update",
 }
+
+
+def _benchmark_context(report_path: Path | None) -> dict[str, Any]:
+    """Build deterministic evaluation context from the active results root."""
+    target_report = report_path or REPORT_PATH
+    results_root = target_report.parent
+    context: dict[str, Any] = {
+        "results_root_name": results_root.name,
+    }
+
+    if results_root.name != "staggered" or not results_root.exists():
+        return context
+
+    complete_set_count = 0
+    set_count = 0
+    for candidate in sorted(results_root.iterdir()):
+        trajectory_path = candidate / "pipeline" / "trajectory.json"
+        if not trajectory_path.exists():
+            continue
+        set_count += 1
+        candidate_traj = load_json_with_fallback(trajectory_path)
+        coverage = candidate_traj.get("coverage", {})
+        if (
+            candidate_traj.get("n_runs", 0) >= 3
+            and coverage.get("has_zero_offset_baseline")
+            and coverage.get("has_nonzero_offset_window")
+        ):
+            complete_set_count += 1
+
+    context["staggered_set_count"] = set_count
+    context["staggered_complete_set_count"] = complete_set_count
+    return context
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────────
@@ -111,15 +143,16 @@ def run_evaluation_cycle(
 
     # ── 2. Trajectory ─────────────────────────────────────────────────────────
     trajectory = compute_trajectory(pipeline_dir)
+    benchmark_context = _benchmark_context(report_path)
 
     # ── 3. Review (deterministic) ─────────────────────────────────────────────
     flat    = _flat(scorecard)
     metrics = trajectory.get("metrics", {})
-    action, reasons = _action_recommendation(scorecard, trajectory, flat)
+    action, reasons = _action_recommendation(scorecard, trajectory, flat, benchmark_context)
 
-    review_md   = build_review(scorecard, trajectory)
+    review_md   = build_review(scorecard, trajectory, benchmark_context)
     review_path = pipeline_dir / "reviews" / f"{run_id}.md"
-    write_review(scorecard, trajectory, review_path)
+    write_review(scorecard, trajectory, review_path, benchmark_context)
 
     # ── 4. LLM interpretation ─────────────────────────────────────────────────
     llm_analysis: dict | None = None
@@ -181,14 +214,15 @@ def _report_benchmark_sections(
     report_path: Path | None,
 ) -> list[tuple[str, dict]]:
     """
-    For the staggered regime, summarize every benchmark set under the results
-    root so the report reflects the whole comparable batch. Legacy reports keep
+    For non-legacy batch roots (for example staggered or degraded replay
+    matrices), summarize every benchmark set under the results root so the
+    report reflects the whole comparable batch. The legacy shared root keeps
     the historical single-set behavior.
     """
     target_report = report_path or REPORT_PATH
     results_root = target_report.parent
 
-    if results_root.name != "staggered":
+    if results_root == LEGACY_RESULTS_ROOT:
         return [(current_audio_dir_name, current_trajectory)]
 
     sections: list[tuple[str, dict]] = []

@@ -25,7 +25,7 @@ def set_session_manager(mgr):
     _session_manager = mgr
 
 
-# ── Glossary (Deepgram keyword boosting) ──────────────────────────────────────
+# ── Glossary (STT adaptation boosting) ───────────────────────────────────────
 
 class GlossaryTermIn(BaseModel):
     boost: int = Field(default=5, ge=1, le=10)
@@ -33,7 +33,7 @@ class GlossaryTermIn(BaseModel):
 
 @router.get("/glossary")
 async def list_glossary(church_id: str):
-    """Return all Deepgram keyword-boost terms for this church."""
+    """Return all STT adaptation terms for this church."""
     terms = await get_glossary(church_id)
     return {"terms": [{"term": t, "boost": b} for t, b in terms.items()]}
 

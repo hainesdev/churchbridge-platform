@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from statistics import mean
 from typing import Any
 
 
@@ -163,7 +164,7 @@ def build_scorecard(result: dict) -> dict:
     layers   = result.get("layers", {})
     all_msgs = result.get("all_messages", [])
 
-    raw_layer       = layers.get("raw_deepgram", {})
+    raw_layer       = layers.get("raw_stt", {})
     committed_layer = layers.get("committed_sentences", {})
     translations    = layers.get("feed_commits", layers.get("translations", []))      # list of dicts
     corrections     = layers.get("feed_revisions", layers.get("llm_corrections", []))   # list of dicts
@@ -175,6 +176,44 @@ def build_scorecard(result: dict) -> dict:
     committed_msgs   = [m for m in all_msgs if m.get("type") == "final_spanish"]
     translation_msgs = [m for m in all_msgs if m.get("type") in ("feed_commit", "translation")]
     correction_msgs  = [m for m in all_msgs if m.get("type") in ("feed_revision", "correction", "translation_update")]
+    stt_final_msgs   = [m for m in all_msgs if m.get("type") == "stt_final"]
+
+    stt_confidences = [
+        float(m["avg_confidence"])
+        for m in stt_final_msgs
+        if isinstance(m.get("avg_confidence"), (int, float))
+    ]
+    detected_languages: list[str] = []
+    code_switch_final_count = 0
+    speaker_tagged_final_count = 0
+    max_speaker_tag_count = 0
+    for msg in stt_final_msgs:
+        msg_languages = []
+        if isinstance(msg.get("detected_language"), str) and msg.get("detected_language"):
+            msg_languages.append(msg["detected_language"])
+        for code in msg.get("detected_languages") or []:
+            if isinstance(code, str) and code and code not in msg_languages:
+                msg_languages.append(code)
+        if len(msg_languages) > 1:
+            code_switch_final_count += 1
+        for code in msg_languages:
+            if code not in detected_languages:
+                detected_languages.append(code)
+        speaker_tags = [
+            int(tag) for tag in (msg.get("speaker_tags") or [])
+            if isinstance(tag, int)
+        ]
+        if speaker_tags:
+            speaker_tagged_final_count += 1
+            max_speaker_tag_count = max(max_speaker_tag_count, len(set(speaker_tags)))
+    low_confidence_final_count = sum(
+        1 for m in stt_final_msgs if m.get("low_confidence") is True
+    )
+    low_confidence_final_rate = None
+    if stt_final_msgs:
+        low_confidence_final_rate = round(
+            low_confidence_final_count / len(stt_final_msgs), 4
+        )
 
     # ── A. Accuracy ────────────────────────────────────────────────────────────
 
@@ -190,6 +229,16 @@ def build_scorecard(result: dict) -> dict:
         "wer_committed_substitutions": wer_committed.get("substitutions"),
         "wer_committed_deletions":  wer_committed.get("deletions"),
         "wer_committed_insertions": wer_committed.get("insertions"),
+        "stt_final_count":          len(stt_final_msgs),
+        "avg_stt_confidence":       round(mean(stt_confidences), 4) if stt_confidences else None,
+        "min_stt_confidence":       round(min(stt_confidences), 4) if stt_confidences else None,
+        "low_confidence_final_count": low_confidence_final_count,
+        "low_confidence_final_rate":  low_confidence_final_rate,
+        "detected_language_count":  len(detected_languages),
+        "detected_languages":       detected_languages,
+        "code_switch_final_count":  code_switch_final_count,
+        "speaker_tagged_final_count": speaker_tagged_final_count,
+        "max_speaker_tag_count":    max_speaker_tag_count,
         "committed_sentence_count": committed_layer.get("sentence_count", 0),
         "translation_count":        len(translations),
         "llm_correction_count":     len(corrections),
@@ -295,7 +344,11 @@ def build_scorecard(result: dict) -> dict:
         "run_id":      result["run_id"],
         "git_commit":  result.get("git_commit"),
         "audio_dir":   result.get("audio_dir"),
+        "source_audio_dir": result.get("source_audio_dir"),
         "audio_file":  result.get("audio_file"),
+        "benchmark_variant": result.get("benchmark_variant", "clean_replay"),
+        "degradation": result.get("degradation"),
+        "clip_start_offset_s": result.get("clip_start_offset_s", 0.0),
         "clip_duration_s": result.get("clip_duration_s"),
         "note":        result.get("note", ""),
         "scorecard_version": "1",

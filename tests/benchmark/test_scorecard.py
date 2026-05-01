@@ -69,7 +69,7 @@ def _make_result(seg_metadata=None, extra_msgs=None):
     return {
         "run_id": "test-run",
         "layers": {
-            "raw_deepgram": {},
+            "raw_stt": {},
             "committed_sentences": {"sentence_count": 1},
             "feed_commits": [{"segment_id": 1000, "ts": 1000, "english": "hello", "elapsed_s": 1.5}],
             "feed_revisions": [],
@@ -142,7 +142,7 @@ def test_client_visible_rewrite_count_only_counts_actual_text_changes():
     result = {
         "run_id": "test-run",
         "layers": {
-            "raw_deepgram": {},
+            "raw_stt": {},
             "committed_sentences": {"sentence_count": 1},
             "feed_commits": [{"segment_id": 1000, "ts": 1000, "english": "hello", "elapsed_s": 1.0}],
             "feed_revisions": [
@@ -168,6 +168,67 @@ def test_client_visible_rewrite_count_only_counts_actual_text_changes():
     assert scorecard["accuracy"]["llm_correction_count"] == 3
     assert scorecard["behavioral"]["orphan_correction_count"] == 1
     assert scorecard["behavioral"]["client_visible_rewrite_count"] == 1
+
+
+def test_scorecard_surfaces_stt_confidence_diagnostics():
+    result = _make_result(
+        extra_msgs=[
+            {
+                "type": "stt_final",
+                "ts": 1000,
+                "text": "hola",
+                "avg_confidence": 0.91,
+                "word_count": 1,
+                "confidence_threshold": 0.8,
+                "low_confidence": False,
+                "_elapsed_s": 0.9,
+            },
+            {
+                "type": "stt_final",
+                "ts": 2000,
+                "text": "mundo",
+                "avg_confidence": 0.63,
+                "word_count": 1,
+                "confidence_threshold": 0.8,
+                "low_confidence": True,
+                "_elapsed_s": 2.0,
+            },
+        ],
+    )
+
+    scorecard = build_scorecard(result)
+
+    assert scorecard["accuracy"]["stt_final_count"] == 2
+    assert scorecard["accuracy"]["avg_stt_confidence"] == 0.77
+    assert scorecard["accuracy"]["min_stt_confidence"] == 0.63
+    assert scorecard["accuracy"]["low_confidence_final_count"] == 1
+    assert scorecard["accuracy"]["low_confidence_final_rate"] == 0.5
+
+
+def test_scorecard_surfaces_language_and_speaker_metadata():
+    result = _make_result(
+        extra_msgs=[
+            {
+                "type": "stt_final",
+                "ts": 1000,
+                "text": "hola hello",
+                "avg_confidence": 0.82,
+                "word_count": 2,
+                "detected_language": "es-US",
+                "detected_languages": ["es-US", "en-US"],
+                "speaker_tags": [1, 2],
+                "_elapsed_s": 0.9,
+            },
+        ],
+    )
+
+    scorecard = build_scorecard(result)
+
+    assert scorecard["accuracy"]["detected_language_count"] == 2
+    assert scorecard["accuracy"]["detected_languages"] == ["es-US", "en-US"]
+    assert scorecard["accuracy"]["code_switch_final_count"] == 1
+    assert scorecard["accuracy"]["speaker_tagged_final_count"] == 1
+    assert scorecard["accuracy"]["max_speaker_tag_count"] == 2
 
 
 # ---------------------------------------------------------------------------

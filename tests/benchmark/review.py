@@ -111,6 +111,7 @@ def _action_recommendation(
     scorecard: dict,
     trajectory: dict,
     flat: dict,
+    benchmark_context: dict[str, Any] | None = None,
 ) -> tuple[str, list[str]]:
     """
     Return (action_label, [reason_lines]).
@@ -118,6 +119,8 @@ def _action_recommendation(
     """
     metrics = trajectory.get("metrics", {})
     n_runs  = trajectory.get("n_runs", 0)
+    coverage = trajectory.get("coverage", {})
+    benchmark_context = benchmark_context or {}
     reasons: list[str] = []
 
     # ── Priority 1: Tier-1 guardrail regression ────────────────────────────────
@@ -173,6 +176,9 @@ def _action_recommendation(
             f"({', '.join(f'`{k}`' for k in long_regressions)}). "
             "Directive may lack explicit guardrail or ranking for this tradeoff."
         )
+        coverage_reasons = _promotion_coverage_gaps(coverage, benchmark_context)
+        if coverage_reasons:
+            return "collect_more_runs", reasons + coverage_reasons
         return "propose_directive_update", reasons
 
     # ── Priority 5: Promote ────────────────────────────────────────────────────
@@ -192,10 +198,16 @@ def _action_recommendation(
             f"Tier-1 guardrails hold. Tier-2 metrics improved: "
             f"{', '.join(f'`{k}`' for k in tier2_improved)}."
         )
+        coverage_reasons = _promotion_coverage_gaps(coverage, benchmark_context)
+        if coverage_reasons:
+            return "collect_more_runs", reasons + coverage_reasons
         return "promote", reasons
 
     if not tier2_regressed:
         reasons.append("Tier-1 guardrails hold. No Tier-2 regressions detected.")
+        coverage_reasons = _promotion_coverage_gaps(coverage, benchmark_context)
+        if coverage_reasons:
+            return "collect_more_runs", reasons + coverage_reasons
         return "promote", reasons
 
     # Mixed signals
@@ -205,6 +217,37 @@ def _action_recommendation(
         "Needs further investigation."
     )
     return "investigate", reasons
+
+
+def _promotion_coverage_gaps(
+    coverage: dict[str, Any],
+    benchmark_context: dict[str, Any],
+) -> list[str]:
+    """Identify coverage gaps that should block promote-level conclusions."""
+    reasons: list[str] = []
+    results_root_name = benchmark_context.get("results_root_name")
+
+    if results_root_name == "staggered":
+        if not coverage.get("has_zero_offset_baseline"):
+            reasons.append(
+                "This staggered set has no `0s` baseline window yet. Add a clean baseline clip "
+                "before treating offset-window results as promotion evidence."
+            )
+        if not coverage.get("has_nonzero_offset_window"):
+            reasons.append(
+                "This staggered set has no non-zero offset stress window yet. Add echo/noise-prone "
+                "offset windows before treating the set as robust."
+            )
+
+        complete_sets = int(benchmark_context.get("staggered_complete_set_count", 0))
+        total_sets = int(benchmark_context.get("staggered_set_count", 0))
+        if total_sets < 2 or complete_sets < 2:
+            reasons.append(
+                "The staggered regime is not yet complete across benchmark sets. Wait until at least "
+                "two sets each have comparable baseline and offset windows before promoting."
+            )
+
+    return reasons
 
 
 # ── Cause inference ────────────────────────────────────────────────────────────
@@ -305,13 +348,17 @@ def _primary_findings(metrics: dict, flat: dict) -> tuple[list[str], list[str], 
 
 # ── Markdown builder ───────────────────────────────────────────────────────────
 
-def build_review(scorecard: dict, trajectory: dict) -> str:
+def build_review(
+    scorecard: dict,
+    trajectory: dict,
+    benchmark_context: dict[str, Any] | None = None,
+) -> str:
     flat    = _flat(scorecard)
     metrics = trajectory.get("metrics", {})
     n_runs  = trajectory.get("n_runs", 0)
     conf    = trajectory.get("confidence", "unknown")
 
-    action, reasons = _action_recommendation(scorecard, trajectory, flat)
+    action, reasons = _action_recommendation(scorecard, trajectory, flat, benchmark_context)
     improved, regressed, weak = _primary_findings(metrics, flat)
     causes = _infer_causes(flat, metrics)
 
@@ -422,9 +469,14 @@ def build_review(scorecard: dict, trajectory: dict) -> str:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def write_review(scorecard: dict, trajectory: dict, out_path: Path) -> str:
+def write_review(
+    scorecard: dict,
+    trajectory: dict,
+    out_path: Path,
+    benchmark_context: dict[str, Any] | None = None,
+) -> str:
     """Build and write the markdown review. Returns the markdown string."""
-    md = build_review(scorecard, trajectory)
+    md = build_review(scorecard, trajectory, benchmark_context)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(md, encoding="utf-8")
     print(f"Review   : {out_path}")

@@ -6,9 +6,10 @@ Streams a clipped sermon audio window through the live server WebSocket
 pipeline and captures every output event for WER scoring and historical
 comparison.
 
-Unlike run_benchmark.py (Deepgram pre-recorded API), this test exercises the
-full production pipeline:
-    audio chunks -> DeepgramSession -> _clean_stt() -> SentenceBuffer
+Unlike run_benchmark.py (offline pre-recorded API), this test exercises the
+full server-side production pipeline after client audio has already been
+prepared:
+    audio chunks -> GoogleSpeechSession -> _clean_stt() -> SentenceBuffer
     -> Google Translate -> LLM enrichment -> broadcaster -> display WebSocket
 
 All events received by the display WebSocket are stored in the result JSON,
@@ -28,6 +29,10 @@ Translation quality is evaluated alongside pipeline behavior, but the loop
 should still distinguish evaluator uncertainty from true regressions and should
 read clipped/noisy windows as resilience checks rather than as the main clean
 audio optimization target.
+
+This is still a replay harness, not a client-capture benchmark. It does not
+exercise iPhone/browser microphone acquisition, echo cancellation, AGC, routing,
+or other front-end audio-processing behavior.
 """
 
 from __future__ import annotations
@@ -73,7 +78,7 @@ from tests.benchmark.storage import (  # noqa: E402
 
 SERVER_PORT = 8799
 CHUNK_MS = 100
-IDLE_DRAIN_S = 8.0
+IDLE_DRAIN_S = 14.0
 DEFAULT_DURATION_S = 30.0
 MAX_DEFAULT_DURATION_S = 30.0
 
@@ -188,6 +193,7 @@ async def run_pipeline(
     sample_rate: int,
     server_port: int,
     church_id: str,
+    stt_config: dict | None = None,
 ) -> tuple[list[dict], float]:
     """Stream audio through the live pipeline and return (all_messages, wall_time_s)."""
     import websockets  # noqa: PLC0415
@@ -201,6 +207,7 @@ async def run_pipeline(
     audio_done = asyncio.Event()
     listener_ready = asyncio.Event()
     stop_listener = asyncio.Event()
+    idle_drain_s = IDLE_DRAIN_S
 
     async def listen() -> None:
         nonlocal last_msg_at
@@ -219,7 +226,7 @@ async def run_pipeline(
                     print(f"  [{data['_elapsed_s']:6.1f}s] {kind:<25s} {str(preview)[:70]}")
 
                 except asyncio.TimeoutError:
-                    if audio_done.is_set() and time.monotonic() - last_msg_at >= IDLE_DRAIN_S:
+                    if audio_done.is_set() and time.monotonic() - last_msg_at >= idle_drain_s:
                         stop_listener.set()
                 except Exception:
                     stop_listener.set()
@@ -227,7 +234,10 @@ async def run_pipeline(
 
     async def stream() -> None:
         async with websockets.connect(stream_url) as ws:
-            await ws.send(json.dumps({"type": "session.start", "sampleRate": sample_rate}))
+            start_payload = {"type": "session.start", "sampleRate": sample_rate}
+            if stt_config:
+                start_payload["sttConfig"] = stt_config
+            await ws.send(json.dumps(start_payload))
             response = json.loads(await ws.recv())
             print(f"  Session started: {response}")
 
@@ -262,6 +272,7 @@ def build_result(
     start_offset_s: float,
     audio_dir: str,
     note: str,
+    stt_config: dict | None = None,
 ) -> dict:
     stt_finals = [m for m in messages if m["type"] == "stt_final"]
     committed = [m for m in messages if m["type"] == "final_spanish"]
@@ -283,6 +294,7 @@ def build_result(
         "clip_start_offset_s": start_offset_s,
         "clip_duration_s": duration_s,
         "note": note,
+        "stt_config": stt_config or {},
         "wall_time_s": wall_s,
         "srt_reference": {
             "segments": len(ref_segments),
@@ -290,7 +302,7 @@ def build_result(
             "text": ref_text,
         },
         "layers": {
-            "raw_deepgram": {
+            "raw_stt": {
                 "finals_count": len(stt_finals),
                 "text": raw_text,
                 "wer": compute_wer(ref_text, raw_text) if raw_text else None,
@@ -380,8 +392,8 @@ def print_report(result: dict) -> None:
     ref = result["srt_reference"]
     print(f"\n  SRT reference: {ref['segments']} segments, {ref['word_count']} words")
 
-    raw = result["layers"]["raw_deepgram"]
-    print(f"\n  Layer 1 — Raw Deepgram STT  ({raw['finals_count']} finals)")
+    raw = result["layers"]["raw_stt"]
+    print(f"\n  Layer 1 — Raw STT Finals  ({raw['finals_count']} finals)")
     if raw["wer"]:
         wer = raw["wer"]
         print(f"    WER: {wer['score_pct']:5.1f}%  [{_wer_bar(wer['score_pct'])}]")
@@ -471,35 +483,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Run LLM translation quality evaluation after the benchmark cycle")
     parser.add_argument("--tq-chunk-size", type=int, default=5,
                         help="Sentences per chunk for translation quality evaluation (default: 5)")
+    parser.add_argument("--stt-model", default="",
+                        help="Override the Google Speech model for this run")
+    parser.add_argument("--stt-language", default="",
+                        help="Override the primary Google Speech language code for this run")
+    parser.add_argument("--stt-alt-language", action="append", default=[],
+                        help="Optional additional language code for locale/code-switch experiments; may be passed multiple times")
+    parser.add_argument("--stt-location", default="",
+                        help="Google Speech location override (for example: us)")
+    parser.add_argument("--stt-recognizer", default="",
+                        help="Google Speech recognizer override (resource name or '_' for inline config)")
+    parser.add_argument("--utterance-end-ms", type=int, default=2000,
+                        help="Google Speech utterance-end / speech-end timeout in milliseconds")
+    parser.add_argument("--confidence-hold-threshold", type=float, default=0.72,
+                        help="Average word confidence below which a final gets an extra buffer hold")
+    parser.add_argument("--low-confidence-hold-secs", type=float, default=2.5,
+                        help="Extra hold duration applied to low-confidence STT finals")
     return parser
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="ChurchBridge AI — Pipeline Regression Test")
-    parser.add_argument("--audio-dir", default="tests/audio/1",
-                        help="Directory containing .mp3 and .srt files")
-    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION_S,
-                        help=f"Seconds of audio to test (default: {DEFAULT_DURATION_S:g})")
-    parser.add_argument("--start-offset", type=float, default=0.0,
-                        help="Start offset in seconds within the source audio")
-    parser.add_argument("--allow-long-duration", action="store_true",
-                        help="Allow durations above the default live-test limit")
-    parser.add_argument("--port", type=int, default=SERVER_PORT,
-                        help=f"Server port for this benchmark run (default: {SERVER_PORT})")
-    parser.add_argument("--church-id", default="",
-                        help="Church/session namespace for this run; defaults to an isolated generated value")
-    parser.add_argument("--results-root", default="tests/benchmark/results",
-                        help="Results root for artifacts. Use tests/benchmark/results/staggered for the new regime")
-    parser.add_argument("--capture-only", action="store_true",
-                        help="Save the raw run JSON only; skip history, review, trajectory, cycle log, and report")
-    parser.add_argument("--note", default="",
-                        help="Free-text note recorded with this run")
-    parser.add_argument("--no-llm", action="store_true",
-                        help="Skip LLM interpretation (deterministic evaluation only)")
-    parser.add_argument("--translation-quality", action="store_true",
-                        help="Run LLM translation quality evaluation after the benchmark cycle")
-    parser.add_argument("--tq-chunk-size", type=int, default=5,
-                        help="Sentences per chunk for translation quality evaluation (default: 5)")
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     run_id = generate_run_id(args.audio_dir, args.start_offset)
@@ -508,6 +512,24 @@ async def main() -> None:
     start_offset_s = args.start_offset
     results_root = resolve_results_root(args.results_root)
     church_id = resolve_run_namespace(args.audio_dir, start_offset_s, args.church_id or None)
+    stt_config = {
+        "utteranceEndMs": args.utterance_end_ms,
+        "confidenceHoldThreshold": args.confidence_hold_threshold,
+        "lowConfidenceHoldSecs": args.low_confidence_hold_secs,
+    }
+    if args.stt_model:
+        stt_config["model"] = args.stt_model
+    language_codes = []
+    if args.stt_language:
+        language_codes.append(args.stt_language)
+    language_codes.extend(code for code in args.stt_alt_language if code)
+    if language_codes:
+        stt_config["languageCodes"] = language_codes
+        stt_config["language"] = language_codes[0]
+    if args.stt_location:
+        stt_config["location"] = args.stt_location
+    if args.stt_recognizer:
+        stt_config["recognizer"] = args.stt_recognizer
 
     mp3_path, srt_path = find_audio_files(audio_dir)
     print(f"Audio : {mp3_path.name}")
@@ -546,7 +568,7 @@ async def main() -> None:
         print("Server ready.\n")
 
         print("Streaming audio through pipeline...")
-        messages, wall_s = await run_pipeline(samples, sample_rate, args.port, church_id)
+        messages, wall_s = await run_pipeline(samples, sample_rate, args.port, church_id, stt_config=stt_config)
 
     finally:
         proc.terminate()
@@ -567,6 +589,7 @@ async def main() -> None:
         start_offset_s=start_offset_s,
         audio_dir=args.audio_dir,
         note=args.note,
+        stt_config=stt_config,
     )
 
     audio_dir_name = Path(args.audio_dir).name

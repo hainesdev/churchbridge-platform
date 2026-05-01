@@ -15,10 +15,11 @@ from server.db.sessions import (
     append_segment,
 )
 from server.services.audio_utils import resample_float32_to_pcm16, base64_to_float32_bytes
-from server.services.deepgram_session import DeepgramSession
+from server.services.google_speech_session import GoogleSpeechSession
 from server.services.google_translate_service import GoogleTranslateService
 from server.services.llm_enrichment_service import LLMEnrichmentService, _format_deferred_release_text
 from server.services.sentence_buffer import SentenceBuffer, _is_incomplete
+from server.services.stt import STTConfig
 from server.services.sermon_state_tracker import SermonStateTracker
 from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 # enriched English when it lands soon after the Google sentence.
 PREFERRED_COMMIT_DELAY_S = 1.25
 
-# Splits a Deepgram final at internal sentence boundaries — e.g.
+# Splits an STT final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
 # Lookbehind: must follow [.!?]
 # Lookahead: must precede an uppercase letter or opening punctuation (¿ ¡ ")
@@ -197,7 +198,7 @@ _QUOTE_INTRO = re.compile(
 
 
 def _split_segments(text: str) -> list[str]:
-    """Split a Deepgram final at internal sentence boundaries, then merge back
+    """Split an STT final at internal sentence boundaries, then merge back
     any trailing fragment that is too short to stand alone.
 
     This keeps rhetorical Q&A pairs together — "¿Quién es él? Jesucristo." is
@@ -220,9 +221,8 @@ def _split_segments(text: str) -> list[str]:
 
 
 class ServiceSession:
-    """One active session per church_id. Owns the Deepgram connection,
-    SentenceBuffer, GoogleTranslateService, LLMEnrichmentService,
-    TopicTracker, and the admin WebSocket."""
+    """One active session per church_id. Owns the STT session, sentence
+    buffer, translation, enrichment, topic tracking, and the admin WebSocket."""
 
     def __init__(self, church_id: str, ws: WebSocket, broadcaster: Broadcaster):
         self._church_id = church_id
@@ -230,7 +230,7 @@ class ServiceSession:
         self._broadcaster = broadcaster
         self._sample_rate = 48000
         self._db_session_id: int | None = None
-        self._deepgram: DeepgramSession | None = None
+        self._stt_session = None
         self._sentence_buffer: SentenceBuffer | None = None
         self._translation: GoogleTranslateService | None = None
         self._enrichment: LLMEnrichmentService | None = None
@@ -250,12 +250,21 @@ class ServiceSession:
         self._pending_feed_commits: dict[int, dict] = {}
         self._committed_segment_ids: set[int] = set()
         self._persisted_segment_ids: set[int] = set()
-        self._segment_text_cache: dict[int, dict[str, str]] = {}
+        self._segment_text_cache: dict[int, dict] = {}
+        self._segment_stt_cache: dict[int, dict] = {}
         self._segment_metadata_cache: dict[int, dict] = {}
         self._pending_segment_metadata: dict[int, dict] = {}
         self._pending_detected_verses: dict[int, dict] = {}
         self._pending_suggested_verses: dict[int, list[dict]] = {}
         self._last_segment_id: int = 0
+        self._stt_config: STTConfig = STTConfig()
+
+    def _ensure_segment_stt_cache(self) -> dict[int, dict]:
+        cache = getattr(self, "_segment_stt_cache", None)
+        if cache is None:
+            cache = {}
+            self._segment_stt_cache = cache
+        return cache
 
     async def start(
         self,
@@ -263,10 +272,12 @@ class ServiceSession:
         sermon_topic: str = "",
         source_scripture_version: str = "rvr1960",
         display_scripture_version: str = "kjv",
+        stt_config: STTConfig | None = None,
     ):
         self._sample_rate = sample_rate
         self._source_scripture_version = source_scripture_version or "rvr1960"
         self._display_scripture_version = display_scripture_version or "kjv"
+        self._stt_config = stt_config or STTConfig()
         self._db_session_id = await create_service_session(self._church_id)
 
         if os.getenv("SESSION_CAPTURE_ENABLED"):
@@ -312,37 +323,40 @@ class ServiceSession:
             state_tracker=self._state_tracker,
         )
 
-        self._deepgram = DeepgramSession(
+        self._stt_session = GoogleSpeechSession(
             church_id=self._church_id,
             on_interim=self._on_interim,
             on_final=self._on_final,
             on_utterance_end=self._on_utterance_end,
         )
-        await self._deepgram.start(glossary=glossary, sample_rate=16000)
+        await self._stt_session.start(glossary=glossary, sample_rate=16000, stt_config=self._stt_config)
 
         await self._send({
             "type": "session_started",
             "sessionId": self._db_session_id,
             "sourceScriptureVersion": self._source_scripture_version,
             "displayScriptureVersion": self._display_scripture_version,
+            "sttConfig": self._stt_config.public_payload(),
         })
         logger.info(
-            "[session] Started for church %s (db_id=%s, topic=%r, source_version=%s, display_version=%s)",
+            "[session] Started for church %s (db_id=%s, topic=%r, source_version=%s, display_version=%s, stt_model=%s, stt_languages=%s)",
             self._church_id,
             self._db_session_id,
             sermon_topic or "(none)",
             self._source_scripture_version,
             self._display_scripture_version,
+            self._stt_config.model,
+            ",".join(self._stt_config.language_codes),
         )
 
     async def ingest(self, audio_b64: str):
-        """Receive a base64 Float32 chunk from the browser, resample, forward to Deepgram."""
+        """Receive a base64 Float32 chunk from the browser, resample, forward to STT."""
         raw = base64_to_float32_bytes(audio_b64)
         pcm16 = resample_float32_to_pcm16(raw, self._sample_rate, dst_rate=16000)
         if self._recorder:
             self._recorder.record_audio(pcm16)
-        if self._deepgram:
-            await self._deepgram.send(pcm16)
+        if self._stt_session:
+            await self._stt_session.send(pcm16)
 
     async def close(self):
         if self._recorder:
@@ -355,8 +369,8 @@ class ServiceSession:
             self._recorder = None
         if self._sentence_buffer:
             await self._sentence_buffer.stop()
-        if self._deepgram:
-            await self._deepgram.stop()
+        if self._stt_session:
+            await self._stt_session.stop()
         if self._translation:
             await self._translation.close()
         if self._enrichment:
@@ -368,10 +382,10 @@ class ServiceSession:
             await close_service_session(self._db_session_id)
         logger.info("[session] Closed for church %s", self._church_id)
 
-    # --- Deepgram callbacks ---
+    # --- STT callbacks ---
 
     async def _on_utterance_end(self):
-        """Deepgram VAD fired UtteranceEnd — speaker paused long enough that the
+        """STT VAD fired utterance end — speaker paused long enough that the
         current buffered fragments form a complete thought. Hard-flush the buffer."""
         if self._sentence_buffer:
             await self._sentence_buffer.utterance_end()
@@ -379,13 +393,17 @@ class ServiceSession:
     async def _on_interim(self, text: str):
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
 
-    async def _on_final(self, text: str, audio_start: float, audio_end: float):
+    async def _on_final(self, text: str, audio_start: float, audio_end: float, stt_meta: dict):
         logger.info("[session:%s] STT final: %s", self._church_id, text)
-        await self._broadcast({"type": "stt_final", "text": text, "ts": _now()})
+        await self._broadcast({"type": "stt_final", "text": text, "ts": _now(), **stt_meta})
         if self._recorder:
             _stt_ts = _now()
             self._recorder.record_event("stt_final", {
-                "text": text, "audio_start": audio_start, "audio_end": audio_end, "ts": _stt_ts,
+                "text": text,
+                "audio_start": audio_start,
+                "audio_end": audio_end,
+                "ts": _stt_ts,
+                **stt_meta,
             })
             self._recorder.record_timing("stt", _stt_ts)
         # Clean noise artifacts before segmentation; broadcast keeps the raw text.
@@ -401,35 +419,56 @@ class ServiceSession:
         if self._translation:
             await self._translation.translate_fragment(clean)
         if self._sentence_buffer:
+            if stt_meta.get("low_confidence"):
+                self._sentence_buffer.hold_next(
+                    "low_confidence_stt",
+                    hold_secs=self._stt_config.low_confidence_hold_secs,
+                )
+                logger.debug(
+                    "[session:%s] Hold set: low_confidence_stt avg_conf=%.3f threshold=%.3f",
+                    self._church_id,
+                    float(stt_meta.get("avg_confidence", 0.0)),
+                    self._stt_config.confidence_hold_threshold,
+                )
             # Proactive hold: if this fragment contains a quote introduction, set
             # a hold BEFORE adding it so the buffer's next timer waits for the
             # actual quote content to arrive. This covers the case where the intro
-            # and the quote span separate Deepgram finals — the intro accumulates
+            # and the quote span separate STT finals — the intro accumulates
             # in the buffer with extra time for the quote to join it.
             if _QUOTE_INTRO.search(clean):
                 self._sentence_buffer.hold_next("quote_introduction_proactive", hold_secs=4.0)
                 logger.debug("[session:%s] Proactive hold: quote_introduction", self._church_id)
             parts = _split_segments(clean)
             if len(parts) == 1:
-                await self._sentence_buffer.add(clean, audio_start, audio_end)
+                    await self._sentence_buffer.add(clean, audio_start, audio_end, stt_meta=stt_meta)
             else:
                 # Distribute audio timing across sub-sentences proportionally by word count.
                 total_words = max(sum(len(p.split()) for p in parts), 1)
                 t = audio_start
                 for part in parts:
                     part_end = t + (audio_end - audio_start) * len(part.split()) / total_words
-                    await self._sentence_buffer.add(part, t, min(part_end, audio_end))
+                    await self._sentence_buffer.add(part, t, min(part_end, audio_end), stt_meta=stt_meta)
                     t = part_end
 
     # --- Sentence buffer callback ---
 
-    async def _on_sentence(self, text: str, audio_start: float, audio_end: float, flush_reason: str):
+    async def _on_sentence(
+        self,
+        text: str,
+        audio_start: float,
+        audio_end: float,
+        flush_reason: str,
+        stt_context: dict | None = None,
+    ):
         ts = self._next_segment_id()
         terminal_incomplete = flush_reason == "session_close" and _is_incomplete(text)
+        stt_context = dict(stt_context or {})
+        self._ensure_segment_stt_cache()[ts] = stt_context
         if self._recorder:
             self._recorder.record_event("sentence_flush", {
                 "text": text, "flush_reason": flush_reason,
                 "audio_start": audio_start, "audio_end": audio_end, "ts": ts, "segment_id": ts,
+                **stt_context,
             })
             self._recorder.record_timing("sentence", ts)
         logger.info("[session:%s] Sentence flushed: %s", self._church_id, text)
@@ -438,6 +477,7 @@ class ServiceSession:
             "text": text,
             "flush_reason": flush_reason,
             "terminal_incomplete": terminal_incomplete,
+            **stt_context,
             **self._segment_ref(ts),
         })
         if self._topic_tracker:
@@ -466,6 +506,7 @@ class ServiceSession:
                 "audio_end": audio_end,
                 "terminal_incomplete": terminal_incomplete,
                 "flush_reason": flush_reason,
+                "stt_context": stt_context,
             }
             # Prune entries older than 120s — these belong to sentences whose
             # translation failed after all retries and will never be consumed.
@@ -488,8 +529,10 @@ class ServiceSession:
                 "audio_end": 0.0,
                 "terminal_incomplete": False,
                 "flush_reason": "",
+                "stt_context": {},
             },
         )
+        stt_context = dict(timing.get("stt_context") or {})
         if timing.get("terminal_incomplete"):
             english = _format_deferred_release_text(english, english)
         logger.info("[session:%s] Translation: %s -> %s", self._church_id, spanish[:200], english[:200])
@@ -509,6 +552,7 @@ class ServiceSession:
             source="google",
             phrase_alignment=None,
             delay_s=PREFERRED_COMMIT_DELAY_S,
+            stt_context=stt_context,
         )
         if self._enrichment:
             # Pop timing; defaults to (0.0, 0.0) if translation was retried after
@@ -520,6 +564,7 @@ class ServiceSession:
                     "audio_end": 0.0,
                     "terminal_incomplete": False,
                     "flush_reason": "",
+                    "stt_context": {},
                 },
             )
             audio_start = float(timing.get("audio_start", 0.0))
@@ -749,6 +794,7 @@ class ServiceSession:
         keep_was_committed = keep_ts in self._committed_segment_ids
         await self._drop_pending_commit(absorb_ts)
         self._segment_text_cache.pop(absorb_ts, None)
+        self._ensure_segment_stt_cache().pop(absorb_ts, None)
         self._segment_metadata_cache.pop(absorb_ts, None)
         self._pending_segment_metadata.pop(absorb_ts, None)
         self._pending_detected_verses.pop(absorb_ts, None)
@@ -799,6 +845,10 @@ class ServiceSession:
         The frontend stores these for future display logic (e.g. register will
         drive exact Bible verse text lookup once Bible versions are stored).
         """
+        metadata = {
+            **metadata,
+            **self._ensure_segment_stt_cache().get(ts, {}),
+        }
         self._pending_segment_metadata[ts] = metadata
         self._segment_metadata_cache[ts] = dict(metadata)
         if metadata.get("pending_completion") and ts in self._pending_feed_commits:
@@ -874,6 +924,7 @@ class ServiceSession:
         source: str,
         phrase_alignment: list[dict] | None,
         delay_s: float,
+        stt_context: dict | None = None,
     ) -> None:
         await self._drop_pending_commit(segment_id)
         task = asyncio.create_task(self._delayed_feed_commit(segment_id, delay_s))
@@ -882,6 +933,7 @@ class ServiceSession:
             "english": english,
             "source": source,
             "phrase_alignment": phrase_alignment,
+            "stt_context": dict(stt_context or {}),
             "task": task,
         }
 
@@ -914,6 +966,7 @@ class ServiceSession:
             english=pending["english"],
             source=pending["source"],
             phrase_alignment=pending.get("phrase_alignment"),
+            stt_context=pending.get("stt_context"),
         )
         await self._broadcast_live_translation_clear(reason="committed", segment_id=segment_id)
         self._committed_segment_ids.add(segment_id)
@@ -983,16 +1036,20 @@ class ServiceSession:
         english: str,
         source: str,
         phrase_alignment: list[dict] | None,
+        stt_context: dict | None = None,
     ) -> None:
+        stt_context = dict(stt_context or {})
         self._segment_text_cache[segment_id] = {
             "spanish": spanish,
             "english": english,
         }
+        self._ensure_segment_stt_cache()[segment_id] = stt_context
         payload = {
             "type": "feed_commit",
             "spanish": spanish,
             "english": english,
             "source": source,
+            **stt_context,
             **self._segment_ref(segment_id),
         }
         if phrase_alignment:
@@ -1013,11 +1070,13 @@ class ServiceSession:
             "spanish": spanish if spanish is not None else cached.get("spanish", ""),
             "english": english,
         }
+        stt_context = self._ensure_segment_stt_cache().get(segment_id, {})
         payload = {
             "type": "feed_revision",
             "english": english,
             "source": source,
             "reason": reason,
+            **stt_context,
             **self._segment_ref(segment_id),
         }
         if spanish is not None:
@@ -1089,6 +1148,7 @@ class SessionManager:
         sermon_topic: str = "",
         source_scripture_version: str = "rvr1960",
         display_scripture_version: str = "kjv",
+        stt_config: STTConfig | None = None,
     ) -> ServiceSession:
         if church_id in self._sessions:
             await self._sessions[church_id].close()
@@ -1100,6 +1160,7 @@ class SessionManager:
             sermon_topic=sermon_topic,
             source_scripture_version=source_scripture_version,
             display_scripture_version=display_scripture_version,
+            stt_config=stt_config,
         )
         return session
 

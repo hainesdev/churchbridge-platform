@@ -148,3 +148,33 @@ def test_write_report_uses_conservative_action_across_staggered_sets(tmp_path):
     report = report_path.read_text(encoding="utf-8")
     assert "## Current Action" in report
     assert "**`collect_more_runs`**" in report
+
+
+def test_write_report_aggregates_all_sets_for_degraded_batch_root(tmp_path):
+    results_root = tmp_path / "degraded-validation"
+    set_one = results_root / "1__clean" / "pipeline"
+    set_two = results_root / "1__echo_medium" / "pipeline"
+    set_one.mkdir(parents=True)
+    set_two.mkdir(parents=True)
+
+    (set_one / "trajectory.json").write_text(json.dumps(_trajectory(14.9)), encoding="utf-8")
+    (set_two / "trajectory.json").write_text(json.dumps(_trajectory(23.1)), encoding="utf-8")
+
+    report_path = results_root / "SELF_IMPROVEMENT_REPORT.md"
+    cycle_log_path = results_root / "cycle_log.json"
+
+    _write_report(
+        audio_dir_name="1__echo_medium",
+        trajectory=_trajectory(23.1),
+        cycle_entry={"cycle_id": "cycle-1", "git_commit": "abc123", "outcome": "pending"},
+        action="collect_more_runs",
+        llm_analysis=None,
+        cycle_log_path=cycle_log_path,
+        report_path=report_path,
+    )
+
+    report = report_path.read_text(encoding="utf-8")
+
+    assert "## Benchmark Sets" in report
+    assert "### Set 1__clean" in report
+    assert "### Set 1__echo_medium" in report

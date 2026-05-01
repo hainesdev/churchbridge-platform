@@ -32,10 +32,17 @@ from server.services.sentence_buffer import (
 class Collector:
     """Captures on_sentence calls for assertion."""
     def __init__(self):
-        self.calls: list[tuple[str, float, float]] = []
+        self.calls: list[tuple[str, float, float, dict]] = []
 
-    async def on_sentence(self, text: str, audio_start: float, audio_end: float, reason: str = ""):
-        self.calls.append((text, audio_start, audio_end))
+    async def on_sentence(
+        self,
+        text: str,
+        audio_start: float,
+        audio_end: float,
+        reason: str = "",
+        stt_meta: dict | None = None,
+    ):
+        self.calls.append((text, audio_start, audio_end, dict(stt_meta or {})))
 
     @property
     def texts(self) -> list[str]:
@@ -151,7 +158,7 @@ class TestImmediateFlush:
             buf = make_buffer(col)
             await buf.add("primer", audio_start=1.0, audio_end=2.0)
             await buf.add("fragmento.", audio_start=2.5, audio_end=4.0)
-            _, start, end = col.calls[0]
+            _, start, end, _ = col.calls[0]
             assert start == 1.0   # pinned to first
             assert end == 4.0     # advanced to last
 
@@ -466,7 +473,7 @@ class TestAudioTiming:
             await buf.add("primero", audio_start=1.0, audio_end=2.0)
             await buf.add("segundo", audio_start=2.5, audio_end=3.5)
             await buf.add("tercero.", audio_start=4.0, audio_end=5.0)
-            _, start, end = col.calls[0]
+            _, start, end, _ = col.calls[0]
             assert start == 1.0
             assert end == 5.0
 
@@ -479,9 +486,49 @@ class TestAudioTiming:
             await buf.add("primera.", audio_start=1.0, audio_end=2.0)
             assert buf._audio_start is None  # reset after flush
             await buf.add("segunda.", audio_start=5.0, audio_end=6.0)
-            _, start, end = col.calls[1]
+            _, start, end, _ = col.calls[1]
             assert start == 5.0
             assert end == 6.0
+
+        asyncio.run(run())
+
+    def test_stt_metadata_is_merged_across_fragments(self):
+        async def run():
+            col = Collector()
+            buf = make_buffer(col)
+            await buf.add(
+                "hola",
+                audio_start=1.0,
+                audio_end=2.0,
+                stt_meta={
+                    "detected_language": "es-US",
+                    "speaker_tags": [1],
+                    "avg_confidence": 0.8,
+                    "word_count": 1,
+                    "low_confidence": False,
+                },
+            )
+            await buf.add(
+                "mundo.",
+                audio_start=2.0,
+                audio_end=3.0,
+                stt_meta={
+                    "detected_language": "en-US",
+                    "speaker_tags": [2],
+                    "avg_confidence": 0.6,
+                    "word_count": 1,
+                    "low_confidence": True,
+                },
+            )
+
+            meta = col.calls[0][3]
+            assert meta["stt_primary_language"] == "es-US"
+            assert meta["stt_detected_languages"] == ["es-US", "en-US"]
+            assert meta["stt_speaker_tags"] == [1, 2]
+            assert meta["stt_speaker_count"] == 2
+            assert meta["stt_avg_confidence"] == 0.7
+            assert meta["stt_word_count"] == 2
+            assert meta["stt_low_confidence"] is True
 
         asyncio.run(run())
 

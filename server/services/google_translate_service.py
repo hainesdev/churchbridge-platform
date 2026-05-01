@@ -44,7 +44,7 @@ class GoogleTranslateService:
 
     Two display tracks:
 
-    Fast track - translate_fragment() translates each Deepgram final immediately,
+    Fast track - translate_fragment() translates each STT final immediately,
     emitting interim_translation so the congregation sees something within ~400ms.
     All fragments accumulated since the last sentence flush are sent as leading
     context so Google can disambiguate long sentences; only the English for the
@@ -82,7 +82,7 @@ class GoogleTranslateService:
         # Accurate sentence translations must commit in order so later sentences
         # cannot cancel or overtake earlier committed captions.
         self._sentence_lock = asyncio.Lock()
-        # All Deepgram finals accumulated within the current sentence window
+        # All STT finals accumulated within the current sentence window
         # (before SentenceBuffer flushes). Grows with each fragment; reset on
         # translate(). Gives Google the full in-progress sentence as leading
         # context so later fragments benefit from the same disambiguation as

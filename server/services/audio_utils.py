@@ -10,7 +10,7 @@ def resample_float32_to_pcm16(
     """Resample raw Float32 LE audio bytes to PCM16 LE at dst_rate.
 
     Browser captures Float32 at native rate (44.1/48kHz).
-    Deepgram expects linear16 at 16kHz.
+    Google Speech expects linear16 at 16kHz.
     Linear interpolation — no DSP library required.
     """
     samples = np.frombuffer(data, dtype=np.float32)

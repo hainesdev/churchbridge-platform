@@ -37,7 +37,7 @@ class VerseScratchEntry:
     reference: str
     canonical_english: str
     spanish_text: str
-    audio_start: float        # Deepgram stream seconds (sermon-relative, reconnect-normalized)
+    audio_start: float        # STT stream seconds (sermon-relative, reconnect-normalized)
     audio_end: float
     ts: int                   # wall-clock ms for client broadcast keying
 
@@ -1966,7 +1966,7 @@ class LLMEnrichmentService:
 
         last = self._verse_scratch[-1]
         same_chapter = (last.book == entry.book and last.chapter == entry.chapter)
-        # Use Deepgram audio timeline for gap — unaffected by server processing lag
+        # Use STT audio timeline for gap — unaffected by server processing lag
         audio_gap = entry.audio_start - last.audio_end
         within_gap = audio_gap <= VERSE_GAP_THRESHOLD_S
 

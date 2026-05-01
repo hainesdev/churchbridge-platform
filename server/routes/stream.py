@@ -1,5 +1,6 @@
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from server.services.stt import STTConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -41,6 +42,7 @@ async def stream_audio(
                 sermon_topic = msg.get("topic", "").strip()
                 source_scripture_version = msg.get("sourceScriptureVersion", "rvr1960")
                 display_scripture_version = msg.get("displayScriptureVersion", "kjv")
+                stt_config = STTConfig.from_payload(msg.get("sttConfig"))
                 session = await _session_manager.create(
                     church_id,
                     ws,
@@ -48,6 +50,7 @@ async def stream_audio(
                     sermon_topic,
                     source_scripture_version=source_scripture_version,
                     display_scripture_version=display_scripture_version,
+                    stt_config=stt_config,
                 )
 
             elif msg_type == "audio":

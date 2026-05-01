@@ -48,14 +48,17 @@ def save_run_result(result: dict, pipeline_dir: Path) -> Path:
 
 
 def history_entry(result: dict) -> dict:
-    wer_raw = result["layers"]["raw_deepgram"]["wer"]
+    wer_raw = result["layers"]["raw_stt"]["wer"]
     wer_committed = result["layers"]["committed_sentences"]["wer"]
     return {
         "run_id": result["run_id"],
         "git_commit": result["git_commit"],
         "note": result["note"],
+        "benchmark_variant": result.get("benchmark_variant", "clean_replay"),
+        "degradation_id": ((result.get("degradation") or {}).get("case_id")),
         "clip_start_offset_s": result.get("clip_start_offset_s", 0.0),
         "clip_duration_s": result["clip_duration_s"],
+        "stt_language_codes": (result.get("stt_config") or {}).get("languageCodes"),
         "wer_raw_pct": wer_raw["score_pct"] if wer_raw else None,
         "wer_committed_pct": wer_committed["score_pct"] if wer_committed else None,
         "sentence_count": result["layers"]["committed_sentences"]["sentence_count"],

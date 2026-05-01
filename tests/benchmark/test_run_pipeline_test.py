@@ -61,3 +61,7 @@ def test_build_arg_parser_mentions_concurrent_run_isolation():
     assert "Concurrent runs" in help_text
     assert "different ports" in help_text
     assert "--results-root" in help_text
+    assert "--stt-model" in help_text
+    assert "--stt-language" in help_text
+    assert "--stt-alt-language" in help_text
+    assert "--utterance-end-ms" in help_text

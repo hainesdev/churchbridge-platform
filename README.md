@@ -245,7 +245,8 @@ The audience sees the Google translation within ~300ms of a sentence finalising.
 
 ## Benchmarking
 
-The live pipeline benchmark is the closest check of production behavior:
+The live pipeline benchmark is the closest check of the server-side production
+pipeline:
 
 ```bash
 server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir tests/audio/1 --translation-quality
@@ -254,6 +255,12 @@ server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir
 It launches its own local server on port `8799` by default, captures the full
 display event stream, writes the raw run JSON, and then updates the
 self-improvement artifacts for that benchmark set.
+
+Important: this is a replay harness, not a native-client microphone benchmark.
+It validates the backend WebSocket/STT/translation/display path after audio has
+already been prepared, but it does not validate iPhone/browser capture,
+voice-processing, echo cancellation, AGC, route changes, or other front-end
+audio behavior.
 
 ### Long recordings and offsets
 

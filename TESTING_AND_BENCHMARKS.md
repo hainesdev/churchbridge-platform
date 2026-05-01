@@ -58,13 +58,18 @@ Latest verified benchmark/evaluation result in this workspace:
 
 ## Pipeline Benchmark
 
-This benchmark exercises the live server pipeline end to end:
+This benchmark exercises the live server pipeline end to end after audio has
+already been captured and prepared:
 
 - Starts `uvicorn` on a caller-selected port
 - Streams clipped sermon audio through the WebSocket pipeline
 - Captures display events
 - Computes WER against the paired SRT
 - Writes a full run JSON and, unless `--capture-only` is used, updates history/evaluation artifacts
+
+It is a replay benchmark, not a microphone-capture benchmark. It does not test
+iPhone/browser acquisition, echo cancellation, AGC, device routing, or other
+front-end audio-processing behavior.
 
 ### Prerequisites
 
@@ -152,20 +157,20 @@ For `--audio-dir tests/audio/1`, results are written to:
 - `tests/benchmark/results/1/pipeline/history.json`
 - `tests/benchmark/results/1/pipeline/<run_id>.json`
 
-For the staggered regime, results are written under:
+For the staggered regime, capture artifacts are written under:
 
 - `tests/benchmark/results/staggered/<audio_dir>/pipeline/`
-- `tests/benchmark/results/staggered/cycle_log.json`
-- `tests/benchmark/results/staggered/SELF_IMPROVEMENT_REPORT.md`
+- `tests/benchmark/results/staggered/cycle_log.json` after sequential evaluation
+- `tests/benchmark/results/staggered/SELF_IMPROVEMENT_REPORT.md` after sequential evaluation
 
-Current verified state:
+Current workspace note:
 
 - Legacy lane:
   - `tests/audio/1` has 3 runs
   - `tests/audio/2` has 3 runs
 - Staggered lane:
-  - `tests/audio/1` has 3 evaluated 5-second runs at offsets `0s`, `30s`, and `60s`
-  - `tests/audio/2` has 3 evaluated 5-second runs at offsets `0s`, `30s`, and `60s`
+  - this workspace may contain capture-only run JSONs without a regime-local report if `evaluate_captured_runs.py` has not been run yet
+  - verify the presence of `trajectory.json`, `cycle_log.json`, and `SELF_IMPROVEMENT_REPORT.md` before treating the staggered lane as evaluated
 
 ## Troubleshooting
 
@@ -228,4 +233,5 @@ Then prepend that folder to `PATH` before running the benchmark.
 - The runner now includes audio/set context plus a unique suffix in `run_id`, so parallel staggered captures do not collide across sets.
 - Session-close flushes now drain queued translation/enrichment work before shutdown, so short capture windows can still emit final translation updates.
 - Use explicit short durations for staggered coverage windows so the harness does not benchmark a full sermon by mistake.
+- `promote`-style conclusions are intentionally gated until staggered coverage includes comparable baseline and offset windows across at least two benchmark sets.
 - Interrupting the benchmark can leave background Python processes behind; clean them up before retrying.
