@@ -38,6 +38,7 @@ class GoogleSpeechSession:
         self._stream_offset: float = 0.0
         self._last_stream_audio_end: float = 0.0
         self._last_final_audio_end: float = 0.0
+        self._startup_error: str = ""
 
     async def start(
         self,
@@ -56,13 +57,15 @@ class GoogleSpeechSession:
         self._stop_event = asyncio.Event()
         self._audio_queue = asyncio.Queue()
         self._stt_config = stt_config or STTConfig()
+        self._startup_error = ""
         ready: asyncio.Event = asyncio.Event()
         self._task = asyncio.create_task(
             self._run(glossary, sample_rate, ready, self._stt_config)
         )
         await ready.wait()
         if self._client is None:
-            raise RuntimeError(f"[google_speech] Failed to connect for church {self._church_id}")
+            detail = f": {self._startup_error}" if self._startup_error else ""
+            raise RuntimeError(f"[google_speech] Failed to connect for church {self._church_id}{detail}")
         logger.info(
             "[google_speech] Session started for church %s at %dHz (%s/%s)",
             self._church_id,
@@ -119,6 +122,7 @@ class GoogleSpeechSession:
             raise
         except Exception as e:
             logger.error("[google_speech] Stream error for church %s: %s", self._church_id, e)
+            self._startup_error = str(e)
             self._client = None
             if not ready.is_set():
                 ready.set()
