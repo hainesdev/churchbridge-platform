@@ -5,7 +5,7 @@ import { BibleVersionSelectors } from './BibleVersionSelectors';
 import { ScripturePopover } from './ScripturePopover';
 import { useBibleVersions } from '@/lib/useBibleVersions';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
-import { float32ToBase64 } from '@/lib/audioUtils';
+import { float32ChunksToBase64Payloads } from '@/lib/audioUtils';
 import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
@@ -113,11 +113,14 @@ function useAudioStream(
     if (!sendBufferRef.current.length || wsRef.current?.readyState !== WebSocket.OPEN) return;
     const chunks = sendBufferRef.current;
     sendBufferRef.current = [];
-    wsRef.current.send(JSON.stringify({ type: 'audio', audio: float32ToBase64(chunks) }));
+    const payloads = float32ChunksToBase64Payloads(chunks);
+    for (const payload of payloads) {
+      wsRef.current.send(JSON.stringify({ type: 'audio', audio: payload }));
+    }
     const now = Date.now();
     setDiagnostics(prev => ({
       ...prev,
-      batchesSent: prev.batchesSent + 1,
+      batchesSent: prev.batchesSent + payloads.length,
       lastBatchAt: now,
     }));
   }, []);

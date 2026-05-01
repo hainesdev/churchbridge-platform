@@ -56,6 +56,61 @@ Latest verified benchmark/evaluation result in this workspace:
 
 - `tests/benchmark`: `29 passed`
 
+## Playwright Web App Tests
+
+Run these from:
+
+```powershell
+C:\Users\Dan\Desktop\Projects\churchbridge-ai\client
+```
+
+These browser tests exercise the real Next.js client against the live backend
+WebSocket pipeline. Unlike the Python replay benchmark, they validate browser
+audio capture shims, stream socket reconnects, display/listener subscriptions,
+and the actual UI pages.
+
+### Prerequisites
+
+- The backend server must already be running and reachable at `http://127.0.0.1:8000`
+  unless you override `CHURCHBRIDGE_API_URL` / `CHURCHBRIDGE_WS_URL`
+- `server\.venv` is set up and the root `.env` contains the required runtime keys
+- Playwright browsers are installed for the client workspace
+
+Start the backend from the repo root in a separate shell:
+
+```powershell
+server\.venv\Scripts\python.exe -m uvicorn server.main:app --host 127.0.0.1 --port 8000
+```
+
+Install client dependencies and Playwright browsers when needed:
+
+```powershell
+npm install
+npx playwright install chromium
+```
+
+### Run All Playwright Tests
+
+```powershell
+npm run test:e2e
+```
+
+### Focused Playwright Runs
+
+```powershell
+npm run test:e2e:web-client-replay
+npm run test:e2e:mobile-listener
+```
+
+Current Playwright coverage in this workspace:
+
+- `client/e2e/web-client-replay.spec.ts`
+  - 60-second browser replay through `/test/[churchId]`
+  - forced stream-socket reconnect during active audio
+  - forced display-socket reconnect during active audio
+- `client/e2e/mobile-listener.spec.ts`
+  - `/listen/[churchId]` receives `live_translation` and `feed_commit` events
+
 ## Pipeline Benchmark
 
 This benchmark exercises the live server pipeline end to end after audio has

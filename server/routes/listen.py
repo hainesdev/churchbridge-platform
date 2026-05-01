@@ -13,20 +13,27 @@ def set_broadcaster(b):
     _broadcaster = b
 
 
+TRANSLATION_EVENT_TYPES = {
+    "live_translation",
+    "live_translation_clear",
+    "feed_commit",
+    "feed_revision",
+}
+
+
 @router.websocket("/api/listen/v1")
 async def listen_ws(
     ws: WebSocket,
     church_id: str = Query(...),
 ):
-    """Mobile listener WebSocket. Forwards only translation events (English only)."""
+    """Mobile listener WebSocket. Forwards only English translation events."""
     await ws.accept()
 
     if _broadcaster.available:
         try:
             async for payload in _broadcaster.subscribe(church_id):
                 msg = json.loads(payload)
-                # Mobile only needs tokens and completed translations
-                if msg.get("type") in ("interim_translation", "translation", "correction"):
+                if msg.get("type") in TRANSLATION_EVENT_TYPES:
                     await ws.send_text(payload)
         except WebSocketDisconnect:
             logger.info("[listen] Mobile disconnected for church %s", church_id)
@@ -40,7 +47,7 @@ async def listen_ws(
             while True:
                 payload = await queue.get()
                 msg = json.loads(payload)
-                if msg.get("type") in ("interim_translation", "translation", "correction"):
+                if msg.get("type") in TRANSLATION_EVENT_TYPES:
                     await ws.send_text(payload)
         except WebSocketDisconnect:
             pass

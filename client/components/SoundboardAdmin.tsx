@@ -4,7 +4,7 @@ import { BibleVersionSelectors } from './BibleVersionSelectors';
 import { VUMeter } from './VUMeter';
 import { useBibleVersions } from '@/lib/useBibleVersions';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
-import { float32ToBase64 } from '@/lib/audioUtils';
+import { float32ChunksToBase64Payloads } from '@/lib/audioUtils';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
 
@@ -45,7 +45,10 @@ export function SoundboardAdmin({ churchId }: SoundboardAdminProps) {
 
     const chunks = sendBufferRef.current;
     sendBufferRef.current = [];
-    wsRef.current.send(JSON.stringify({ type: 'audio', audio: float32ToBase64(chunks) }));
+    const payloads = float32ChunksToBase64Payloads(chunks);
+    for (const payload of payloads) {
+      wsRef.current.send(JSON.stringify({ type: 'audio', audio: payload }));
+    }
   }, []);
 
   const connect = useCallback(() => {

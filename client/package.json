@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:e2e": "playwright test",
+    "test:e2e:web-client-replay": "playwright test e2e/web-client-replay.spec.ts --reporter=line",
+    "test:e2e:mobile-listener": "playwright test e2e/mobile-listener.spec.ts --reporter=line"
   },
   "dependencies": {
     "framer-motion": "^12.38.0",
@@ -16,6 +19,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@playwright/test": "^1.55.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
