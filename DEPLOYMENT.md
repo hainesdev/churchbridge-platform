@@ -20,7 +20,7 @@ Compose now uses Docker network aliases (`churchbridge_api`, `churchbridge_web`)
 - `deploy/web.Dockerfile`: frontend image
 - `deploy/nginx/churchbridge.dhaines.dev.conf`: vhost config for the shared Nginx proxy — **installed automatically by `deploy.sh`** into `/var/www/dhaines.dev/nginx/conf.d/churchbridge.conf` on every deploy. Also committed to the `dhaines.dev` repo as a belt-and-suspenders backup.
 - `deploy/.env.production.example`: production env template
-- `deploy/scripts/deploy.sh`: remove legacy fixed-name containers if present, stop the current compose stack to avoid recreate-time name conflicts, rebuild/restart the stack, install the nginx vhost config, and reload `dhaines_nginx`
+- `deploy/scripts/deploy.sh`: remove legacy fixed-name containers if present, stop the current compose stack to avoid recreate-time name conflicts, rebuild/restart the stack, backfill missing Google Speech env vars into `.env.production`, install the nginx vhost config, and reload `dhaines_nginx`
 - `deploy/scripts/sync-db.sh`: copies `data/churchbridge.db` into the Docker volume before deploy when present
 - `deploy/scripts/deploy-ref.sh`: deploy a specific Git SHA/ref from `main`
 - `deploy/scripts/update-if-needed.sh`: pull `main` and redeploy when changed
@@ -32,10 +32,11 @@ Compose now uses Docker network aliases (`churchbridge_api`, `churchbridge_web`)
 
 1. Clone this repo to `/var/www/churchbridge-ai`.
 2. Create `/var/www/churchbridge-ai/.env.production` from `deploy/.env.production.example`.
+   The deploy script backfills the default Chirp 3 env keys if they are missing and expects the Google credential file at `/var/www/churchbridge-ai/secrets/google-speech-service-account.json`.
 3. Copy the production SQLite file to `/var/www/churchbridge-ai/data/churchbridge.db`.
 4. Add the `churchbridge` DNS record in DigitalOcean pointing to `167.71.84.35`.
 5. Issue a certificate with the existing Certbot container and webroot volume: `docker compose -f /var/www/dhaines.dev/docker-compose.yml run --rm certbot certonly --webroot -w /var/www/certbot -d churchbridge.dhaines.dev`.
-6. Run `deploy/scripts/deploy.sh` — this installs the nginx vhost config, reloads `dhaines_nginx`, and brings up the stack.
+6. Run `deploy/scripts/deploy.sh` — this patches missing Google Speech env keys, installs the nginx vhost config, reloads `dhaines_nginx`, and brings up the stack.
 7. Install and enable the systemd timer for automatic updates.
 
 > **Note:** Step 4 in the old bootstrap ("copy the nginx config manually") is now handled automatically by `deploy.sh`.

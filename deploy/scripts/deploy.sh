@@ -11,6 +11,37 @@ if [[ ! -f ".env.production" ]]; then
   exit 1
 fi
 
+ensure_env_var() {
+  local key="$1"
+  local value="$2"
+  local env_file="${3:-.env.production}"
+
+  if grep -qE "^${key}=" "${env_file}"; then
+    return 0
+  fi
+
+  printf '%s=%s\n' "${key}" "${value}" >> "${env_file}"
+  echo "Added ${key} to ${env_file}."
+}
+
+ensure_google_speech_env() {
+  local env_file=".env.production"
+  local credentials_path="/var/www/churchbridge-ai/secrets/google-speech-service-account.json"
+
+  ensure_env_var "GOOGLE_CLOUD_PROJECT" "active-alchemy-491315-c4" "${env_file}"
+  ensure_env_var "GOOGLE_CLOUD_LOCATION" "us" "${env_file}"
+  ensure_env_var "GOOGLE_SPEECH_MODEL" "chirp_3" "${env_file}"
+  ensure_env_var "GOOGLE_SPEECH_LANGUAGE" "es-US" "${env_file}"
+  ensure_env_var "GOOGLE_SPEECH_RECOGNIZER" "_" "${env_file}"
+  ensure_env_var "GOOGLE_APPLICATION_CREDENTIALS" "${credentials_path}" "${env_file}"
+
+  if [[ ! -f "${credentials_path}" ]]; then
+    echo "Warning: ${credentials_path} does not exist on the host. Google Speech will still fail until the service account key is placed there." >&2
+  fi
+}
+
+ensure_google_speech_env
+
 bash "${SCRIPT_DIR}/sync-db.sh"
 
 # Legacy cleanup: older production revisions pinned fixed container names
