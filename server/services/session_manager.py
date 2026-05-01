@@ -392,6 +392,9 @@ class ServiceSession:
 
     async def _on_interim(self, text: str):
         await self._broadcast({"type": "interim", "text": text, "ts": _now()})
+        preview = _clean_stt(text)
+        if preview and self._translation:
+            await self._translation.translate_interim(preview)
 
     async def _on_final(self, text: str, audio_start: float, audio_end: float, stt_meta: dict):
         logger.info("[session:%s] STT final: %s", self._church_id, text)
@@ -544,6 +547,7 @@ class ServiceSession:
             source="google_sentence",
             display_ready=False,
             segment_id=ts,
+            merge_strategy="replace",
         )
         await self._queue_feed_commit(
             segment_id=ts,
@@ -578,12 +582,18 @@ class ServiceSession:
                 terminal_incomplete=bool(timing.get("terminal_incomplete")),
             )
 
-    async def _on_interim_translation(self, text: str):
+    async def _on_interim_translation(
+        self,
+        text: str,
+        source: str = "google_fragment",
+        replace: bool = False,
+    ):
         await self._broadcast_live_translation(
             text=text,
-            source="google_fragment",
+            source=source,
             display_ready=False,
             live_ts=_now(),
+            merge_strategy="replace" if replace else "append",
         )
 
     async def _on_correction(self, ts: int, english: str):
@@ -608,6 +618,7 @@ class ServiceSession:
                 source="google_correction",
                 display_ready=False,
                 segment_id=ts,
+                merge_strategy="replace",
             )
             return
         await self._broadcast_feed_revision(
@@ -649,6 +660,7 @@ class ServiceSession:
                 source="llm",
                 display_ready=True,
                 segment_id=ts,
+                merge_strategy="replace",
             )
             await self._commit_pending_segment(ts)
             return
@@ -810,6 +822,7 @@ class ServiceSession:
                 source="llm",
                 display_ready=True,
                 segment_id=keep_ts,
+                merge_strategy="replace",
             )
             await self._commit_pending_segment(keep_ts)
         await self._broadcast({
@@ -1001,12 +1014,14 @@ class ServiceSession:
         display_ready: bool,
         live_ts: int | None = None,
         segment_id: int | None = None,
+        merge_strategy: str = "append",
     ) -> None:
         payload = {
             "type": "live_translation",
             "text": text,
             "source": source,
             "display_ready": display_ready,
+            "merge_strategy": merge_strategy,
         }
         if segment_id is not None:
             payload.update(self._segment_ref(segment_id))

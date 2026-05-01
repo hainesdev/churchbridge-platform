@@ -383,6 +383,7 @@ class FakeGoogleTranslateService(GoogleTranslateService):
         self._fragment_task = None
         self._sentence_lock = asyncio.Lock()
         self._fragment_context = []
+        self._last_preview_spanish = ""
         self._http = None
         self._responses = list(responses)
         self._call_count = 0
@@ -439,6 +440,55 @@ class TestDualPassCorrection:
             assert corrections[0][0] == 1000          # prior ts
             assert corrections[0][1] == "In him is light"  # corrected prior
             assert translations[1][1] == "And we walk together"
+
+        asyncio.run(run())
+
+
+class TestInterimTranslationPreview:
+    def _make_p(self, *texts):
+        return "".join(f"<p>{t}</p>" for t in texts)
+
+    def test_interim_preview_replaces_in_place(self):
+        async def run():
+            interim_updates = []
+
+            async def on_interim_translation(text, source, replace):
+                interim_updates.append((text, source, replace))
+
+            svc = FakeGoogleTranslateService(
+                responses=[self._make_p("God is love")],
+                on_translation=lambda *args: None,
+                on_correction=lambda *args: None,
+                on_interim_translation=on_interim_translation,
+            )
+
+            await svc.translate_interim("Dios es amor")
+            await asyncio.sleep(0.25)
+
+            assert interim_updates == [("God is love", "google_interim", True)]
+
+        asyncio.run(run())
+
+    def test_duplicate_interim_preview_is_suppressed(self):
+        async def run():
+            interim_updates = []
+
+            async def on_interim_translation(text, source, replace):
+                interim_updates.append((text, source, replace))
+
+            svc = FakeGoogleTranslateService(
+                responses=[self._make_p("God is love"), self._make_p("God is love")],
+                on_translation=lambda *args: None,
+                on_correction=lambda *args: None,
+                on_interim_translation=on_interim_translation,
+            )
+
+            await svc.translate_interim("Dios es amor")
+            await asyncio.sleep(0.25)
+            await svc.translate_interim("Dios es amor")
+            await asyncio.sleep(0.25)
+
+            assert interim_updates == [("God is love", "google_interim", True)]
 
         asyncio.run(run())
 

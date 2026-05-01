@@ -34,6 +34,7 @@ class SlowFakeGoogleTranslateService(GoogleTranslateService):
         self._sentence_tasks = []
         self._sentence_lock = asyncio.Lock()
         self._fragment_context = []
+        self._last_preview_spanish = ""
         self._http = None
         self._responses = list(responses)
         self._call_count = 0
@@ -66,6 +67,7 @@ class ControlledGoogleTranslateService(GoogleTranslateService):
         self._sentence_tasks = []
         self._sentence_lock = asyncio.Lock()
         self._fragment_context = []
+        self._last_preview_spanish = ""
         self._http = _NoopHttpClient()
         self._responses = list(responses)
         self._call_count = 0
@@ -735,6 +737,62 @@ class TestLowConfidenceHold:
             )]
             assert broadcasts[0]["type"] == "stt_final"
             assert broadcasts[0]["low_confidence"] is True
+
+        run(run_())
+
+
+class TestInterimPreview:
+    def test_interim_triggers_fast_translation_preview(self):
+        async def run_():
+            translation_calls = []
+            broadcasts = []
+
+            class _StubTranslation:
+                async def translate_interim(self, text):
+                    translation_calls.append(text)
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    broadcasts.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._translation = _StubTranslation()
+            session._recorder = None
+
+            await session._on_interim("Pentecostés comunión unos con otros")
+
+            assert broadcasts == [{
+                "type": "interim",
+                "text": "Pentecostés comunión unos con otros",
+                "ts": broadcasts[0]["ts"],
+            }]
+            assert translation_calls == ["comunión unos con otros"]
+
+        run(run_())
+
+    def test_live_translation_broadcast_includes_merge_strategy(self):
+        async def run_():
+            broadcasts = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    broadcasts.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+
+            await session._on_interim_translation("Walking in the light", "google_interim", True)
+
+            assert broadcasts[0]["type"] == "live_translation"
+            assert broadcasts[0]["source"] == "google_interim"
+            assert broadcasts[0]["merge_strategy"] == "replace"
 
         run(run_())
 

@@ -26,6 +26,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 CONTEXT_WINDOW = 2  # previous sentences sent alongside current for disambiguation
 _P_TAG = re.compile(r"<p>(.*?)</p>", re.DOTALL)
+INTERIM_PREVIEW_DEBOUNCE_S = 0.18
+INTERIM_PREVIEW_MIN_CHARS = 8
 
 
 def _wrap(segments: list[str]) -> str:
@@ -69,7 +71,7 @@ class GoogleTranslateService:
         self,
         on_translation: Callable[[str, str, int], Awaitable[None]],
         on_correction: Callable[[int, str], Awaitable[None]],
-        on_interim_translation: Callable[[str], Awaitable[None]],
+        on_interim_translation: Callable[[str, str, bool], Awaitable[None]],
     ):
         self._on_translation = on_translation
         self._on_correction = on_correction
@@ -88,6 +90,7 @@ class GoogleTranslateService:
         # context so later fragments benefit from the same disambiguation as
         # earlier ones - not just the immediately prior fragment.
         self._fragment_context: list[str] = []
+        self._last_preview_spanish = ""
         self._http = httpx.AsyncClient(timeout=10.0)
 
     async def close(self):
@@ -114,10 +117,27 @@ class GoogleTranslateService:
         is emitted to the display."""
         if self._fragment_task and not self._fragment_task.done():
             self._fragment_task.cancel()
+        self._last_preview_spanish = ""
         prev_context = list(self._fragment_context)
         self._fragment_context.append(spanish)
         self._fragment_task = asyncio.create_task(
             self._do_translate_fragment(spanish, prev_context)
+        )
+
+    async def translate_interim(self, spanish: str):
+        """Preview track: translate the latest STT interim as a replace-in-place
+        live preview for the current sentence hypothesis."""
+        spanish = spanish.strip()
+        if len(spanish) < INTERIM_PREVIEW_MIN_CHARS:
+            return
+        if spanish == self._last_preview_spanish:
+            return
+        self._last_preview_spanish = spanish
+        if self._fragment_task and not self._fragment_task.done():
+            self._fragment_task.cancel()
+        prev_context = list(self._fragment_context)
+        self._fragment_task = asyncio.create_task(
+            self._do_translate_interim(spanish, prev_context)
         )
 
     async def _do_translate_fragment(self, spanish: str, prev_context: list[str]):
@@ -129,11 +149,27 @@ class GoogleTranslateService:
                 return
             parts = _unwrap(translated)
             english = parts[-1] if parts else translated.strip()
-            await self._on_interim_translation(english)
+            await self._on_interim_translation(english, "google_fragment", False)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.debug("[google_translate] Fragment error for '%s': %s", spanish[:40], e)
+
+    async def _do_translate_interim(self, spanish: str, prev_context: list[str]):
+        my_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(INTERIM_PREVIEW_DEBOUNCE_S)
+            segments = prev_context + [spanish]
+            translated = await self._call_api(_wrap(segments))
+            if my_task is not self._fragment_task:
+                return
+            parts = _unwrap(translated)
+            english = parts[-1] if parts else translated.strip()
+            await self._on_interim_translation(english, "google_interim", True)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("[google_translate] Interim preview error for '%s': %s", spanish[:40], e)
 
     async def translate(self, spanish: str, ts: int):
         """Accurate sentence translation; supersedes in-flight fragment interim."""
@@ -141,6 +177,7 @@ class GoogleTranslateService:
             self._fragment_task.cancel()
         self._fragment_task = None
         self._fragment_context = []
+        self._last_preview_spanish = ""
         self._active_task = asyncio.create_task(self._do_translate(spanish, ts))
         self._sentence_tasks = [t for t in getattr(self, "_sentence_tasks", []) if not t.done()]
         self._sentence_tasks.append(self._active_task)
