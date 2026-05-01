@@ -125,6 +125,30 @@ function messagePhraseAlignment(msg: Record<string, unknown>): PhraseAlignment[]
   return alignment;
 }
 
+function defaultLiveMergeStrategy(source: string): 'append' | 'replace' {
+  switch (source) {
+    case 'google_sentence':
+    case 'google_correction':
+    case 'google_interim':
+    case 'llm':
+      return 'replace';
+    default:
+      return 'append';
+  }
+}
+
+function mergeLiveEnglish(current: string, incoming: string): string {
+  const currentTrimmed = current.trim();
+  const incomingTrimmed = incoming.trim();
+  if (!incomingTrimmed) return currentTrimmed;
+  if (!currentTrimmed) return incomingTrimmed;
+  if (incomingTrimmed.startsWith(currentTrimmed)) return incomingTrimmed;
+  if (currentTrimmed.startsWith(incomingTrimmed) || currentTrimmed.includes(incomingTrimmed)) {
+    return currentTrimmed;
+  }
+  return `${currentTrimmed} ${incomingTrimmed}`;
+}
+
 export function useTranslationFeed(churchId: string): TranslationFeed {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [spanishLines, setSpanishLines] = useState<string[]>([]);
@@ -214,7 +238,17 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
         }
 
         if (msg.type === 'live_translation') {
-          setLiveEnglish(String(msg.text ?? ''));
+          const text = String(msg.text ?? '').trim();
+          if (!text) return;
+          const source = typeof msg.source === 'string' ? msg.source : 'live_translation';
+          const mergeStrategy = msg.merge_strategy === 'replace' || msg.merge_strategy === 'append'
+            ? msg.merge_strategy
+            : defaultLiveMergeStrategy(source);
+          setLiveEnglish(prev => (
+            mergeStrategy === 'replace'
+              ? text
+              : mergeLiveEnglish(prev, text)
+          ));
           setLiveSegmentId(messageSegmentId(msg));
           setLiveUpdatedAt(Date.now());
           return;
