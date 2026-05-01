@@ -26,6 +26,7 @@ jobs:
       DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
       DEPLOY_REF: ${{ github.event.inputs.ref || github.sha }}
       HEALTHCHECK_URL: ${{ secrets.DEPLOY_HEALTHCHECK_URL }}
+      GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64 }}
     steps:
       - name: Check required secrets
         shell: bash
@@ -49,6 +50,15 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.ssh
           ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Install Google Speech credentials on droplet
+        if: ${{ env.GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64 != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64}" | \
+            ssh -p "${DEPLOY_PORT:-22}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "mkdir -p '${DEPLOY_PATH}/secrets' && base64 -d > '${DEPLOY_PATH}/secrets/google-speech-service-account.json' && chmod 600 '${DEPLOY_PATH}/secrets/google-speech-service-account.json'"
 
       - name: Deploy exact ref on droplet
         shell: bash
