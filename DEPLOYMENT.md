@@ -53,7 +53,7 @@ GitHub Actions can now deploy production on every push to `main` and via manual 
 - `DEPLOY_PATH`: repo checkout on the droplet, for example `/var/www/churchbridge-ai`
 - `DEPLOY_PORT`: optional SSH port, defaults to `22`
 - `DEPLOY_HEALTHCHECK_URL`: optional public health URL, for example `https://churchbridge.dhaines.dev/health`
-- `GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64`: optional base64-encoded service-account JSON. When set, the deploy workflow writes it to `${DEPLOY_PATH}/secrets/google-speech-service-account.json` before restarting the stack.
+- `GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64`: optional base64-encoded service-account JSON. When set, the deploy workflow writes it to `${DEPLOY_PATH}/secrets/google-speech-service-account.json` before restarting the stack, and the API container reads it from `/app/secrets/google-speech-service-account.json`.
 
 ### Workflow behavior
 
