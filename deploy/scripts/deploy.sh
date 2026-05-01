@@ -22,7 +22,7 @@ set_env_var() {
     if [[ "${current}" == "${value}" ]]; then
       return 0
     fi
-    python - "${env_file}" "${key}" "${value}" <<'PY'
+    python3 - "${env_file}" "${key}" "${value}" <<'PY'
 from pathlib import Path
 import sys
 
