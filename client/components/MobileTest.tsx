@@ -7,6 +7,12 @@ import { useBibleVersions } from '@/lib/useBibleVersions';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
 import { float32ChunksToBase64Payloads } from '@/lib/audioUtils';
 import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
+import {
+  createInitialStreamDebugState,
+  useBrowserDiagnosticsTelemetry,
+  type BrowserAudioDiagnostics as AudioDiagnostics,
+  type BrowserStreamDebugState,
+} from '@/lib/browserDiagnostics';
 
 type Status = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
 type AudioPreset = 'quiet-room' | 'noisy-church' | 'near-speaker' | 'manual';
@@ -19,20 +25,6 @@ interface AudioCaptureOptions {
   noiseSuppression: boolean;
   echoCancellation: boolean;
   autoGainControl: boolean;
-}
-
-interface AudioDiagnostics {
-  inputLevel: number;
-  noiseFloor: number;
-  clipping: boolean;
-  speechDetected: boolean;
-  batchesSent: number;
-  lastBatchAt: number | null;
-  audioContextSampleRate: number | null;
-  requestedSampleRate: number;
-  inputDeviceLabel: string;
-  lastSpeechAt: number | null;
-  appliedOptions: AudioCaptureOptions | null;
 }
 
 const BATCH_INTERVAL_MS = 100;
@@ -95,12 +87,14 @@ function useAudioStream(
     lastSpeechAt: null,
     appliedOptions: null,
   });
+  const [streamDebug, setStreamDebug] = useState<BrowserStreamDebugState>(createInitialStreamDebugState);
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sendBufferRef = useRef<Float32Array[]>([]);
+  const sendBufferSampleCountRef = useRef(0);
   const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryDelayRef = useRef(1000);
   const shouldReconnectRef = useRef(false);
@@ -112,7 +106,10 @@ function useAudioStream(
   const flushBuffer = useCallback(() => {
     if (!sendBufferRef.current.length || wsRef.current?.readyState !== WebSocket.OPEN) return;
     const chunks = sendBufferRef.current;
+    const bufferedChunkCount = chunks.length;
+    const bufferedSampleCount = sendBufferSampleCountRef.current;
     sendBufferRef.current = [];
+    sendBufferSampleCountRef.current = 0;
     const payloads = float32ChunksToBase64Payloads(chunks);
     for (const payload of payloads) {
       wsRef.current.send(JSON.stringify({ type: 'audio', audio: payload }));
@@ -122,6 +119,12 @@ function useAudioStream(
       ...prev,
       batchesSent: prev.batchesSent + payloads.length,
       lastBatchAt: now,
+    }));
+    setStreamDebug(prev => ({
+      ...prev,
+      payloadsSent: prev.payloadsSent + payloads.length,
+      bufferedChunkCount: Math.max(0, prev.bufferedChunkCount - bufferedChunkCount),
+      bufferedSampleCount: Math.max(0, prev.bufferedSampleCount - bufferedSampleCount),
     }));
   }, []);
 
@@ -133,6 +136,11 @@ function useAudioStream(
       setStatus('active');
       setErrorMsg('');
       retryDelayRef.current = 1000;
+      setStreamDebug(prev => ({
+        ...prev,
+        socketOpenCount: prev.socketOpenCount + 1,
+        lastSocketOpenAt: Date.now(),
+      }));
       ws.send(JSON.stringify({
         type: 'session.start',
         sampleRate: sampleRateRef.current,
@@ -144,10 +152,34 @@ function useAudioStream(
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'error') { setErrorMsg(msg.message); setStatus('error'); }
+      if (msg.type === 'error') {
+        setErrorMsg(msg.message);
+        setStatus('error');
+        setStreamDebug(prev => ({
+          ...prev,
+          lastErrorMessage: String(msg.message ?? ''),
+          lastSocketErrorAt: Date.now(),
+        }));
+      }
     };
 
-    ws.onclose = () => {
+    ws.onerror = () => {
+      setStreamDebug(prev => ({
+        ...prev,
+        socketErrorCount: prev.socketErrorCount + 1,
+        lastSocketErrorAt: Date.now(),
+      }));
+    };
+
+    ws.onclose = (event) => {
+      setStreamDebug(prev => ({
+        ...prev,
+        socketCloseCount: prev.socketCloseCount + 1,
+        reconnectCount: shouldReconnectRef.current ? prev.reconnectCount + 1 : prev.reconnectCount,
+        lastSocketCloseAt: Date.now(),
+        lastSocketCloseCode: event.code,
+        lastSocketCloseReason: event.reason,
+      }));
       if (!shouldReconnectRef.current) return;
       setStatus('reconnecting');
       setTimeout(() => { if (shouldReconnectRef.current) connectRef.current(); }, retryDelayRef.current);
@@ -162,6 +194,9 @@ function useAudioStream(
   const start = useCallback(async () => {
     setStatus('connecting');
     setErrorMsg('');
+    setStreamDebug(createInitialStreamDebugState());
+    sendBufferRef.current = [];
+    sendBufferSampleCountRef.current = 0;
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -202,6 +237,12 @@ function useAudioStream(
         if (e.data.type !== 'chunk') return;
         const samples = e.data.samples as Float32Array;
         sendBufferRef.current.push(samples);
+        sendBufferSampleCountRef.current += samples.length;
+        setStreamDebug(prev => ({
+          ...prev,
+          bufferedChunkCount: sendBufferRef.current.length,
+          bufferedSampleCount: sendBufferSampleCountRef.current,
+        }));
         const { rms, peak } = computeSignalMetrics(samples);
         const nextNoiseFloor = noiseFloorRef.current === 0
           ? rms
@@ -272,14 +313,20 @@ function useAudioStream(
     ctxRef.current?.close();
     ctxRef.current = null;
     sendBufferRef.current = [];
+    sendBufferSampleCountRef.current = 0;
     noiseFloorRef.current = 0;
     setDiagnostics(prev => ({ ...prev, speechDetected: false, inputLevel: 0, clipping: false }));
+    setStreamDebug(prev => ({
+      ...prev,
+      bufferedChunkCount: 0,
+      bufferedSampleCount: 0,
+    }));
     setStatus('idle');
   }, []);
 
   useEffect(() => () => stop(), [stop]);
 
-  return { status, errorMsg, diagnostics, start, stop };
+  return { status, errorMsg, diagnostics, streamDebug, start, stop };
 }
 
 function DiagnosticsBar({
@@ -355,6 +402,15 @@ function TranslationTestPanel({
   lastInterimAt,
   lastFinalAt,
   lastTranslationAt,
+  remoteTelemetryEnabled,
+  telemetrySessionKey,
+  telemetrySending,
+  telemetryLastPostedAt,
+  telemetryLastPostStatus,
+  telemetryLastPostError,
+  telemetryWarningFlags,
+  onToggleRemoteTelemetry,
+  onSendTelemetrySnapshot,
 }: {
   open: boolean;
   onClose: () => void;
@@ -373,6 +429,15 @@ function TranslationTestPanel({
   lastInterimAt: number | null;
   lastFinalAt: number | null;
   lastTranslationAt: number | null;
+  remoteTelemetryEnabled: boolean;
+  telemetrySessionKey: string;
+  telemetrySending: boolean;
+  telemetryLastPostedAt: number | null;
+  telemetryLastPostStatus: string;
+  telemetryLastPostError: string;
+  telemetryWarningFlags: string[];
+  onToggleRemoteTelemetry: () => void;
+  onSendTelemetrySnapshot: () => void;
 }) {
   const sttHealthy = !!(lastFinalAt && now - lastFinalAt < 10_000);
   const translationHealthy = !!(lastTranslationAt && now - lastTranslationAt < 12_000);
@@ -488,6 +553,45 @@ function TranslationTestPanel({
               </div>
             </div>
           </div>
+
+          <div className="space-y-3">
+            <h3 className="text-sm font-semibold text-white">Remote Telemetry</h3>
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-4 space-y-4">
+              <ToggleRow
+                label="Browser Telemetry"
+                description="Post live browser snapshots to the diagnostics dashboard during manual tests."
+                checked={remoteTelemetryEnabled}
+                disabled={false}
+                onToggle={onToggleRemoteTelemetry}
+              />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Session key</p>
+                  <p className="mt-2 break-all font-mono text-xs text-gray-300">{telemetrySessionKey}</p>
+                  <p className="mt-2 text-xs text-gray-500">
+                    Last post: {telemetryLastPostedAt ? formatAge(now, telemetryLastPostedAt) : 'Not sent yet'}
+                  </p>
+                </div>
+                <div className="rounded-2xl border border-gray-800 bg-gray-950/80 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Status</p>
+                  <p className="mt-2 text-sm text-white">
+                    {telemetrySending ? 'Posting snapshot...' : telemetryLastPostStatus || 'Idle'}
+                  </p>
+                  <p className="mt-2 text-xs text-red-300">
+                    {telemetryLastPostError || (telemetryWarningFlags.length > 0 ? telemetryWarningFlags.join(', ') : 'No current warnings')}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={onSendTelemetrySnapshot}
+                disabled={!remoteTelemetryEnabled || telemetrySending}
+                className="w-full rounded-2xl border border-sky-700 bg-sky-900/40 px-4 py-3 text-sm font-medium text-sky-100 transition-colors hover:bg-sky-900/60 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {telemetrySending ? 'Posting...' : 'Post Snapshot Now'}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -502,10 +606,11 @@ export function MobileTest({ churchId }: MobileTestProps) {
   const [panelOpen, setPanelOpen] = useState(false);
   const [preset, setPreset] = useState<AudioPreset>('noisy-church');
   const [manualOptions, setManualOptions] = useState<AudioCaptureOptions>(AUDIO_PRESETS['noisy-church']);
+  const [remoteTelemetryEnabled, setRemoteTelemetryEnabled] = useState(true);
   const [now, setNow] = useState(() => Date.now());
   const { versions, loading: versionsLoading, error: versionsError } = useBibleVersions(churchId);
   const effectiveOptions = getEffectiveOptions(preset, manualOptions);
-  const { status, errorMsg, diagnostics, start, stop } = useAudioStream(
+  const { status, errorMsg, diagnostics, streamDebug, start, stop } = useAudioStream(
     churchId,
     sourceScriptureVersion,
     displayScriptureVersion,
@@ -524,6 +629,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
     lastInterimSpanish,
     lastFinalSpanish,
     lastCommittedEnglish,
+    debug: feedDebug,
   } = useTranslationFeed(churchId);
   const [popover, setPopover] = useState<{
     title: string;
@@ -542,6 +648,23 @@ export function MobileTest({ churchId }: MobileTestProps) {
     return () => clearInterval(timer);
   }, []);
 
+  const telemetry = useBrowserDiagnosticsTelemetry({
+    churchId,
+    enabled: remoteTelemetryEnabled,
+    streamStatus: status,
+    streamError: errorMsg,
+    displayConnected,
+    audioDiagnostics: diagnostics,
+    streamDebug,
+    feedDebug,
+    lastInterimAt,
+    lastFinalAt,
+    lastTranslationAt,
+    lastInterimSpanish,
+    lastFinalSpanish,
+    lastCommittedEnglish,
+  });
+
   const handlePresetChange = useCallback((nextPreset: AudioPreset) => {
     setPreset(nextPreset);
     if (nextPreset !== 'manual') {
@@ -553,6 +676,10 @@ export function MobileTest({ churchId }: MobileTestProps) {
     setPreset('manual');
     setManualOptions(prev => ({ ...prev, [key]: value }));
   }, []);
+
+  const handleSendTelemetrySnapshot = useCallback(() => {
+    void telemetry.sendSnapshotNow();
+  }, [telemetry]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -627,7 +754,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
               onDisplayVersionChange={setDisplayScriptureVersion}
               disabled={false}
             />
-            {versionsLoading && <p className="mt-2 text-xs text-gray-500 text-center">Loading versions…</p>}
+          {versionsLoading && <p className="mt-2 text-xs text-gray-500 text-center">Loading versions...</p>}
           </div>
         ) : null}
         <div className="rounded-2xl border border-gray-800 bg-gray-900 p-4">
@@ -664,6 +791,15 @@ export function MobileTest({ churchId }: MobileTestProps) {
           lastInterimAt={lastInterimAt}
           lastFinalAt={lastFinalAt}
           lastTranslationAt={lastTranslationAt}
+          remoteTelemetryEnabled={remoteTelemetryEnabled}
+          telemetrySessionKey={telemetry.sessionKey}
+          telemetrySending={telemetry.sending}
+          telemetryLastPostedAt={telemetry.lastPostedAt}
+          telemetryLastPostStatus={telemetry.lastPostStatus}
+          telemetryLastPostError={telemetry.lastPostError}
+          telemetryWarningFlags={telemetry.warningFlags}
+          onToggleRemoteTelemetry={() => setRemoteTelemetryEnabled(prev => !prev)}
+          onSendTelemetrySnapshot={handleSendTelemetrySnapshot}
         />
       </div>
     );
@@ -823,6 +959,15 @@ export function MobileTest({ churchId }: MobileTestProps) {
         lastInterimAt={lastInterimAt}
         lastFinalAt={lastFinalAt}
         lastTranslationAt={lastTranslationAt}
+        remoteTelemetryEnabled={remoteTelemetryEnabled}
+        telemetrySessionKey={telemetry.sessionKey}
+        telemetrySending={telemetry.sending}
+        telemetryLastPostedAt={telemetry.lastPostedAt}
+        telemetryLastPostStatus={telemetry.lastPostStatus}
+        telemetryLastPostError={telemetry.lastPostError}
+        telemetryWarningFlags={telemetry.warningFlags}
+        onToggleRemoteTelemetry={() => setRemoteTelemetryEnabled(prev => !prev)}
+        onSendTelemetrySnapshot={handleSendTelemetrySnapshot}
       />
       <ScripturePopover
         open={popover !== null}

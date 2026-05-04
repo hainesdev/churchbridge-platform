@@ -5,6 +5,7 @@ import { useEventLog } from '@/lib/useEventLog';
 import { LatencyBars } from './LatencyBars';
 import { EnrichmentHealth } from './EnrichmentHealth';
 import { EventLog } from './EventLog';
+import { RemoteReports } from './RemoteReports';
 import { getApiBaseUrl } from '@/lib/wsBaseUrl';
 
 interface LiveViewProps {
@@ -118,6 +119,9 @@ export function LiveView({ churchId }: LiveViewProps) {
 
       {/* Event stream */}
       <EventLog events={events} connected={connected} />
+
+      {/* Remote browser snapshots */}
+      <RemoteReports churchId={churchId} />
     </div>
   );
 }

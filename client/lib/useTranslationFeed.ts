@@ -2,6 +2,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { getWebSocketBaseUrl } from '@/lib/wsBaseUrl';
 import { attachVerseToVisibleSegment, resolveMergedSegmentId } from '@/lib/mergedVerseRouting';
+import {
+  createInitialFeedDebugState,
+  type BrowserFeedDebugState,
+} from '@/lib/browserDiagnostics';
 
 export interface VerseDetection {
   book: string;
@@ -92,6 +96,7 @@ export interface TranslationFeed {
   lastInterimSpanish: string;
   lastFinalSpanish: string;
   lastCommittedEnglish: string;
+  debug: BrowserFeedDebugState;
 }
 
 function messageSegmentId(msg: Record<string, unknown>): number | null {
@@ -168,6 +173,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   const [lastInterimSpanish, setLastInterimSpanish] = useState('');
   const [lastFinalSpanish, setLastFinalSpanish] = useState('');
   const [lastCommittedEnglish, setLastCommittedEnglish] = useState('');
+  const [debug, setDebug] = useState<BrowserFeedDebugState>(createInitialFeedDebugState);
 
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mergedIntoRef = useRef<Map<number, number>>(new Map());
@@ -206,9 +212,31 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     const connect = () => {
       if (stopped) return;
       ws = new WebSocket(`${getWebSocketBaseUrl()}/api/display/v1?church_id=${encodeURIComponent(churchId)}`);
-      ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
+      ws.onopen = () => {
+        setConnected(true);
+        setDebug(prev => ({
+          ...prev,
+          displaySocketOpenCount: prev.displaySocketOpenCount + 1,
+          lastSocketOpenAt: Date.now(),
+        }));
+      };
+      ws.onerror = () => {
+        setDebug(prev => ({
+          ...prev,
+          displaySocketErrorCount: prev.displaySocketErrorCount + 1,
+          lastSocketErrorAt: Date.now(),
+        }));
+      };
+      ws.onclose = (event) => {
         setConnected(false);
+        setDebug(prev => ({
+          ...prev,
+          displaySocketCloseCount: prev.displaySocketCloseCount + 1,
+          displayReconnectCount: prev.displayReconnectCount + 1,
+          lastSocketCloseAt: Date.now(),
+          lastSocketCloseCode: event.code,
+          lastSocketCloseReason: event.reason,
+        }));
         setTimeout(connect, 2000);
       };
       ws.onmessage = (e) => {
@@ -219,6 +247,12 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           console.warn('[useTranslationFeed] Malformed WebSocket message:', e.data);
           return;
         }
+        setDebug(prev => ({
+          ...prev,
+          totalEvents: prev.totalEvents + 1,
+          lastEventType: String(msg.type ?? 'unknown'),
+          lastEventAt: Date.now(),
+        }));
 
         if (msg.type === 'interim') {
           const text = String(msg.text ?? '');
@@ -447,5 +481,6 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     lastInterimSpanish,
     lastFinalSpanish,
     lastCommittedEnglish,
+    debug,
   };
 }
