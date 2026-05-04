@@ -915,6 +915,7 @@ class ServiceSession:
                 ),
             },
             "enrichment": dict(self._enrichment.metrics) if self._enrichment else {},
+            "stt_session": self._stt_session.get_stats() if self._stt_session else {},
             "stt_noise_removed_count": self._stt_noise_removed_count,
             "_enrichment_settled_size": len(self._enrichment_settled),
             "session_id": self._db_session_id,

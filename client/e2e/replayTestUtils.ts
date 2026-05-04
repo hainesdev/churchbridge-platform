@@ -54,11 +54,12 @@ export function getFakeAudioBase64(): string {
 
 export async function installReplayHarness(
   page: Page,
-  options: { fakeMic?: boolean } = {},
+  options: { fakeMic?: boolean; fakeMicLoop?: boolean } = {},
 ): Promise<void> {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const fakeMic = options.fakeMic ?? false;
+  const fakeMicLoop = options.fakeMicLoop ?? false;
   const base64Audio = fakeMic ? getFakeAudioBase64() : null;
 
   page.on('console', (message) => {
@@ -71,7 +72,7 @@ export async function installReplayHarness(
   });
 
   await page.addInitScript(
-    ({ base64Audio: injectedAudio, fakeMic: enableFakeMic }) => {
+    ({ base64Audio: injectedAudio, fakeMic: enableFakeMic, fakeMicLoop: shouldLoopFakeMic }) => {
       const metrics: ReplayMetrics = {
         fakeMicRequestedAtMs: null,
         fakeMicStartedAtMs: null,
@@ -186,6 +187,7 @@ export async function installReplayHarness(
         const destination = context.createMediaStreamDestination();
         const source = context.createBufferSource();
         source.buffer = decoded;
+        source.loop = shouldLoopFakeMic;
         source.connect(destination);
         source.onended = () => {
           metrics.fakeMicEndedAtMs = Date.now();
@@ -211,7 +213,7 @@ export async function installReplayHarness(
         return cachedStreamPromise;
       };
     },
-    { base64Audio, fakeMic },
+    { base64Audio, fakeMic, fakeMicLoop },
   );
 
   await page.exposeFunction('__cbAttachErrors', () => {

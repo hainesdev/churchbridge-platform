@@ -14,6 +14,8 @@ from google.protobuf.duration_pb2 import Duration
 from server.services.stt import STTConfig
 
 logger = logging.getLogger(__name__)
+STREAM_RESTART_BACKOFF_S = 0.5
+MAX_STREAM_RESTART_BACKOFF_S = 5.0
 
 
 class GoogleSpeechSession:
@@ -39,6 +41,9 @@ class GoogleSpeechSession:
         self._last_stream_audio_end: float = 0.0
         self._last_final_audio_end: float = 0.0
         self._startup_error: str = ""
+        self._stream_restart_count: int = 0
+        self._stream_error_count: int = 0
+        self._last_stream_end_reason: str = ""
 
     async def start(
         self,
@@ -57,7 +62,13 @@ class GoogleSpeechSession:
         self._stop_event = asyncio.Event()
         self._audio_queue = asyncio.Queue()
         self._stt_config = stt_config or STTConfig()
+        self._stream_offset = 0.0
+        self._last_stream_audio_end = 0.0
+        self._last_final_audio_end = 0.0
         self._startup_error = ""
+        self._stream_restart_count = 0
+        self._stream_error_count = 0
+        self._last_stream_end_reason = ""
         ready: asyncio.Event = asyncio.Event()
         self._task = asyncio.create_task(
             self._run(glossary, sample_rate, ready, self._stt_config)
@@ -79,6 +90,8 @@ class GoogleSpeechSession:
             await self._audio_queue.put(pcm16_bytes)
 
     async def stop(self) -> None:
+        if self._stop_event:
+            self._stop_event.set()
         if self._audio_queue is not None:
             await self._audio_queue.put(None)
         if self._task and not self._task.done():
@@ -107,17 +120,51 @@ class GoogleSpeechSession:
         ready: asyncio.Event,
         stt_config: STTConfig,
     ) -> None:
+        restart_backoff_s = STREAM_RESTART_BACKOFF_S
         try:
             endpoint = _google_api_endpoint(stt_config.location)
             self._client = SpeechAsyncClient(
                 client_options=ClientOptions(api_endpoint=endpoint),
             )
-            stream = await self._client.streaming_recognize(
-                requests=self._request_generator(glossary, sample_rate, stt_config)
-            )
-            ready.set()
-            async for response in stream:
-                await self._handle_response(response)
+            while not self._stopping():
+                try:
+                    stream = await self._client.streaming_recognize(
+                        requests=self._request_generator(glossary, sample_rate, stt_config)
+                    )
+                    if not ready.is_set():
+                        ready.set()
+                    async for response in stream:
+                        await self._handle_response(response)
+                    if self._stopping():
+                        break
+                    self._roll_stream_window()
+                    self._stream_restart_count += 1
+                    self._last_stream_end_reason = "eof"
+                    logger.warning(
+                        "[google_speech] Stream ended unexpectedly for church %s; restarting (count=%d, offset=%.2fs)",
+                        self._church_id,
+                        self._stream_restart_count,
+                        self._stream_offset,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._stream_error_count += 1
+                    self._last_stream_end_reason = f"error:{type(e).__name__}"
+                    if not ready.is_set():
+                        raise
+                    self._roll_stream_window()
+                    logger.error(
+                        "[google_speech] Stream error for church %s (restart=%d, offset=%.2fs): %s",
+                        self._church_id,
+                        self._stream_restart_count + 1,
+                        self._stream_offset,
+                        e,
+                    )
+                if self._stopping():
+                    break
+                await self._sleep_with_stop(restart_backoff_s)
+                restart_backoff_s = min(restart_backoff_s * 2, MAX_STREAM_RESTART_BACKOFF_S)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -208,6 +255,34 @@ class GoogleSpeechSession:
                 await self._on_final(text, audio_start, audio_end, stt_meta)
             else:
                 await self._on_interim(text)
+
+    def get_stats(self) -> dict:
+        return {
+            "stream_offset_s": round(self._stream_offset, 3),
+            "last_stream_audio_end_s": round(self._last_stream_audio_end, 3),
+            "last_final_audio_end_s": round(self._last_final_audio_end, 3),
+            "stream_restart_count": self._stream_restart_count,
+            "stream_error_count": self._stream_error_count,
+            "last_stream_end_reason": self._last_stream_end_reason,
+            "task_done": bool(self._task.done()) if self._task else False,
+        }
+
+    def _roll_stream_window(self) -> None:
+        if self._last_stream_audio_end > 0:
+            self._stream_offset += self._last_stream_audio_end
+            self._last_stream_audio_end = 0.0
+
+    def _stopping(self) -> bool:
+        return bool(self._stop_event and self._stop_event.is_set())
+
+    async def _sleep_with_stop(self, delay_s: float) -> None:
+        if not self._stop_event:
+            await asyncio.sleep(delay_s)
+            return
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay_s)
+        except asyncio.TimeoutError:
+            return
 
 
 def _google_api_endpoint(location: str) -> str:

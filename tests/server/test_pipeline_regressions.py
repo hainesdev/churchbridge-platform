@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 from collections import deque
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -176,6 +177,11 @@ def make_json_result(
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def _wait_for(predicate, interval_s: float = 0.01):
+    while not predicate():
+        await asyncio.sleep(interval_s)
 
 
 class TestGoogleSentenceConcurrency:
@@ -674,6 +680,87 @@ class TestGoogleSpeechConfig:
         )
 
         assert isinstance(session, GoogleSpeechSession)
+
+    def test_google_speech_session_restarts_after_unexpected_stream_end(self):
+        async def run_():
+            import server.services.google_speech_session as speech_module
+
+            os.environ["GOOGLE_CLOUD_PROJECT"] = "test-project"
+            finals = []
+            client_instances = []
+
+            class _FakeResponseStream:
+                def __init__(self, requests, transcript):
+                    self._requests = requests
+                    self._transcript = transcript
+                    self._sent = False
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self._sent:
+                        raise StopAsyncIteration
+                    await anext(self._requests)
+                    self._sent = True
+                    return SimpleNamespace(
+                        speech_event_type=0,
+                        results=[
+                            SimpleNamespace(
+                                alternatives=[
+                                    SimpleNamespace(
+                                        transcript=self._transcript,
+                                        confidence=0.91,
+                                        words=[],
+                                    )
+                                ],
+                                is_final=True,
+                                result_end_offset=SimpleNamespace(seconds=1, nanos=0),
+                                language_code="es-US",
+                            )
+                        ],
+                    )
+
+            class _FakeClient:
+                def __init__(self, client_options=None):
+                    self.client_options = client_options
+                    self.transport = SimpleNamespace(close=lambda: None)
+                    self.stream_call_count = 0
+                    client_instances.append(self)
+
+                async def streaming_recognize(self, requests):
+                    self.stream_call_count += 1
+                    await anext(requests)  # config request
+                    transcript = f"final-{self.stream_call_count}"
+                    return _FakeResponseStream(requests, transcript)
+
+            original_client = speech_module.SpeechAsyncClient
+            speech_module.SpeechAsyncClient = _FakeClient
+            try:
+                session = GoogleSpeechSession(
+                    church_id="test",
+                    on_interim=lambda text: asyncio.sleep(0),
+                    on_final=lambda text, start, end, meta: finals.append((text, start, end, meta)) or asyncio.sleep(0),
+                    on_utterance_end=lambda: asyncio.sleep(0),
+                )
+
+                await session.start(glossary={}, sample_rate=16000)
+                await session.send(b"\x01\x02")
+                await asyncio.wait_for(_wait_for(lambda: len(finals) >= 1), timeout=2.0)
+                await session.send(b"\x03\x04")
+                await asyncio.wait_for(_wait_for(lambda: len(finals) >= 2), timeout=2.0)
+                await session.stop()
+
+                assert [item[0] for item in finals] == ["final-1", "final-2"]
+                assert client_instances[0].stream_call_count >= 2
+                stats = session.get_stats()
+                assert stats["stream_restart_count"] >= 1
+                assert stats["stream_error_count"] == 0
+                assert stats["stream_offset_s"] >= 1.0
+            finally:
+                speech_module.SpeechAsyncClient = original_client
+
+        run(run_())
 
 
 class TestLowConfidenceHold:

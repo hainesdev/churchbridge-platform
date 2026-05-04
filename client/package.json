@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:e2e": "playwright test",
+    "test:e2e:web-client-endurance": "playwright test e2e/web-client-endurance.spec.ts --reporter=line",
     "test:e2e:web-client-replay": "playwright test e2e/web-client-replay.spec.ts --reporter=line",
     "test:e2e:mobile-listener": "playwright test e2e/mobile-listener.spec.ts --reporter=line"
   },
