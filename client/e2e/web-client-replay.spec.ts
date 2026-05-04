@@ -13,6 +13,27 @@ async function startReplay(page: Page, churchId: string): Promise<void> {
   await expect(page.getByRole('button', { name: 'End' })).toBeVisible({ timeout: 15_000 });
 }
 
+async function expectVisibleTranslatedText(page: Page): Promise<void> {
+  await expect.poll(async () => {
+    const texts = await page.getByTestId('live-translation').allInnerTexts();
+    return texts.some((text) => text.trim().length >= 12);
+  }).toBe(true);
+}
+
+async function expectCommittedTranslation(page: Page): Promise<void> {
+  await expect.poll(async () => {
+    const english = await page.getByTestId('committed-english').allInnerTexts();
+    const spanish = await page.getByTestId('committed-spanish').allInnerTexts();
+    const pairs = english.map((value, index) => ({
+      english: value.trim(),
+      spanish: (spanish[index] ?? '').trim(),
+    }));
+    return pairs.some(({ english: en, spanish: es }) => (
+      en.length >= 12 && es.length >= 8 && en.toLowerCase() !== es.toLowerCase()
+    ));
+  }).toBe(true);
+}
+
 test.describe('web client replay', () => {
   test('streams 60 seconds through the real browser client path', async ({ page }) => {
     test.setTimeout(150_000);
@@ -38,6 +59,8 @@ test.describe('web client replay', () => {
     expect(displaySockets.length).toBeGreaterThanOrEqual(1);
     expect(streamSockets.filter((record) => record.closedAtMs !== null)).toHaveLength(0);
     expect(displaySockets.filter((record) => record.closedAtMs !== null)).toHaveLength(0);
+    await expectVisibleTranslatedText(page);
+    await expectCommittedTranslation(page);
     expect(
       metrics.consoleErrors.filter((message) => !message.includes('Failed to load resource')),
     ).toHaveLength(0);
@@ -85,6 +108,8 @@ test.describe('web client replay', () => {
     expect(metrics.messageCounts.feed_commit ?? 0).toBeGreaterThanOrEqual(preDropCommitCount + 1);
     expect(streamSockets.some((record) => record.closedAtMs !== null)).toBe(true);
     expect(streamSockets.some((record) => record.messageCount > 0 && record.closedAtMs === null)).toBe(true);
+    await expectVisibleTranslatedText(page);
+    await expectCommittedTranslation(page);
     expect(metrics.pageErrors).toHaveLength(0);
   });
 
@@ -124,6 +149,8 @@ test.describe('web client replay', () => {
     expect(displaySockets.some((record) => record.closedAtMs !== null)).toBe(true);
     expect(displaySockets.some((record) => record.messageCount > 0 && record.closedAtMs === null)).toBe(true);
     expect(metrics.messageCounts.feed_commit ?? 0).toBeGreaterThanOrEqual(preDropCommitCount + 1);
+    await expectVisibleTranslatedText(page);
+    await expectCommittedTranslation(page);
     expect(metrics.pageErrors).toHaveLength(0);
   });
 });

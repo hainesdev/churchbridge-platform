@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 
 # Hold the dock-to-feed handoff briefly so the interpreted area can prefer
 # enriched English when it lands soon after the Google sentence.
-PREFERRED_COMMIT_DELAY_S = 1.25
+PREFERRED_COMMIT_DELAY_S = 0.85
+SHORT_FRAGMENT_COMMIT_DELAY_S = 1.5
+TERMINAL_INCOMPLETE_COMMIT_DELAY_S = 0.35
 
 # Splits an STT final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
@@ -176,6 +178,35 @@ def _clean_stt(text: str) -> str:
     return ' '.join(text.split())
 
 
+def _language_family(code: str) -> str:
+    normalized = str(code or "").strip().lower()
+    if normalized.startswith("es"):
+        return "es"
+    if normalized.startswith("en"):
+        return "en"
+    return ""
+
+
+def _translation_mode(stt_context: dict | None) -> str:
+    stt_context = dict(stt_context or {})
+    primary_family = _language_family(
+        stt_context.get("stt_primary_language", "") or stt_context.get("detected_language", "")
+    )
+    if primary_family == "en":
+        return "english"
+    if primary_family == "es":
+        return "spanish"
+
+    detected = stt_context.get("stt_detected_languages") or stt_context.get("detected_languages") or []
+    for code in detected:
+        family = _language_family(code)
+        if family == "en":
+            return "english"
+        if family == "es":
+            return "spanish"
+    return "unknown"
+
+
 # --- Discourse-based buffer hold detection ---
 # Applied synchronously in _on_sentence (after flush, before the next fragment
 # arrives) so there is no race with LLM enrichment timing.
@@ -218,6 +249,17 @@ def _split_segments(text: str) -> list[str]:
         else:
             merged.append(part)
     return merged
+
+
+def _preferred_commit_delay_s(text: str, *, terminal_incomplete: bool) -> float:
+    """Keep clearly complete captions snappy while giving tiny bridge fragments
+    a bit more time for merge repair to cancel the pending commit."""
+    if terminal_incomplete:
+        return TERMINAL_INCOMPLETE_COMMIT_DELAY_S
+    word_count = len(text.split())
+    if word_count <= 3:
+        return SHORT_FRAGMENT_COMMIT_DELAY_S
+    return PREFERRED_COMMIT_DELAY_S
 
 
 class ServiceSession:
@@ -367,10 +409,10 @@ class ServiceSession:
             except Exception as e:
                 logger.warning("[session] Recorder stop failed: %s", e)
             self._recorder = None
-        if self._sentence_buffer:
-            await self._sentence_buffer.stop()
         if self._stt_session:
             await self._stt_session.stop()
+        if self._sentence_buffer:
+            await self._sentence_buffer.stop()
         if self._translation:
             await self._translation.close()
         if self._enrichment:
@@ -390,11 +432,15 @@ class ServiceSession:
         if self._sentence_buffer:
             await self._sentence_buffer.utterance_end()
 
-    async def _on_interim(self, text: str):
-        await self._broadcast({"type": "interim", "text": text, "ts": _now()})
+    async def _on_interim(self, text: str, stt_meta: dict | None = None):
+        stt_meta = dict(stt_meta or {})
+        await self._broadcast({"type": "interim", "text": text, "ts": _now(), **stt_meta})
         preview = _clean_stt(text)
         if preview and self._translation:
-            await self._translation.translate_interim(preview)
+            if _translation_mode(stt_meta) == "english":
+                await self._on_interim_translation(preview, "stt_passthrough", True)
+            else:
+                await self._translation.translate_interim(preview)
 
     async def _on_final(self, text: str, audio_start: float, audio_end: float, stt_meta: dict):
         logger.info("[session:%s] STT final: %s", self._church_id, text)
@@ -420,7 +466,10 @@ class ServiceSession:
         if not clean:
             return
         if self._translation:
-            await self._translation.translate_fragment(clean)
+            if _translation_mode(stt_meta) == "english":
+                await self._on_interim_translation(clean, "stt_passthrough", True)
+            else:
+                await self._translation.translate_fragment(clean)
         if self._sentence_buffer:
             if stt_meta.get("low_confidence"):
                 self._sentence_buffer.hold_next(
@@ -443,7 +492,7 @@ class ServiceSession:
                 logger.debug("[session:%s] Proactive hold: quote_introduction", self._church_id)
             parts = _split_segments(clean)
             if len(parts) == 1:
-                    await self._sentence_buffer.add(clean, audio_start, audio_end, stt_meta=stt_meta)
+                await self._sentence_buffer.add(clean, audio_start, audio_end, stt_meta=stt_meta)
             else:
                 # Distribute audio timing across sub-sentences proportionally by word count.
                 total_words = max(sum(len(p.split()) for p in parts), 1)
@@ -504,12 +553,17 @@ class ServiceSession:
                 logger.debug("[session:%s] Hold set: rhetorical_question", self._church_id)
 
         if self._translation:
+            commit_delay_s = _preferred_commit_delay_s(
+                text,
+                terminal_incomplete=terminal_incomplete,
+            )
             self._pending_audio_timing[ts] = {
                 "audio_start": audio_start,
                 "audio_end": audio_end,
                 "terminal_incomplete": terminal_incomplete,
                 "flush_reason": flush_reason,
                 "stt_context": stt_context,
+                "commit_delay_s": commit_delay_s,
             }
             # Prune entries older than 120s — these belong to sentences whose
             # translation failed after all retries and will never be consumed.
@@ -520,9 +574,52 @@ class ServiceSession:
             stale_settled = [k for k in self._enrichment_settled if k < cutoff]
             for k in stale_settled:
                 self._enrichment_settled.discard(k)
-            await self._translation.translate(text, ts)
+            if _translation_mode(stt_context) == "english":
+                await self._emit_passthrough_sentence(text, ts, stt_context)
+            else:
+                await self._translation.translate(text, ts)
 
     # --- Google Translation callbacks ---
+
+    async def _emit_passthrough_sentence(self, text: str, ts: int, stt_context: dict | None = None):
+        timing = self._pending_audio_timing.pop(
+            ts,
+            {
+                "audio_start": 0.0,
+                "audio_end": 0.0,
+                "terminal_incomplete": False,
+                "flush_reason": "",
+                "stt_context": stt_context or {},
+                "commit_delay_s": PREFERRED_COMMIT_DELAY_S,
+            },
+        )
+        stt_context = dict(stt_context or timing.get("stt_context") or {})
+        english = text
+        if timing.get("terminal_incomplete"):
+            english = _format_deferred_release_text(english, english)
+        logger.info("[session:%s] English passthrough: %s", self._church_id, english[:200])
+        if self._recorder:
+            self._recorder.record_event(
+                "translation",
+                {"spanish": text, "english": english, "ts": ts, "source": "passthrough"},
+            )
+            self._recorder.record_timing("translation", ts)
+        await self._broadcast_live_translation(
+            text=english,
+            source="stt_passthrough",
+            display_ready=False,
+            segment_id=ts,
+            merge_strategy="replace",
+        )
+        await self._queue_feed_commit(
+            segment_id=ts,
+            spanish=text,
+            english=english,
+            source="passthrough",
+            phrase_alignment=None,
+            delay_s=float(timing.get("commit_delay_s", PREFERRED_COMMIT_DELAY_S)),
+            stt_context=stt_context,
+        )
 
     async def _on_translation(self, spanish: str, english: str, ts: int):
         timing = self._pending_audio_timing.get(
@@ -533,6 +630,7 @@ class ServiceSession:
                 "terminal_incomplete": False,
                 "flush_reason": "",
                 "stt_context": {},
+                "commit_delay_s": PREFERRED_COMMIT_DELAY_S,
             },
         )
         stt_context = dict(timing.get("stt_context") or {})
@@ -555,7 +653,7 @@ class ServiceSession:
             english=english,
             source="google",
             phrase_alignment=None,
-            delay_s=PREFERRED_COMMIT_DELAY_S,
+            delay_s=float(timing.get("commit_delay_s", PREFERRED_COMMIT_DELAY_S)),
             stt_context=stt_context,
         )
         if self._enrichment:
@@ -569,6 +667,7 @@ class ServiceSession:
                     "terminal_incomplete": False,
                     "flush_reason": "",
                     "stt_context": {},
+                    "commit_delay_s": PREFERRED_COMMIT_DELAY_S,
                 },
             )
             audio_start = float(timing.get("audio_start", 0.0))
@@ -580,6 +679,7 @@ class ServiceSession:
                 audio_start,
                 audio_end,
                 terminal_incomplete=bool(timing.get("terminal_incomplete")),
+                stt_context=stt_context,
             )
 
     async def _on_interim_translation(

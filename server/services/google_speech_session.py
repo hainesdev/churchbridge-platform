@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import logging
 import os
+from collections import Counter
+from dataclasses import replace
 from typing import Awaitable, Callable
 
 from google.api_core.client_options import ClientOptions
@@ -16,6 +18,7 @@ from server.services.stt import STTConfig
 logger = logging.getLogger(__name__)
 STREAM_RESTART_BACKOFF_S = 0.5
 MAX_STREAM_RESTART_BACKOFF_S = 5.0
+_UNSUPPORTED_DIARIZATION_FRAGMENT = "does not support speaker diarization"
 
 
 class GoogleSpeechSession:
@@ -24,7 +27,7 @@ class GoogleSpeechSession:
     def __init__(
         self,
         church_id: str,
-        on_interim: Callable[[str], Awaitable[None]],
+        on_interim: Callable[[str, dict], Awaitable[None]],
         on_final: Callable[[str, float, float, dict], Awaitable[None]],
         on_utterance_end: Callable[[], Awaitable[None]] | None = None,
     ):
@@ -121,15 +124,16 @@ class GoogleSpeechSession:
         stt_config: STTConfig,
     ) -> None:
         restart_backoff_s = STREAM_RESTART_BACKOFF_S
+        active_stt_config = stt_config
         try:
-            endpoint = _google_api_endpoint(stt_config.location)
+            endpoint = _google_api_endpoint(active_stt_config.location)
             self._client = SpeechAsyncClient(
                 client_options=ClientOptions(api_endpoint=endpoint),
             )
             while not self._stopping():
                 try:
                     stream = await self._client.streaming_recognize(
-                        requests=self._request_generator(glossary, sample_rate, stt_config)
+                        requests=self._request_generator(glossary, sample_rate, active_stt_config)
                     )
                     if not ready.is_set():
                         ready.set()
@@ -149,6 +153,15 @@ class GoogleSpeechSession:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    if _supports_diarization_fallback(e, active_stt_config):
+                        active_stt_config = replace(active_stt_config, diarization_enabled=False)
+                        self._stt_config = active_stt_config
+                        self._last_stream_end_reason = "diarization_unsupported_fallback"
+                        logger.warning(
+                            "[google_speech] Streaming diarization unsupported for church %s; retrying without diarization",
+                            self._church_id,
+                        )
+                        continue
                     self._stream_error_count += 1
                     self._last_stream_end_reason = f"error:{type(e).__name__}"
                     if not ready.is_set():
@@ -230,31 +243,29 @@ class GoogleSpeechSession:
             self._last_stream_audio_end = max(self._last_stream_audio_end, relative_end)
 
             words = list(getattr(alt, "words", []) or [])
-            speaker_tags = sorted({
-                int(getattr(word, "speaker_label", 0) or 0)
-                for word in words
-                if getattr(word, "speaker_label", 0)
-            })
             avg_confidence = (
                 sum(float(word.confidence or 0.0) for word in words) / len(words)
                 if words else float(getattr(alt, "confidence", 0.0) or 0.0)
             )
+            detected_language = getattr(result, "language_code", "") or ""
+            detected_languages = [detected_language] if detected_language else []
             stt_meta = {
                 "avg_confidence": avg_confidence,
                 "word_count": len(words),
                 "confidence_threshold": self._stt_config.confidence_hold_threshold,
                 "low_confidence": avg_confidence > 0
                 and avg_confidence < self._stt_config.confidence_hold_threshold,
-                "detected_language": getattr(result, "language_code", "") or "",
-                "detected_languages": [getattr(result, "language_code", "")] if getattr(result, "language_code", "") else [],
-                "speaker_tags": speaker_tags,
+                "detected_language": detected_language,
+                "detected_languages": detected_languages,
+                "segment_language_mode": _segment_language_mode(detected_language, detected_languages),
             }
+            stt_meta.update(_speaker_metadata(words))
 
             if result.is_final:
                 self._last_final_audio_end = audio_end
                 await self._on_final(text, audio_start, audio_end, stt_meta)
             else:
-                await self._on_interim(text)
+                await self._on_interim(text, stt_meta)
 
     def get_stats(self) -> dict:
         return {
@@ -303,6 +314,121 @@ def _duration_to_seconds(value) -> float:
     seconds = float(getattr(value, "seconds", 0))
     nanos = float(getattr(value, "nanos", 0))
     return seconds + nanos / 1_000_000_000
+
+
+def _supports_diarization_fallback(exc: Exception, stt_config: STTConfig) -> bool:
+    if not stt_config.diarization_enabled:
+        return False
+    return _UNSUPPORTED_DIARIZATION_FRAGMENT in str(exc).strip().lower()
+
+
+def _language_family(code: str) -> str:
+    normalized = str(code or "").strip().lower()
+    if normalized.startswith("es"):
+        return "es"
+    if normalized.startswith("en"):
+        return "en"
+    return ""
+
+
+def _segment_language_mode(primary_code: str, detected_codes: list[str]) -> str:
+    families = {
+        family
+        for family in [_language_family(primary_code), *(_language_family(code) for code in detected_codes)]
+        if family
+    }
+    if families == {"en"}:
+        return "english"
+    if families == {"es"}:
+        return "spanish"
+    if families:
+        return "mixed"
+    return "unknown"
+
+
+def _word_confidence(word) -> float:
+    return float(getattr(word, "confidence", 0.0) or 0.0)
+
+
+def _speaker_label(word) -> int:
+    return int(getattr(word, "speaker_label", 0) or 0)
+
+
+def _word_text(word) -> str:
+    return str(getattr(word, "word", "") or "").strip()
+
+
+def _build_speaker_segments(words: list) -> list[dict]:
+    segments: list[dict] = []
+    current: dict | None = None
+
+    for index, word in enumerate(words):
+        text = _word_text(word)
+        if not text:
+            continue
+        speaker = _speaker_label(word)
+        start_s = _duration_to_seconds(getattr(word, "start_offset", None))
+        end_s = _duration_to_seconds(getattr(word, "end_offset", None))
+        confidence = _word_confidence(word)
+
+        if current is None or current["speaker"] != speaker:
+            if current is not None:
+                current["text"] = " ".join(current.pop("words"))
+                word_count = max(len(current.pop("confidences")), 1)
+                current["avg_confidence"] = round(current["confidence_total"] / word_count, 4)
+                current.pop("confidence_total")
+                segments.append(current)
+            current = {
+                "speaker": speaker,
+                "start_s": start_s,
+                "end_s": end_s,
+                "words": [text],
+                "confidence_total": confidence,
+                "confidences": [confidence],
+                "word_start_index": index,
+                "word_end_index": index,
+            }
+            continue
+
+        current["words"].append(text)
+        current["end_s"] = end_s
+        current["confidence_total"] += confidence
+        current["confidences"].append(confidence)
+        current["word_end_index"] = index
+
+    if current is not None:
+        current["text"] = " ".join(current.pop("words"))
+        word_count = max(len(current.pop("confidences")), 1)
+        current["avg_confidence"] = round(current["confidence_total"] / word_count, 4)
+        current.pop("confidence_total")
+        segments.append(current)
+
+    return segments
+
+
+def _speaker_metadata(words: list) -> dict:
+    speaker_tags = sorted({
+        _speaker_label(word)
+        for word in words
+        if _speaker_label(word) > 0
+    })
+    speaker_segments = _build_speaker_segments(words)
+    speaker_counts = Counter(
+        segment["speaker"]
+        for segment in speaker_segments
+        if int(segment.get("speaker", 0) or 0) > 0
+    )
+    dominant_speaker = speaker_counts.most_common(1)[0][0] if speaker_counts else 0
+    speaker_switch_count = max(len(speaker_segments) - 1, 0)
+
+    return {
+        "speaker_tags": speaker_tags,
+        "speaker_segments": speaker_segments,
+        "speaker_count": len(speaker_tags),
+        "dominant_speaker": dominant_speaker,
+        "speaker_switch_count": speaker_switch_count,
+        "mixed_speaker_segment": speaker_switch_count > 0,
+    }
 
 
 def _build_recognition_config(

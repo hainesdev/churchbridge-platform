@@ -7,6 +7,21 @@ async function startReplay(page: Page, churchId: string): Promise<void> {
   await expect(page.getByRole('button', { name: 'End' })).toBeVisible({ timeout: 15_000 });
 }
 
+async function expectVisibleListenerTranslation(page: Page): Promise<void> {
+  await expect.poll(async () => {
+    const texts = await page.getByTestId('listener-committed-line').allInnerTexts();
+    return texts.some((text) => text.trim().length >= 12);
+  }).toBe(true);
+}
+
+async function expectLiveOrCommittedListenerText(page: Page): Promise<void> {
+  await expect.poll(async () => {
+    const liveTexts = await page.getByTestId('listener-live-line').allInnerTexts();
+    const committedTexts = await page.getByTestId('listener-committed-line').allInnerTexts();
+    return [...liveTexts, ...committedTexts].some((text) => text.trim().length >= 12);
+  }).toBe(true);
+}
+
 test.describe('mobile listener replay', () => {
   test('receives live and committed translation events on the listener socket', async ({ browser }) => {
     test.setTimeout(120_000);
@@ -26,7 +41,9 @@ test.describe('mobile listener replay', () => {
       return (counts.live_translation ?? 0) >= 1 && (counts.feed_commit ?? 0) >= 1;
     }, undefined, { timeout: 60_000 });
 
-    await expect(listenerPage.getByText('Translation will appear here when the service begins.')).toHaveCount(0);
+    await expect(listenerPage.getByTestId('listener-empty-state')).toHaveCount(0);
+    await expectLiveOrCommittedListenerText(listenerPage);
+    await expectVisibleListenerTranslation(listenerPage);
 
     const listenerMetrics = await readReplayMetrics(listenerPage);
     const recordingMetrics = await readReplayMetrics(recordingPage);

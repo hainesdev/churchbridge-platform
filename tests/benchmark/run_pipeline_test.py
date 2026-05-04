@@ -47,6 +47,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
@@ -81,18 +82,24 @@ CHUNK_MS = 100
 IDLE_DRAIN_S = 14.0
 DEFAULT_DURATION_S = 30.0
 MAX_DEFAULT_DURATION_S = 30.0
+SESSION_START_TIMEOUT_S = 10.0
 
 
-def find_audio_files(audio_dir: Path) -> tuple[Path, Path]:
+def find_primary_audio_file(audio_dir: Path) -> Path:
     mp3s = list(audio_dir.glob("*.mp3"))
     wavs = list(audio_dir.glob("*.wav"))
-    srts = list(audio_dir.glob("*.srt"))
     audio_files = mp3s or wavs  # prefer MP3 if both present
     if not audio_files:
         raise FileNotFoundError(f"No .mp3 or .wav found in {audio_dir}")
+    return audio_files[0]
+
+
+def find_audio_files(audio_dir: Path) -> tuple[Path, Path]:
+    srts = list(audio_dir.glob("*.srt"))
+    audio_file = find_primary_audio_file(audio_dir)
     if not srts:
         raise FileNotFoundError(f"No .srt found in {audio_dir}")
-    return audio_files[0], srts[0]
+    return audio_file, srts[0]
 
 
 def clip_audio(mp3_path: Path, duration_s: float, start_offset_s: float = 0.0) -> tuple[np.ndarray, int]:
@@ -188,18 +195,37 @@ async def wait_for_server(server_port: int, timeout_s: float = 30.0) -> None:
     raise RuntimeError(f"Server did not become ready within {timeout_s}s")
 
 
+def resolve_ws_base_url(server_port: int | None = None, server_base_url: str = "") -> str:
+    raw = server_base_url.strip()
+    if raw:
+        parsed = urlparse(raw)
+        if parsed.scheme in {"ws", "wss"}:
+            return raw.rstrip("/")
+        if parsed.scheme in {"http", "https"}:
+            ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+            return f"{ws_scheme}://{parsed.netloc}".rstrip("/")
+        raise ValueError(f"Unsupported server base URL: {server_base_url}")
+
+    if server_port is None:
+        raise ValueError("server_port is required when server_base_url is not provided")
+    return f"ws://localhost:{server_port}"
+
+
 async def run_pipeline(
     samples: np.ndarray,
     sample_rate: int,
-    server_port: int,
     church_id: str,
+    server_port: int | None = None,
+    server_base_url: str = "",
     stt_config: dict | None = None,
-) -> tuple[list[dict], float]:
-    """Stream audio through the live pipeline and return (all_messages, wall_time_s)."""
+    client_profile: str = "benchmark",
+) -> tuple[list[dict], float, dict]:
+    """Stream audio through the live pipeline and return (all_messages, wall_time_s, transport)."""
     import websockets  # noqa: PLC0415
 
-    display_url = f"ws://localhost:{server_port}/api/display/v1?church_id={church_id}"
-    stream_url = f"ws://localhost:{server_port}/api/stream/v1?church_id={church_id}"
+    ws_base_url = resolve_ws_base_url(server_port=server_port, server_base_url=server_base_url)
+    display_url = f"{ws_base_url}/api/display/v1?church_id={church_id}"
+    stream_url = f"{ws_base_url}/api/stream/v1?church_id={church_id}"
 
     messages: list[dict] = []
     test_start = time.monotonic()
@@ -207,11 +233,29 @@ async def run_pipeline(
     audio_done = asyncio.Event()
     listener_ready = asyncio.Event()
     stop_listener = asyncio.Event()
+    session_started = asyncio.Event()
     idle_drain_s = IDLE_DRAIN_S
+    chunk_n = int(sample_rate * CHUNK_MS / 1000)
+    transport = {
+        "client_profile": client_profile,
+        "ws_base_url": ws_base_url,
+        "chunk_ms": CHUNK_MS,
+        "chunk_samples": chunk_n,
+        "audio_chunk_count": int((len(samples) + max(chunk_n - 1, 0)) // max(chunk_n, 1)),
+        "display_connected_at_s": None,
+        "display_disconnect_count": 0,
+        "display_errors": [],
+        "stream_connected_at_s": None,
+        "stream_disconnect_count": 0,
+        "stream_errors": [],
+        "session_started_at_s": None,
+        "session_started_payload": None,
+    }
 
     async def listen() -> None:
         nonlocal last_msg_at
         async with websockets.connect(display_url) as ws:
+            transport["display_connected_at_s"] = round(time.monotonic() - test_start, 3)
             listener_ready.set()
             while not stop_listener.is_set():
                 try:
@@ -228,36 +272,69 @@ async def run_pipeline(
                 except asyncio.TimeoutError:
                     if audio_done.is_set() and time.monotonic() - last_msg_at >= idle_drain_s:
                         stop_listener.set()
-                except Exception:
+                except Exception as exc:
+                    transport["display_disconnect_count"] += 1
+                    transport["display_errors"].append(repr(exc))
                     stop_listener.set()
                     raise
 
     async def stream() -> None:
         async with websockets.connect(stream_url) as ws:
+            transport["stream_connected_at_s"] = round(time.monotonic() - test_start, 3)
             start_payload = {"type": "session.start", "sampleRate": sample_rate}
             if stt_config:
                 start_payload["sttConfig"] = stt_config
             await ws.send(json.dumps(start_payload))
-            response = json.loads(await ws.recv())
-            print(f"  Session started: {response}")
+            stream_listener_stopped = asyncio.Event()
 
-            chunk_n = int(sample_rate * CHUNK_MS / 1000)
-            for i in range(0, len(samples), chunk_n):
-                chunk = samples[i : i + chunk_n].astype("<f4")
-                audio_b64 = base64.b64encode(chunk.tobytes()).decode()
-                await ws.send(json.dumps({"type": "audio", "audio": audio_b64}))
-                await asyncio.sleep(CHUNK_MS / 1000)
+            async def listen_stream() -> None:
+                try:
+                    while True:
+                        raw = await ws.recv()
+                        data = json.loads(raw)
+                        if data.get("type") == "session_started":
+                            transport["session_started_at_s"] = round(time.monotonic() - test_start, 3)
+                            transport["session_started_payload"] = data
+                            print(f"  Session started: {data}")
+                            session_started.set()
+                        elif data.get("type") == "error":
+                            transport["stream_errors"].append(data.get("message", "unknown error"))
+                except Exception as exc:
+                    transport["stream_disconnect_count"] += 1
+                    if not audio_done.is_set():
+                        transport["stream_errors"].append(repr(exc))
+                finally:
+                    stream_listener_stopped.set()
 
-            await ws.send(json.dumps({"type": "session.stop"}))
-            print("  Audio streaming complete — draining pipeline...")
-            audio_done.set()
+            stream_listener_task = asyncio.create_task(listen_stream())
+            try:
+                if client_profile == "benchmark":
+                    await asyncio.wait_for(session_started.wait(), timeout=SESSION_START_TIMEOUT_S)
+                else:
+                    await asyncio.sleep(CHUNK_MS / 1000)
+
+                for i in range(0, len(samples), chunk_n):
+                    chunk = samples[i : i + chunk_n].astype("<f4")
+                    audio_b64 = base64.b64encode(chunk.tobytes()).decode()
+                    await ws.send(json.dumps({"type": "audio", "audio": audio_b64}))
+                    await asyncio.sleep(CHUNK_MS / 1000)
+
+                await ws.send(json.dumps({"type": "session.stop"}))
+                print("  Audio streaming complete — draining pipeline...")
+                audio_done.set()
+                try:
+                    await asyncio.wait_for(stream_listener_stopped.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+            finally:
+                stream_listener_task.cancel()
 
     listener_task = asyncio.create_task(listen())
     await listener_ready.wait()
 
     await stream()
     await listener_task
-    return messages, round(time.monotonic() - test_start, 1)
+    return messages, round(time.monotonic() - test_start, 1), transport
 
 
 def build_result(
@@ -273,6 +350,8 @@ def build_result(
     audio_dir: str,
     note: str,
     stt_config: dict | None = None,
+    transport: dict | None = None,
+    client_profile: str = "benchmark",
 ) -> dict:
     stt_finals = [m for m in messages if m["type"] == "stt_final"]
     committed = [m for m in messages if m["type"] == "final_spanish"]
@@ -294,7 +373,9 @@ def build_result(
         "clip_start_offset_s": start_offset_s,
         "clip_duration_s": duration_s,
         "note": note,
+        "client_profile": client_profile,
         "stt_config": stt_config or {},
+        "transport": transport or {},
         "wall_time_s": wall_s,
         "srt_reference": {
             "segments": len(ref_segments),
@@ -446,6 +527,15 @@ def print_report(result: dict) -> None:
 
     print(f"\n  Wall time : {result['wall_time_s']}s")
     print(f"  Events    : {len(result['all_messages'])} total")
+    transport = result.get("transport") or {}
+    if transport:
+        print(
+            "  Transport : "
+            f"profile={result.get('client_profile', 'benchmark')}  "
+            f"session_started_at={transport.get('session_started_at_s')}s  "
+            f"stream_errors={len(transport.get('stream_errors', []))}  "
+            f"display_errors={len(transport.get('display_errors', []))}"
+        )
     print(divider)
 
 
@@ -469,12 +559,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Allow durations above the default live-test limit")
     parser.add_argument("--port", type=int, default=SERVER_PORT,
                         help=f"Server port for this benchmark run (default: {SERVER_PORT}); concurrent runs must use different ports")
+    parser.add_argument("--server-base-url", default="",
+                        help="Optional remote server base URL (for example https://churchbridge.dhaines.dev). When provided, the benchmark targets that server instead of starting a local one")
     parser.add_argument("--church-id", default="",
                         help="Church/session namespace for this run; defaults to an isolated generated value, but set it explicitly for concurrent runs when needed")
     parser.add_argument("--results-root", default="tests/benchmark/results",
                         help="Results root for artifacts. Use tests/benchmark/results/staggered for the new regime or a separate root to isolate concurrent runs")
     parser.add_argument("--capture-only", action="store_true",
                         help="Save the raw run JSON only; skip history, review, trajectory, cycle log, and report")
+    parser.add_argument("--client-profile", default="benchmark", choices=["benchmark", "web"],
+                        help="How closely to mirror the real web client transport behavior")
     parser.add_argument("--note", default="",
                         help="Free-text note recorded with this run")
     parser.add_argument("--no-llm", action="store_true",
@@ -534,7 +628,11 @@ async def main() -> None:
     mp3_path, srt_path = find_audio_files(audio_dir)
     print(f"Audio : {mp3_path.name}")
     print(f"SRT   : {srt_path.name}")
-    print(f"Port  : {args.port}")
+    if args.server_base_url:
+        print(f"Remote: {args.server_base_url}")
+    else:
+        print(f"Port  : {args.port}")
+    print(f"Client: {args.client_profile}")
     print(f"Scope : {church_id}")
 
     samples, sample_rate = clip_audio(mp3_path, duration_s, start_offset_s=start_offset_s)
@@ -547,35 +645,48 @@ async def main() -> None:
         f"window {start_offset_s}s–{start_offset_s + duration_s}s\n"
     )
 
-    print(f"Starting server on port {args.port}...")
-    env = os.environ.copy()
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "server.main:app",
-            "--port",
-            str(args.port),
-            "--log-level",
-            "warning",
-        ],
-        cwd=ROOT,
-        env=env,
-    )
+    proc = None
     try:
-        await wait_for_server(args.port)
-        print("Server ready.\n")
+        if args.server_base_url:
+            print("Target server ready path is managed externally.\n")
+        else:
+            print(f"Starting server on port {args.port}...")
+            env = os.environ.copy()
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "server.main:app",
+                    "--port",
+                    str(args.port),
+                    "--log-level",
+                    "warning",
+                ],
+                cwd=ROOT,
+                env=env,
+            )
+            await wait_for_server(args.port)
+            print("Server ready.\n")
 
         print("Streaming audio through pipeline...")
-        messages, wall_s = await run_pipeline(samples, sample_rate, args.port, church_id, stt_config=stt_config)
+        messages, wall_s, transport = await run_pipeline(
+            samples,
+            sample_rate,
+            church_id,
+            server_port=None if args.server_base_url else args.port,
+            server_base_url=args.server_base_url,
+            stt_config=stt_config,
+            client_profile=args.client_profile,
+        )
 
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     result = build_result(
         run_id=run_id,
@@ -590,6 +701,8 @@ async def main() -> None:
         audio_dir=args.audio_dir,
         note=args.note,
         stt_config=stt_config,
+        transport=transport,
+        client_profile=args.client_profile,
     )
 
     audio_dir_name = Path(args.audio_dir).name

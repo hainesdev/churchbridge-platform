@@ -877,9 +877,14 @@ export function MobileTest({ churchId }: MobileTestProps) {
               className="space-y-0.5"
             >
               <div className="flex flex-wrap items-center gap-2">
-                <p className={`text-xl font-semibold leading-snug transition-colors duration-[600ms] ${
-                flashingId === s.id ? 'text-blue-200' : ''
-                }`}>{s.english}</p>
+                <p
+                  data-testid="committed-english"
+                  className={`text-xl font-semibold leading-snug transition-colors duration-[600ms] ${
+                  flashingId === s.id ? 'text-blue-200' : ''
+                  }`}
+                >
+                  {s.english}
+                </p>
                 {s.verseDetected && (
                   <button
                     onClick={() => setPopover({
@@ -910,7 +915,7 @@ export function MobileTest({ churchId }: MobileTestProps) {
                   </button>
                 ))}
               </div>
-              <p className="text-sm text-gray-500 leading-snug">{s.spanish}</p>
+              <p data-testid="committed-spanish" className="text-sm text-gray-500 leading-snug">{s.spanish}</p>
             </motion.div>
           ))}
         </div>
@@ -928,11 +933,11 @@ export function MobileTest({ churchId }: MobileTestProps) {
       <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-4 py-4 backdrop-blur">
         <p className="text-[11px] uppercase tracking-[0.24em] text-gray-500">Live Translation</p>
         {liveEnglish ? (
-          <p className="mt-2 text-xl font-semibold leading-snug text-white">
+          <p data-testid="live-translation" className="mt-2 text-xl font-semibold leading-snug text-white">
             {liveEnglish}<span className="animate-pulse text-blue-400 ml-1">▌</span>
           </p>
         ) : (
-          <p className="mt-2 text-sm text-gray-500">Waiting for live translation...</p>
+          <p data-testid="live-translation-placeholder" className="mt-2 text-sm text-gray-500">Waiting for live translation...</p>
         )}
       </div>
 
@@ -981,3 +986,4 @@ export function MobileTest({ churchId }: MobileTestProps) {
     </div>
   );
 }
+

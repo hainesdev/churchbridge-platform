@@ -1,6 +1,6 @@
 # ChurchBridge AI
 
-A discourse-aware real-time sermon interpreter. Accepts live Spanish speech from a soundboard, assembles it into structurally complete thoughts, translates with theological precision, and distributes captions to sanctuary displays and mobile listeners simultaneously.
+A discourse-aware real-time sermon interpreter. Accepts live Spanish sermon audio from a soundboard, tolerates English code-switching, assembles speech into structurally complete thoughts, and distributes English captions to sanctuary displays and mobile listeners simultaneously.
 
 The system does not simply translate sentences as they arrive. It holds partial utterances until it is confident a thought is complete, uses an LLM to classify discourse structure and detect when fragments should be merged, suppresses incomplete captions until they can be finalised, and corrects itself retroactively via caption merges.
 
@@ -12,19 +12,22 @@ Soundboard mic (browser)
   └── PCM audio (Float32, resampled to 16kHz)
         │
         ▼
-  Deepgram STT (nova-2, streaming)
-    interim results ──► display preview only
+  Google Speech-to-Text V2 (Chirp 3, streaming)
+    interim results ──► preview language router
+                         • Spanish-dominant interim ──► Google preview translation
+                         • English-dominant interim ──► passthrough preview
     final results ──► STT noise cleanup
                           │
                           ├── filler removal (Uh, Mmm, stutter collapses)
                           ├── Pentecostés/Pentecostales disambiguation
+                          ├── detected-language metadata (Spanish / English)
                           └── sentence boundary splitting
                                     │
                                     ▼
                           SentenceBuffer (discourse-aware gating)
                             holds text until:
                               • terminal punctuation detected
-                              • UtteranceEnd signal from Deepgram
+                              • utterance-end / VAD signal from Google Speech
                               • fallback timer (3.5s + extensions)
                             extends when:
                               • trailing connector word detected (que, porque, es…)
@@ -33,7 +36,9 @@ Soundboard mic (browser)
                               • LLM signals continuation_required on prior sentence
                                     │
                                     ▼ (complete thought)
-                          Google Translate  ──►  fast English (< 300ms)
+                          Language router
+                            • Spanish-dominant sentence ──► Google Translate fast path
+                            • English-dominant sentence ──► passthrough commit
                                     │                │
                                     │                ▼
                                     │          broadcast: translation
@@ -55,13 +60,14 @@ Soundboard mic (browser)
                     display_ready=true    display_ready=false
                           │               (thought incomplete/fragmented)
                           ▼                    │
-                  translation_update      deferred 6s
+                  translation_update      adaptive deferred release
                   broadcast immediately   │
                                           ├── if merge arrives → caption_merge broadcast
                                           │    (head-anchored: earliest segment stays,
                                           │     fragments absorbed into it, full merged
                                           │     English covers the complete thought)
-                                          └── if no merge → release after 6s fallback
+                                          └── if no merge → release after 2.0–4.5s,
+                                               depending on fragment risk
                                     │
                                     ▼ (separate async call, per display_ready sentence)
                           Verse Suggestions (Claude Haiku, lightweight)
@@ -73,11 +79,11 @@ Soundboard mic (browser)
 
 **Discourse-aware buffering, not sentence-boundary translation.** The `SentenceBuffer` extends its timer whenever the accumulated text ends with a structural incomplete signal — a preposition, dangling copula, unclosed question, or fewer than four words. The LLM's `continuation_required` signal feeds back into the buffer to extend future boundaries when the prior sentence was incomplete.
 
-**display_ready is the authoritative emission gate.** The LLM computes `display_ready` and the server enforces it deterministically: `thought_complete AND NOT continuation_required AND quality != "fragmented" AND tag != "quote_introduction"`. The LLM's value can only make it more restrictive, never relax it. When false, the Google translation is suppressed until a merge arrives or a 6-second fallback releases it.
+**display_ready is the authoritative emission gate.** The LLM computes `display_ready` and the server enforces it deterministically: `thought_complete AND NOT continuation_required AND quality != "fragmented" AND tag != "quote_introduction"`. The LLM's value can only make it more restrictive, never relax it. When false, the Google translation is suppressed until a merge arrives or an adaptive deferred-release timeout emits the best safe fallback.
 
 **Head-anchored caption chains.** When the LLM signals `merge_with_previous`, the system always keeps the earliest segment in the chain on screen and absorbs subsequent fragments into it. A 3-fragment chain produces a single stable caption at the original screen position — no visual jumping.
 
-**Two-tier translation.** Google Translate provides a < 300ms fast path that displays immediately. Claude runs asynchronously and fires `translation_update` only when `display_ready` is true. For merged sentences, the LLM receives the pending sentence's Spanish and English explicitly and must write a unified translation for the full merged unit.
+**Two-tier translation.** Spanish sentences go through Google Translate as the fast path; English-dominant sentences bypass translation and pass straight through. The same language routing now applies to interim preview text, so quick display no longer tries to mistranslate English code-switching as Spanish. Claude runs asynchronously and fires `translation_update` only when `display_ready` is true. Feed commits also use adaptive timing: clearly complete captions commit faster, while tiny bridge fragments wait slightly longer so merge repair can cancel unsafe commits.
 
 **Verse suggestions are decoupled from structural decisions.** Verse detection stays in the main enrichment call (it shares sentence context). Suggestions run as a separate lightweight async call that cannot compete with structural decisions for prompt attention.
 
@@ -90,9 +96,9 @@ Soundboard Admin (Browser)
     │
     └── WebSocket ──► FastAPI /api/stream/v1
                           │
-                          ├── Deepgram (STT, nova-2, streaming)
+                          ├── Google Speech V2 (STT, Chirp 3 streaming)
                           ├── SentenceBuffer (discourse-aware gating)
-                          ├── Google Translate (fast path)
+                          ├── Google Translate / English passthrough
                           ├── Claude Haiku (enrichment + verse suggestions)
                           ├── SermonStateTracker (mode detection)
                           ├── TopicTracker (rolling theological context)
@@ -102,13 +108,203 @@ Soundboard Admin (Browser)
                                   └── /api/listen/v1  → Mobile PWA (QR code)
 ```
 
+## Long-term target pipeline
+
+The current system is discourse-aware and bilingual at the sentence level. The
+ideal long-term system is **speaker-aware, mixed-language aware, and display-
+aware at the segment level**.
+
+### Target design principles
+
+**Speaker boundaries are structural signals, not optional metadata.**
+Chirp 3 diarization should shape merge decisions, translation routing, and UI
+rendering the same way punctuation and discourse tags do today.
+
+**Code-switching is a first-class mode.**
+A segment that contains both English and Spanish should not be flattened into
+"mostly Spanish" or "mostly English". The pipeline should explicitly represent
+mixed-language segments and render them accordingly.
+
+**The display should distinguish original speech from interpreted speech.**
+The congregation should be able to tell whether a line is:
+
+- direct English passthrough
+- Spanish translated into English
+- a mixed-language segment
+- a leader line, congregational response, or other speaker role
+
+### Ideal future flow
+
+```text
+Soundboard / house mix / mobile source
+  │
+  └── PCM audio
+        │
+        ▼
+  Google Speech-to-Text V2 (Chirp 3, streaming, diarization enabled)
+    emits:
+      • transcript text
+      • detected language(s)
+      • word timing
+      • word confidence
+      • per-word speaker labels
+        │
+        ▼
+  STT metadata shaping
+    derives:
+      • speaker_segments
+      • dominant_speaker
+      • speaker_switch_count
+      • mixed_speaker_segment
+      • segment_language_mode = english | spanish | mixed
+      • low-confidence / fragmented flags
+        │
+        ▼
+  Discourse-aware SentenceBuffer
+    uses:
+      • punctuation / VAD / timing
+      • continuation heuristics
+      • speaker-change guardrails
+      • language-switch guardrails
+        │
+        ▼
+  Translation router
+    • english  → passthrough
+    • spanish  → Google fast translation
+    • mixed    → bilingual segment builder
+                 (passthrough English spans, translate Spanish spans)
+        │
+        ▼
+  LLM enrichment
+    sees:
+      • discourse context
+      • topic / sermon mode context
+      • speaker context
+      • language-mode context
+    decides:
+      • display_ready
+      • merge_with_previous
+      • translation improvement
+      • verse detection / suggestions
+      • speaker-role hints (leader / congregation / reader / interpreter / unknown)
+        │
+        ▼
+  Segment model for clients
+    includes:
+      • source_language
+      • display_language
+      • speaker_id
+      • speaker_role
+      • is_passthrough
+      • is_translation
+      • is_mixed_segment
+      • phrase / span alignment where available
+        │
+        ├── Sanctuary display
+        │     • stable lower-third English
+        │     • optional language / speaker badges
+        │
+        └── Mobile listener
+              • committed transcript
+              • live preview
+              • optional bilingual and speaker-aware rendering
+```
+
+### The most important future upgrades
+
+**1. Make diarization first-class**
+
+Store and propagate more than `speaker_tags`. The server should preserve
+contiguous speaker runs, per-run confidence, and whether the fragment changed
+speaker mid-thought. The LLM should see speaker transitions before it decides
+to merge caption fragments.
+
+**2. Add a true `mixed` translation mode**
+
+Today routing is sentence-level: English passthrough or Spanish translation.
+Long term, mixed segments should be shaped explicitly so the pipeline can:
+
+- passthrough English spans
+- translate Spanish spans
+- preserve the order of bilingual speech
+- avoid mistranslating English code-switches as Spanish content
+
+**3. Use speaker and language boundaries as merge guardrails**
+
+The merge path should strongly penalize or block merges when:
+
+- `dominant_speaker` changes
+- `speaker_switch_count > 0`
+- the language family flips between adjacent fragments
+
+unless lexical continuation evidence is overwhelming.
+
+**4. Separate speaker identity from speaker role**
+
+Chirp diarization yields anonymous speaker ids; the pipeline should keep that
+authoritative signal and optionally infer higher-level roles such as:
+
+- `leader`
+- `congregation`
+- `reader`
+- `interpreter`
+- `unknown`
+
+Role inference should remain best-effort and never override raw speaker ids.
+
+**5. Stop treating every caption as a single-language ribbon**
+
+Client payloads should evolve toward a segment model that can render:
+
+- `[EN] All right, welcome to Lakeview Church...`
+- `[ES→EN] Vamos, canta. → Come on, sing.`
+
+without pretending both are the same kind of line.
+
+### Recommended implementation order
+
+Phase 1 — Metadata and capture
+
+- request diarization by default for bilingual / multi-speaker capture runs
+- preserve per-word speaker labels and build `speaker_segments`
+- add capture metrics for code-switching, speaker switches, and stream restarts
+
+Phase 2 — Interpretation guardrails
+
+- add `segment_language_mode = english | spanish | mixed`
+- inject speaker / language context into the enrichment prompt
+- penalize cross-speaker and cross-language merges
+
+Phase 3 — Display model
+
+- expand segment payloads with language and speaker metadata
+- add UI badges and mixed-segment treatment
+- later support richer per-span bilingual rendering
+
+This sequencing keeps the highest-risk structural decisions in the backend
+where they can be benchmarked before the UI grows more expressive.
+
+### Current implementation status
+
+- `segment_language_mode` now flows through the live session pipeline and into
+  capture artifacts.
+- The enrichment prompt now receives segment speaker/language structure when it
+  is available, and merge decisions are conservatively blocked across language
+  flips or speaker-structure conflicts.
+- The capture runner records speaker/language-mode summaries even for audio
+  without an `.srt`.
+- Google Speech streaming currently rejects speaker diarization on this live
+  path. When diarization is requested, the server now logs the limitation and
+  automatically retries without diarization so the live interpreter does not
+  fail dark.
+
 ## Stack
 
 | Layer | Technology |
 |---|---|
 | Backend | FastAPI (Python), asyncio throughout |
-| STT | Deepgram nova-2 with keyword boosting for theological terms |
-| Fast translation | Google Cloud Translation API |
+| STT | Google Cloud Speech-to-Text V2 (`chirp_3`) with phrase adaptation, bilingual `languageCodes`, and optional diarization |
+| Fast translation | Google Cloud Translation API for Spanish; direct passthrough for English-dominant STT segments |
 | Enrichment LLM | Anthropic Claude Haiku (claude-haiku-4-5) |
 | Frontend | Next.js (App Router) |
 | Pub/Sub | In-process broadcaster; optional Redis |
@@ -126,10 +322,12 @@ server/
         services.py               — REST: church config, glossary management
     services/
         session_manager.py        — One ServiceSession per church_id; STT noise
-                                    cleanup, sentence splitting, discourse holds
+                                    cleanup, language routing, sentence splitting,
+                                    discourse holds
         sentence_buffer.py        — Discourse-aware flush gating; incomplete-tail
                                     detection; UtteranceEnd soft guard
-        deepgram_session.py       — Deepgram streaming connection + callbacks
+        google_speech_session.py  — Google Speech streaming session + restart logic
+        stt.py                    — STT provider config, languageCodes, VAD, diarization
         google_translate_service.py — Fast-path translation + dual-pass correction
         llm_enrichment_service.py — Claude enrichment: translation improvement,
                                     discourse classification, display_ready gating,
@@ -139,6 +337,7 @@ server/
                                     summarisation (sermon arc, key themes, mode)
         sermon_state_tracker.py   — Debounced sermon mode from per-sentence signals
         broadcaster.py            — In-process pub/sub; Redis when available
+        mobile_diagnostics.py     — Remote browser/mobile diagnostics reports
         audio_utils.py            — PCM resampling (Float32 → 16kHz linear16)
     db/
         index.py                  — SQLite setup, schema migrations
@@ -206,9 +405,20 @@ Required variables:
 
 | Variable | Purpose |
 |---|---|
-| `DEEPGRAM_API_KEY` | Deepgram STT streaming |
+| `GOOGLE_CLOUD_PROJECT` | Google Speech-to-Text project id |
 | `GOOGLE_TRANSLATE_API_KEY` | Fast-path translation |
 | `ANTHROPIC_API_KEY` | Claude enrichment + verse suggestions |
+
+Google Speech also needs usable Google Cloud credentials in the local environment, typically through `GOOGLE_APPLICATION_CREDENTIALS` or another Application Default Credentials flow.
+
+Useful optional STT variables:
+
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_SPEECH_LANGUAGE_CODES` | Comma-separated language list for STT, e.g. `es-US,en-US` |
+| `GOOGLE_SPEECH_LANGUAGE` | Primary STT language if `GOOGLE_SPEECH_LANGUAGE_CODES` is not set |
+| `GOOGLE_SPEECH_SECONDARY_LANGUAGE` | Optional secondary STT language |
+| `GOOGLE_SPEECH_MODEL` | STT model override; defaults to `chirp_3` |
 
 Place `.env` in the repository root. For Next.js, add `client/.env.local` and set `NEXT_PUBLIC_WS_URL` or `NEXT_PUBLIC_API_URL` only if you need to override defaults (they target `localhost:8000` for local dev).
 
@@ -234,14 +444,14 @@ Start in order: Redis (optional) → backend → frontend.
 
 | Stage | Typical |
 |---|---|
-| Mic → Deepgram interim | ~150ms |
-| Deepgram final → Google translation | ~250ms |
-| Google translation → display | ~300ms total |
+| Mic → Google STT interim | ~150ms |
+| Google STT final → Google translation | ~250ms |
+| Google translation / passthrough → display | ~300ms total |
 | LLM enrichment (async, non-blocking) | ~600–1200ms |
 | LLM translation update → display | fires only when `display_ready=true` |
-| Deferred release fallback | 6s after enrichment if no merge |
+| Deferred release fallback | adaptive, typically ~2.0–4.5s if no merge |
 
-The audience sees the Google translation within ~300ms of a sentence finalising. The LLM-improved translation updates it silently a second later if the sentence is display-ready, or holds it until a merge assembles the complete thought.
+The audience sees interim preview text first, then either a fast Google translation or an English passthrough caption within roughly the same window after a sentence finalises. The LLM-improved translation updates it silently a second later if the sentence is display-ready, or holds it until a merge assembles the complete thought.
 
 ## Benchmarking
 
@@ -255,6 +465,16 @@ server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir
 It launches its own local server on port `8799` by default, captures the full
 display event stream, writes the raw run JSON, and then updates the
 self-improvement artifacts for that benchmark set.
+
+When a recording does not yet have an `.srt` reference, use the capture-only
+pipeline runner instead:
+
+```bash
+server/.venv/Scripts/python.exe tests/benchmark/run_capture_pipeline_test.py --audio-dir tests/audio/3 --duration 60 --allow-long-duration
+```
+
+This capture mode records the full event stream, timing, language counts, feed
+commits, and revisions without attempting WER or scorecard evaluation.
 
 Important: this is a replay harness, not a native-client microphone benchmark.
 It validates the backend WebSocket/STT/translation/display path after audio has
@@ -313,7 +533,8 @@ server/.venv/Scripts/python.exe tests/benchmark/run_pipeline_test.py --audio-dir
 
 The live translation path is intentionally layered now:
 
-- Google Translate is still the fast baseline shown first.
+- Google Translate is still the fast baseline shown first for Spanish content, including Spanish interim preview.
+- English-dominant STT sentences and interim previews pass straight through without translation.
 - Claude enrichment is validated before it can replace that baseline.
 - Unsafe rewrites fall back to Google.
 - Higher-risk cases can trigger a repair pass before release.

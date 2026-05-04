@@ -20,9 +20,20 @@ from server.services.google_translate_service import GoogleTranslateService
 from server.services.google_speech_session import (
     GoogleSpeechSession,
     _build_adaptation,
+    _build_speaker_segments,
     _build_recognition_config,
+    _segment_language_mode,
+    _speaker_metadata,
+    _supports_diarization_fallback,
 )
-from server.services.llm_enrichment_service import LLMEnrichmentService, _build_alignment_request_message
+from server.services.sentence_buffer import SentenceBuffer
+from server.services.llm_enrichment_service import (
+    LLMEnrichmentService,
+    _build_alignment_request_message,
+    _build_user_message,
+    _merge_blocked_by_segment_structure,
+    _normalize_segment_structure,
+)
 from server.services.stt import STTConfig
 
 
@@ -493,6 +504,82 @@ class TestEnrichmentCloseDrain:
 
 
 class TestSessionCloseIncompleteMetadata:
+    def test_close_stops_stt_before_flushing_buffered_tail(self):
+        async def run_():
+            events = []
+            sentence_translate_calls = []
+            fragment_translate_calls = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubTranslation:
+                def __init__(self):
+                    self.closed = False
+
+                async def translate_fragment(self, text):
+                    fragment_translate_calls.append((text, self.closed))
+
+                async def translate(self, text, ts):
+                    sentence_translate_calls.append((text, self.closed))
+
+                async def close(self):
+                    self.closed = True
+
+            class _StubSttSession:
+                async def stop(self):
+                    await session._on_final(
+                        "Este es el mensaje que hemos",
+                        1.0,
+                        2.0,
+                        {
+                            "detected_language": "es-US",
+                            "detected_languages": ["es-US"],
+                            "avg_confidence": 0.0,
+                            "word_count": 6,
+                            "low_confidence": False,
+                            "speaker_tags": [],
+                        },
+                    )
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._topic_tracker = None
+            session._state_tracker = None
+            session._translation = _StubTranslation()
+            session._enrichment = None
+            session._stt_session = _StubSttSession()
+            session._sentence_buffer = SentenceBuffer(on_sentence=session._on_sentence)
+            session._pending_audio_timing = {}
+            session._enrichment_settled = set()
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_stt_cache = {}
+            session._segment_metadata_cache = {}
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._pending_suggested_verses = {}
+            session._db_session_id = None
+            session._recorder = None
+            session._last_segment_id = 0
+            session._stt_noise_removed_count = 0
+            session._stt_config = STTConfig()
+
+            await session.close()
+            await asyncio.sleep(0.05)
+
+            assert fragment_translate_calls == [("es el mensaje que hemos", False)]
+            assert sentence_translate_calls == [("es el mensaje que hemos", False)]
+            assert any(event["type"] == "final_spanish" for event in events)
+
+        run(run_())
+
     def test_session_close_incomplete_flush_is_marked_terminal_incomplete(self):
         async def run_():
             events = []
@@ -609,7 +696,7 @@ class TestGoogleSttConfig:
         config = STTConfig.from_payload({})
 
         assert config.model == "chirp_3"
-        assert config.language_codes == ("es-US",)
+        assert config.language_codes == ("es-US", "en-US")
         assert config.location == "us"
         assert config.recognizer == "_"
         assert config.confidence_hold_threshold == 0.72
@@ -674,12 +761,177 @@ class TestGoogleSpeechConfig:
     def test_google_speech_session_is_constructible(self):
         session = GoogleSpeechSession(
             church_id="test",
-            on_interim=lambda text: asyncio.sleep(0),
+            on_interim=lambda text, meta: asyncio.sleep(0),
             on_final=lambda text, start, end, meta: asyncio.sleep(0),
             on_utterance_end=lambda: asyncio.sleep(0),
         )
 
         assert isinstance(session, GoogleSpeechSession)
+
+
+class _FakeWord:
+    def __init__(
+        self,
+        text: str,
+        *,
+        speaker_label: int = 0,
+        confidence: float = 0.0,
+        start_s: float = 0.0,
+        end_s: float = 0.0,
+    ):
+        self.word = text
+        self.speaker_label = speaker_label
+        self.confidence = confidence
+        self.start_offset = SimpleNamespace(seconds=int(start_s), nanos=int((start_s % 1) * 1_000_000_000))
+        self.end_offset = SimpleNamespace(seconds=int(end_s), nanos=int((end_s % 1) * 1_000_000_000))
+
+
+class TestGoogleSpeechMetadata:
+    def test_build_speaker_segments_groups_contiguous_words(self):
+        words = [
+            _FakeWord("Buenos", speaker_label=1, confidence=0.9, start_s=0.0, end_s=0.2),
+            _FakeWord("dias", speaker_label=1, confidence=0.7, start_s=0.2, end_s=0.4),
+            _FakeWord("church", speaker_label=2, confidence=0.8, start_s=0.4, end_s=0.7),
+        ]
+
+        assert _build_speaker_segments(words) == [
+            {
+                "speaker": 1,
+                "start_s": 0.0,
+                "end_s": 0.4,
+                "text": "Buenos dias",
+                "avg_confidence": 0.8,
+                "word_start_index": 0,
+                "word_end_index": 1,
+            },
+            {
+                "speaker": 2,
+                "start_s": 0.4,
+                "end_s": 0.7,
+                "text": "church",
+                "avg_confidence": 0.8,
+                "word_start_index": 2,
+                "word_end_index": 2,
+            },
+        ]
+
+    def test_speaker_metadata_exposes_dominant_speaker_and_switches(self):
+        words = [
+            _FakeWord("Bienvenidos", speaker_label=1, confidence=0.9, start_s=0.0, end_s=0.2),
+            _FakeWord("todos", speaker_label=1, confidence=0.9, start_s=0.2, end_s=0.4),
+            _FakeWord("amen", speaker_label=2, confidence=0.8, start_s=0.4, end_s=0.5),
+            _FakeWord("gracias", speaker_label=1, confidence=0.7, start_s=0.5, end_s=0.7),
+        ]
+
+        assert _speaker_metadata(words) == {
+            "speaker_tags": [1, 2],
+            "speaker_segments": [
+                {
+                    "speaker": 1,
+                    "start_s": 0.0,
+                    "end_s": 0.4,
+                    "text": "Bienvenidos todos",
+                    "avg_confidence": 0.9,
+                    "word_start_index": 0,
+                    "word_end_index": 1,
+                },
+                {
+                    "speaker": 2,
+                    "start_s": 0.4,
+                    "end_s": 0.5,
+                    "text": "amen",
+                    "avg_confidence": 0.8,
+                    "word_start_index": 2,
+                    "word_end_index": 2,
+                },
+                {
+                    "speaker": 1,
+                    "start_s": 0.5,
+                    "end_s": 0.7,
+                    "text": "gracias",
+                    "avg_confidence": 0.7,
+                    "word_start_index": 3,
+                    "word_end_index": 3,
+                },
+            ],
+            "speaker_count": 2,
+            "dominant_speaker": 1,
+            "speaker_switch_count": 2,
+            "mixed_speaker_segment": True,
+        }
+
+    def test_segment_language_mode_detects_mixed_segments(self):
+        assert _segment_language_mode("en-US", ["en-US"]) == "english"
+        assert _segment_language_mode("es-US", ["es-US"]) == "spanish"
+        assert _segment_language_mode("en-US", ["en-US", "es-US"]) == "mixed"
+        assert _segment_language_mode("", []) == "unknown"
+
+    def test_diarization_fallback_detects_streaming_unsupported_error(self):
+        config = STTConfig.from_payload({"diarizationEnabled": True})
+
+        assert _supports_diarization_fallback(
+            RuntimeError("400 StreamingRecognize does not support Speaker Diarization."),
+            config,
+        ) is True
+        assert _supports_diarization_fallback(RuntimeError("some other error"), config) is False
+        assert _supports_diarization_fallback(
+            RuntimeError("400 StreamingRecognize does not support Speaker Diarization."),
+            STTConfig.from_payload({"diarizationEnabled": False}),
+        ) is False
+
+
+class TestSegmentStructurePrompting:
+    def test_normalize_segment_structure_prefers_segment_metadata_fields(self):
+        assert _normalize_segment_structure({
+            "detected_language": "es-US",
+            "detected_languages": ["es-US", "en-US"],
+            "segment_language_mode": "mixed",
+            "dominant_speaker": 2,
+            "speaker_switch_count": 1,
+            "mixed_speaker_segment": True,
+            "speaker_segments": [{"speaker": 2, "text": "Gloria a Dios"}],
+        }) == {
+            "primary_language": "es-US",
+            "detected_languages": ["es-US", "en-US"],
+            "segment_language_mode": "mixed",
+            "dominant_speaker": 2,
+            "speaker_switch_count": 1,
+            "mixed_speaker_segment": True,
+            "speaker_segments": [{"speaker": 2, "text": "Gloria a Dios"}],
+        }
+
+    def test_merge_blocked_by_segment_structure_on_language_flip_or_speaker_change(self):
+        assert _merge_blocked_by_segment_structure(
+            {"segment_language_mode": "english"},
+            {"segment_language_mode": "spanish"},
+        ) is True
+        assert _merge_blocked_by_segment_structure(
+            {"segment_language_mode": "spanish", "dominant_speaker": 2},
+            {"segment_language_mode": "spanish", "dominant_speaker": 1},
+        ) is True
+        assert _merge_blocked_by_segment_structure(
+            {"segment_language_mode": "spanish", "dominant_speaker": 1},
+            {"segment_language_mode": "spanish", "dominant_speaker": 1},
+        ) is False
+
+    def test_build_user_message_includes_segment_structure_blocks(self):
+        message = _build_user_message(
+            "Bienvenidos todos",
+            "Welcome everyone",
+            "",
+            [],
+            None,
+            set(),
+            "",
+            None,
+            None,
+            {"segment_language_mode": "mixed", "dominant_speaker": 1, "speaker_switch_count": 1},
+            {"segment_language_mode": "spanish", "dominant_speaker": 1, "speaker_switch_count": 0},
+        )
+
+        assert "[CURRENT SEGMENT STRUCTURE]" in message
+        assert "segment_language_mode: mixed" in message
+        assert "[PREVIOUS SEGMENT STRUCTURE]" in message
 
     def test_google_speech_session_restarts_after_unexpected_stream_end(self):
         async def run_():
@@ -739,7 +991,7 @@ class TestGoogleSpeechConfig:
             try:
                 session = GoogleSpeechSession(
                     church_id="test",
-                    on_interim=lambda text: asyncio.sleep(0),
+                    on_interim=lambda text, meta: asyncio.sleep(0),
                     on_final=lambda text, start, end, meta: finals.append((text, start, end, meta)) or asyncio.sleep(0),
                     on_utterance_end=lambda: asyncio.sleep(0),
                 )
@@ -828,6 +1080,145 @@ class TestLowConfidenceHold:
         run(run_())
 
 
+class TestCodeSwitchingPassthrough:
+    def test_english_stt_final_bypasses_fragment_translation(self):
+        async def run_():
+            translation_calls = []
+            add_calls = []
+            broadcasts = []
+
+            class _StubTranslation:
+                async def translate_fragment(self, text):
+                    translation_calls.append(text)
+
+            class _StubSentenceBuffer:
+                async def add(self, text, audio_start, audio_end, stt_meta=None):
+                    add_calls.append((text, audio_start, audio_end, dict(stt_meta or {})))
+
+                def hold_next(self, reason, hold_secs=3.0):
+                    return None
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    broadcasts.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._translation = _StubTranslation()
+            session._sentence_buffer = _StubSentenceBuffer()
+            session._stt_config = STTConfig()
+            session._recorder = None
+            session._stt_noise_removed_count = 0
+
+            await session._on_final(
+                "God is light",
+                1.0,
+                2.0,
+                {
+                    "detected_language": "en-US",
+                    "detected_languages": ["en-US"],
+                    "avg_confidence": 0.95,
+                    "word_count": 3,
+                    "low_confidence": False,
+                },
+            )
+
+            assert translation_calls == []
+            assert broadcasts[0]["type"] == "stt_final"
+            assert broadcasts[1]["type"] == "live_translation"
+            assert broadcasts[1]["text"] == "God is light"
+            assert broadcasts[1]["source"] == "stt_passthrough"
+            assert broadcasts[1]["merge_strategy"] == "replace"
+            assert add_calls == [(
+                "God is light",
+                1.0,
+                2.0,
+                {
+                    "detected_language": "en-US",
+                    "detected_languages": ["en-US"],
+                    "avg_confidence": 0.95,
+                    "word_count": 3,
+                    "low_confidence": False,
+                },
+            )]
+
+        run(run_())
+
+    def test_english_sentence_flush_commits_passthrough_without_translation(self):
+        async def run_():
+            events = []
+            translate_calls = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubTranslation:
+                async def translate(self, text, ts):
+                    translate_calls.append((text, ts))
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._topic_tracker = None
+            session._state_tracker = None
+            session._sentence_buffer = None
+            session._translation = _StubTranslation()
+            session._enrichment = None
+            session._pending_audio_timing = {}
+            session._enrichment_settled = set()
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {}
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._pending_suggested_verses = {}
+            session._db_session_id = None
+            session._recorder = None
+            session._last_segment_id = 0
+
+            await session._on_sentence(
+                "God is light",
+                10.0,
+                12.0,
+                "utterance_end",
+                {
+                    "stt_primary_language": "en-US",
+                    "stt_detected_languages": ["en-US"],
+                },
+            )
+            await session._flush_all_pending_commits()
+
+            assert translate_calls == []
+            assert [event["type"] for event in events] == [
+                "final_spanish",
+                "live_translation",
+                "feed_commit",
+                "live_translation_clear",
+            ]
+            assert events[1]["text"] == "God is light"
+            assert events[1]["source"] == "stt_passthrough"
+            assert events[2] == {
+                "type": "feed_commit",
+                "spanish": "God is light",
+                "english": "God is light",
+                "source": "passthrough",
+                "stt_primary_language": "en-US",
+                "stt_detected_languages": ["en-US"],
+                "segment_id": events[2]["segment_id"],
+                "ts": events[2]["ts"],
+            }
+
+        run(run_())
+
+
 class TestInterimPreview:
     def test_interim_triggers_fast_translation_preview(self):
         async def run_():
@@ -850,14 +1241,53 @@ class TestInterimPreview:
             session._translation = _StubTranslation()
             session._recorder = None
 
-            await session._on_interim("Pentecostés comunión unos con otros")
+            await session._on_interim(
+                "Dios es amor",
+                {"detected_language": "es-US", "detected_languages": ["es-US"]},
+            )
 
             assert broadcasts == [{
                 "type": "interim",
-                "text": "Pentecostés comunión unos con otros",
+                "text": "Dios es amor",
                 "ts": broadcasts[0]["ts"],
+                "detected_language": "es-US",
+                "detected_languages": ["es-US"],
             }]
-            assert translation_calls == ["comunión unos con otros"]
+            assert translation_calls == ["Dios es amor"]
+
+        run(run_())
+
+    def test_english_interim_uses_passthrough_preview(self):
+        async def run_():
+            translation_calls = []
+            broadcasts = []
+
+            class _StubTranslation:
+                async def translate_interim(self, text):
+                    translation_calls.append(text)
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    broadcasts.append(event)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._translation = _StubTranslation()
+            session._recorder = None
+
+            await session._on_interim(
+                "God is light",
+                {"detected_language": "en-US", "detected_languages": ["en-US"]},
+            )
+
+            assert translation_calls == []
+            assert [event["type"] for event in broadcasts] == ["interim", "live_translation"]
+            assert broadcasts[1]["text"] == "God is light"
+            assert broadcasts[1]["source"] == "stt_passthrough"
+            assert broadcasts[1]["merge_strategy"] == "replace"
 
         run(run_())
 

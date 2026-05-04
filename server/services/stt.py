@@ -8,8 +8,34 @@ def _default_model() -> str:
     return os.getenv("GOOGLE_SPEECH_MODEL", "chirp_3").strip() or "chirp_3"
 
 
+def _dedupe_language_codes(codes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for code in codes:
+        cleaned = str(code).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(cleaned)
+    return tuple(ordered)
+
+
 def _default_language_codes() -> tuple[str, ...]:
+    raw_codes = os.getenv("GOOGLE_SPEECH_LANGUAGE_CODES", "").strip()
+    if raw_codes:
+        return _dedupe_language_codes(raw_codes.split(","))
+
     primary = os.getenv("GOOGLE_SPEECH_LANGUAGE", "es-US").strip() or "es-US"
+    secondary = os.getenv("GOOGLE_SPEECH_SECONDARY_LANGUAGE", "").strip()
+    if secondary:
+        return _dedupe_language_codes((primary, secondary))
+    if primary.lower().startswith("es"):
+        return _dedupe_language_codes((primary, "en-US"))
+    if primary.lower().startswith("en"):
+        return _dedupe_language_codes((primary, "es-US"))
     return (primary,)
 
 
@@ -24,13 +50,13 @@ def _default_recognizer() -> str:
 def _parse_language_codes(payload: dict) -> tuple[str, ...]:
     raw_codes = payload.get("languageCodes")
     if isinstance(raw_codes, (list, tuple)):
-        cleaned = tuple(str(code).strip() for code in raw_codes if str(code).strip())
+        cleaned = _dedupe_language_codes(raw_codes)
         if cleaned:
             return cleaned
 
     legacy_language = str(payload.get("language") or "").strip()
     if legacy_language:
-        return (legacy_language,)
+        return _dedupe_language_codes(legacy_language.split(","))
 
     return _default_language_codes()
 

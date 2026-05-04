@@ -123,19 +123,19 @@ export function MobileListener({ churchId }: MobileListenerProps) {
 
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
         {lines.length === 0 && !liveText && (
-          <p className="text-gray-600 text-center mt-12 text-base">
+          <p data-testid="listener-empty-state" className="text-gray-600 text-center mt-12 text-base">
             Translation will appear here when the service begins.
           </p>
         )}
 
         {lines.map((line) => (
-          <p key={line.id} className="text-xl leading-relaxed text-gray-200">
+          <p key={line.id} data-testid="listener-committed-line" className="text-xl leading-relaxed text-gray-200">
             {line.text}
           </p>
         ))}
 
         {liveText && (
-          <p className="text-xl leading-relaxed text-gray-400 italic">
+          <p data-testid="listener-live-line" className="text-xl leading-relaxed text-gray-400 italic">
             {liveText}
             <span className="animate-pulse ml-1">▌</span>
           </p>
@@ -146,3 +146,4 @@ export function MobileListener({ churchId }: MobileListenerProps) {
     </div>
   );
 }
+

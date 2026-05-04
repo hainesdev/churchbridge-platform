@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 MAX_ENRICHMENT_TOKENS = 1100
-DEFERRED_RELEASE_S = 6.0    # seconds to wait before releasing a suppressed translation if no merge
+DEFERRED_RELEASE_DEFAULT_S = 3.0
+DEFERRED_RELEASE_MERGE_PRONE_S = 3.5
+DEFERRED_RELEASE_SHORT_FRAGMENT_S = 4.5
+DEFERRED_RELEASE_INCOMPLETE_S = 2.0
 _VALID_SERMON_MODES = frozenset({
     "scripture", "exposition", "illustration", "application", "exhortation", "procedural"
 })
@@ -480,6 +483,9 @@ JSON schema:
   "literal_translation": "string",
   "natural_translation": "string"
 }
+17. When [CURRENT SEGMENT STRUCTURE] or [PREVIOUS SEGMENT STRUCTURE] indicates a speaker change,
+    mixed speakers, or a language-mode flip, be conservative with merge_with_previous.
+    Do NOT merge across those boundaries unless the current line unmistakably completes a bad split.
 """
 
 _ALIGNMENT_SYSTEM = """\
@@ -720,6 +726,35 @@ def _format_deferred_release_text(english: str, google_english: str) -> str:
     return release_text
 
 
+def _deferred_release_delay_s(
+    *,
+    spanish: str | None,
+    english: str,
+    google_english: str,
+    discourse_tag: str,
+    source_quality: str,
+    translation_register: str,
+) -> float:
+    """Choose a shorter release window for obviously usable captions while
+    preserving extra merge time for tiny bridge fragments."""
+    word_count = len((spanish or "").split())
+    if word_count and word_count <= 3:
+        return DEFERRED_RELEASE_SHORT_FRAGMENT_S
+    if (
+        _translation_looks_incomplete(english)
+        or _translation_looks_incomplete(google_english)
+        or source_quality in {"fragmented", "noisy"}
+    ):
+        return DEFERRED_RELEASE_INCOMPLETE_S
+    if discourse_tag in {"quote_introduction", "answer_to_question"}:
+        return DEFERRED_RELEASE_MERGE_PRONE_S
+    if discourse_tag == "rhetorical_question":
+        return 2.5
+    if translation_register == "scripture":
+        return 3.25
+    return DEFERRED_RELEASE_DEFAULT_S
+
+
 def _build_alignment_request_message(
     spanish: str,
     english: str,
@@ -767,6 +802,104 @@ def _build_system_prompt(church_terms: dict[str, str]) -> str:
     return _SYSTEM_PROMPT_BASE.replace("{glossary_block}", glossary_block)
 
 
+def _normalize_segment_structure(stt_context: dict | None) -> dict:
+    stt_context = dict(stt_context or {})
+    detected_languages = [
+        str(code).strip()
+        for code in (
+            stt_context.get("detected_languages")
+            or stt_context.get("stt_detected_languages")
+            or []
+        )
+        if str(code).strip()
+    ]
+    return {
+        "primary_language": str(
+            stt_context.get("detected_language")
+            or stt_context.get("stt_primary_language")
+            or ""
+        ).strip(),
+        "detected_languages": detected_languages,
+        "segment_language_mode": str(
+            stt_context.get("segment_language_mode")
+            or stt_context.get("stt_segment_language_mode")
+            or ""
+        ).strip()
+        or "unknown",
+        "dominant_speaker": int(
+            stt_context.get("dominant_speaker")
+            or stt_context.get("stt_dominant_speaker")
+            or 0
+        ),
+        "speaker_switch_count": int(
+            stt_context.get("speaker_switch_count")
+            or stt_context.get("stt_speaker_switch_count")
+            or 0
+        ),
+        "mixed_speaker_segment": bool(
+            stt_context.get("mixed_speaker_segment")
+            or stt_context.get("stt_mixed_speaker_segment")
+        ),
+        "speaker_segments": list(
+            stt_context.get("speaker_segments")
+            or stt_context.get("stt_speaker_segments")
+            or []
+        ),
+    }
+
+
+def _segment_structure_block(title: str, stt_context: dict | None) -> str | None:
+    structure = _normalize_segment_structure(stt_context)
+    lines = [
+        f"segment_language_mode: {structure['segment_language_mode']}",
+        f"primary_language: {structure['primary_language'] or 'unknown'}",
+    ]
+    if structure["detected_languages"]:
+        lines.append("detected_languages: " + ", ".join(structure["detected_languages"]))
+    if structure["dominant_speaker"]:
+        lines.append(f"dominant_speaker: {structure['dominant_speaker']}")
+    lines.append(f"speaker_switch_count: {structure['speaker_switch_count']}")
+    lines.append(f"mixed_speaker_segment: {str(structure['mixed_speaker_segment']).lower()}")
+    compact_segments: list[str] = []
+    for segment in structure["speaker_segments"][:4]:
+        if not isinstance(segment, dict):
+            continue
+        speaker = segment.get("speaker", 0)
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        compact_segments.append(f"speaker_{speaker}: {text[:80]}")
+    if compact_segments:
+        lines.append("speaker_segments: " + " | ".join(compact_segments))
+    if not any(value for value in lines[2:]) and lines[0].endswith("unknown") and lines[1].endswith("unknown"):
+        return None
+    return f"[{title}]\n" + "\n".join(lines)
+
+
+def _merge_blocked_by_segment_structure(
+    current_stt_context: dict | None,
+    previous_stt_context: dict | None,
+) -> bool:
+    current = _normalize_segment_structure(current_stt_context)
+    previous = _normalize_segment_structure(previous_stt_context)
+    current_mode = current["segment_language_mode"]
+    previous_mode = previous["segment_language_mode"]
+    if current_mode and previous_mode and "unknown" not in {current_mode, previous_mode}:
+        if current_mode != previous_mode:
+            return True
+    if current["mixed_speaker_segment"] or previous["mixed_speaker_segment"]:
+        return True
+    if current["speaker_switch_count"] > 0 or previous["speaker_switch_count"] > 0:
+        return True
+    if (
+        current["dominant_speaker"] > 0
+        and previous["dominant_speaker"] > 0
+        and current["dominant_speaker"] != previous["dominant_speaker"]
+    ):
+        return True
+    return False
+
+
 def _build_user_message(
     spanish: str,
     google_english: str,
@@ -777,6 +910,8 @@ def _build_user_message(
     current_mode_label: str = "",
     prev_discourse: dict | None = None,
     recent_modes: list[str] | None = None,
+    current_stt_context: dict | None = None,
+    prev_stt_context: dict | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -834,6 +969,13 @@ def _build_user_message(
                 f"improved_translation MUST cover both this previous sentence AND the current sentence "
                 f"as one repaired unit."
             )
+
+    current_structure = _segment_structure_block("CURRENT SEGMENT STRUCTURE", current_stt_context)
+    if current_structure:
+        parts.append(current_structure)
+    previous_structure = _segment_structure_block("PREVIOUS SEGMENT STRUCTURE", prev_stt_context)
+    if previous_structure:
+        parts.append(previous_structure)
 
     word_count = len(spanish.split())
     if word_count > 25:
@@ -915,6 +1057,8 @@ class LLMEnrichmentService:
         self._shown_suggestions: set[str] = set()
         # Discourse output of the previous enriched sentence — injected as forward context
         self._prev_discourse: dict | None = None
+        # Structured speaker/language view of the previous segment.
+        self._prev_stt_context: dict | None = None
         # Timestamp of the previously enriched sentence — used for segmentation-repair targeting
         self._prev_sentence_ts: int | None = None
         # Deferred translation updates: ts → (english, asyncio.Task)
@@ -965,6 +1109,7 @@ class LLMEnrichmentService:
         audio_start: float = 0.0,
         audio_end: float = 0.0,
         terminal_incomplete: bool = False,
+        stt_context: dict | None = None,
     ) -> asyncio.Task:
         """Schedule enrichment as a fire-and-forget task. Does not block."""
         self._scheduled_ts.append(ts)
@@ -976,6 +1121,7 @@ class LLMEnrichmentService:
                 audio_start,
                 audio_end,
                 terminal_incomplete,
+                stt_context,
             )
         )
         self._tasks = [t for t in self._tasks if not t.done()]
@@ -1256,6 +1402,7 @@ class LLMEnrichmentService:
         audio_start: float,
         audio_end: float,
         terminal_incomplete: bool,
+        stt_context: dict | None,
     ) -> None:
         # topic_context is from TopicTracker (updated on an independent schedule,
         # not affected by enrichment apply ordering — snapshot early is fine).
@@ -1278,6 +1425,7 @@ class LLMEnrichmentService:
             active_passage = self._active_passage
             shown = set(self._shown_suggestions)
             prev_discourse = self._prev_discourse
+            prev_stt_context = self._prev_stt_context
             current_mode_label = (
                 self._state_tracker.get_context_label() if self._state_tracker else ""
             )
@@ -1295,7 +1443,7 @@ class LLMEnrichmentService:
 
         user_msg = _build_user_message(
             spanish, google_english, topic_context, history, active_passage, shown,
-            current_mode_label, prev_discourse, recent_modes,
+            current_mode_label, prev_discourse, recent_modes, stt_context, prev_stt_context,
         )
 
         try:
@@ -1332,6 +1480,10 @@ class LLMEnrichmentService:
         source_quality = result.get("source_quality", "clean")
         if source_quality not in ("clean", "noisy", "fragmented"):
             source_quality = "clean"
+        if source_quality == "clean":
+            current_structure = _normalize_segment_structure(stt_context)
+            if current_structure["mixed_speaker_segment"] or current_structure["speaker_switch_count"] > 0:
+                source_quality = "fragmented"
         translation_register = result.get("translation_register", "expository")
         if translation_register not in ("scripture", "expository", "narrative", "exhortation"):
             translation_register = "expository"
@@ -1346,6 +1498,13 @@ class LLMEnrichmentService:
             display_ready = False
         if terminal_incomplete:
             display_ready = False
+        if merge_with_previous and _merge_blocked_by_segment_structure(stt_context, prev_stt_context):
+            logger.info(
+                "[enrichment:%s] merge blocked by segment structure ts=%d",
+                self._church_id,
+                ts,
+            )
+            merge_with_previous = False
 
         sermon_mode = result.get("sermon_mode", "exposition")
         if sermon_mode not in _VALID_SERMON_MODES:
@@ -1420,6 +1579,7 @@ class LLMEnrichmentService:
                 "source_quality": source_quality,
                 "display_ready": display_ready,
             }
+            self._prev_stt_context = _normalize_segment_structure(stt_context)
 
             # Feedback hold: if this sentence was incomplete, ask the buffer to
             # hold the next sentence longer so its continuation can accumulate.
@@ -1484,7 +1644,7 @@ class LLMEnrichmentService:
                     self._last_emitted_translation[ts] = _normalize_translation(google_english)
             else:
                 # Sentence is not display_ready — suppress translation update and defer.
-                # The deferred release fires after DEFERRED_RELEASE_S if no merge arrives.
+                # The deferred release uses an adaptive timeout if no merge arrives.
                 defer_task = asyncio.create_task(
                     self._deferred_translation_release(
                         ts,
@@ -1503,6 +1663,7 @@ class LLMEnrichmentService:
                         ),
                         translation_register=translation_register,
                         discourse_tag=discourse_tag,
+                        source_quality=source_quality,
                         verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
                     )
                 )
@@ -1780,22 +1941,32 @@ class LLMEnrichmentService:
         allow_alignment: bool = False,
         translation_register: str = "expository",
         discourse_tag: str = "statement",
+        source_quality: str = "clean",
         verse_detected: dict | None = None,
     ) -> None:
-        """Fallback: release a suppressed translation after DEFERRED_RELEASE_S if no segmentation repair arrived.
+        """Fallback: release a suppressed translation after an adaptive timeout if no segmentation repair arrived.
 
         Called when display_ready was false. If caption_merge fires first as segmentation repair, this task
         is cancelled. If no merge arrives within the timeout, the best available
         translation is emitted so the caption is not permanently blank.
         """
         try:
-            await asyncio.sleep(DEFERRED_RELEASE_S)
+            delay_s = _deferred_release_delay_s(
+                spanish=spanish,
+                english=english,
+                google_english=google_english,
+                discourse_tag=discourse_tag,
+                source_quality=source_quality,
+                translation_register=translation_register,
+            )
+
+            await asyncio.sleep(delay_s)
             if ts in self._deferred_updates:
                 del self._deferred_updates[ts]
                 logger.info(
                     "[enrichment:%s] decision=deferred_translation_released ts=%d "
                     "(no merge in %.1fs)",
-                    self._church_id, ts, DEFERRED_RELEASE_S,
+                    self._church_id, ts, delay_s,
                 )
                 # Always emit a release event when we time out a deferred caption,
                 # even if the text matches Google's original output. The client
