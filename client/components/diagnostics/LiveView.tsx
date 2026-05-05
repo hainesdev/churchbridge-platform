@@ -5,6 +5,7 @@ import { useEventLog } from '@/lib/useEventLog';
 import { LatencyBars } from './LatencyBars';
 import { EnrichmentHealth } from './EnrichmentHealth';
 import { EventLog } from './EventLog';
+import { PipelineTrace } from './PipelineTrace';
 import { RemoteReports } from './RemoteReports';
 import { getApiBaseUrl } from '@/lib/wsBaseUrl';
 
@@ -133,6 +134,8 @@ export function LiveView({ churchId }: LiveViewProps) {
         bufferCounts={buffer}
         noiseCount={noiseCount}
       />
+
+      <PipelineTrace events={events} connected={connected} />
 
       {/* Event stream */}
       <EventLog events={events} connected={connected} />

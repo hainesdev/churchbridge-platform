@@ -8,12 +8,11 @@ export interface RawEvent {
   raw: Record<string, unknown>;
 }
 
-const RING_SIZE = 30;
-
 /**
- * Opens a WebSocket to /api/display/v1 and maintains a ring buffer of the
- * last RING_SIZE events. Lightweight alternative to useTranslationFeed —
- * only captures raw events, no translation state machine.
+ * Opens a WebSocket to /api/display/v1 and retains the full in-memory event
+ * stream for the current diagnostics session. Lightweight alternative to
+ * useTranslationFeed that captures raw events without a translation state
+ * machine.
  */
 export function useEventLog(churchId: string) {
   const [events, setEvents] = useState<RawEvent[]>([]);
@@ -26,14 +25,14 @@ export function useEventLog(churchId: string) {
     const connect = () => {
       if (stopped) return;
       ws = new WebSocket(
-        `${getWebSocketBaseUrl()}/api/display/v1?church_id=${encodeURIComponent(churchId)}`
+        `${getWebSocketBaseUrl()}/api/display/v1?church_id=${encodeURIComponent(churchId)}`,
       );
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
         setConnected(false);
         setTimeout(connect, 2000);
       };
-      ws.onmessage = (e) => {
+      ws.onmessage = e => {
         try {
           const msg = JSON.parse(e.data as string) as Record<string, unknown>;
           const entry: RawEvent = {
@@ -41,9 +40,9 @@ export function useEventLog(churchId: string) {
             ts: Number(msg.ts ?? Date.now()),
             raw: msg,
           };
-          setEvents(prev => [...prev.slice(-(RING_SIZE - 1)), entry]);
+          setEvents(prev => [...prev, entry]);
         } catch {
-          // Ignore malformed messages
+          // Ignore malformed messages.
         }
       };
     };

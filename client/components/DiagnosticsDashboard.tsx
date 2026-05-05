@@ -15,7 +15,7 @@ export function DiagnosticsDashboard({ churchId }: DiagnosticsDashboardProps) {
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
-      <div className="max-w-2xl mx-auto px-4 py-6 space-y-5">
+      <div className="max-w-7xl mx-auto px-4 py-6 space-y-5">
         <div className="flex items-baseline justify-between">
           <div>
             <h1 className="text-lg font-semibold">Diagnostics</h1>

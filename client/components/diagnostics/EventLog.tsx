@@ -1,4 +1,5 @@
 'use client';
+import { useState } from 'react';
 import { RawEvent } from '@/lib/useEventLog';
 
 const EVENT_COLOR: Record<string, string> = {
@@ -15,6 +16,7 @@ const EVENT_COLOR: Record<string, string> = {
   mode_change: 'text-purple-400',
   caption_merge: 'text-gray-500',
   segment_metadata: 'text-gray-600',
+  pipeline_trace: 'text-emerald-300',
 };
 
 function formatTs(ts: number): string {
@@ -26,6 +28,9 @@ function formatTs(ts: number): string {
 }
 
 function excerptPayload(raw: Record<string, unknown>): string {
+  if (raw.type === 'pipeline_trace') {
+    return String(raw.summary ?? raw.trace_stage ?? 'trace');
+  }
   const rest = { ...raw };
   delete rest.type;
   delete rest.ts;
@@ -39,33 +44,49 @@ interface EventLogProps {
 }
 
 export function EventLog({ events, connected }: EventLogProps) {
+  const [open, setOpen] = useState(false);
   const reversed = [...events].reverse();
 
   return (
     <div className="rounded-2xl border border-gray-800 bg-gray-900 p-4 space-y-2">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
-          Event Stream
-        </h3>
-        <span className={`text-xs ${connected ? 'text-green-500' : 'text-gray-600'}`}>
-          {connected ? 'live' : 'disconnected'}
-        </span>
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+            Event Stream
+          </h3>
+          <p className="mt-1 text-xs text-gray-600">
+            Secondary raw feed for quick scanning. The timeline above is the primary operator view.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className={`text-xs ${connected ? 'text-green-500' : 'text-gray-600'}`}>
+            {connected ? 'live' : 'disconnected'}
+          </span>
+          <button
+            onClick={() => setOpen(current => !current)}
+            className="rounded-full border border-gray-800 bg-gray-950/60 px-3 py-1 text-xs text-gray-400 hover:text-gray-200"
+          >
+            {open ? 'Collapse' : 'Expand'}
+          </button>
+        </div>
       </div>
-      <div className="h-64 overflow-y-auto space-y-0.5 font-mono">
-        {reversed.length === 0 ? (
-          <p className="text-xs text-gray-600 py-2">No events yet</p>
-        ) : (
-          reversed.map((event, index) => (
-            <div key={index} className="flex gap-2 text-xs leading-5">
-              <span className="text-gray-600 shrink-0">{formatTs(event.ts)}</span>
-              <span className={`shrink-0 ${EVENT_COLOR[event.type] ?? 'text-gray-400'}`}>
-                {event.type}
-              </span>
-              <span className="text-gray-600 truncate">{excerptPayload(event.raw)}</span>
-            </div>
-          ))
-        )}
-      </div>
+      {open && (
+        <div className="h-64 overflow-y-auto space-y-0.5 font-mono">
+          {reversed.length === 0 ? (
+            <p className="text-xs text-gray-600 py-2">No events yet</p>
+          ) : (
+            reversed.map((event, index) => (
+              <div key={index} className="flex gap-2 text-xs leading-5">
+                <span className="text-gray-600 shrink-0">{formatTs(event.ts)}</span>
+                <span className={`shrink-0 ${EVENT_COLOR[event.type] ?? 'text-gray-400'}`}>
+                  {event.type}
+                </span>
+                <span className="text-gray-600 truncate">{excerptPayload(event.raw)}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -387,6 +387,7 @@ class ServiceSession:
         self._topic_tracker = TopicTracker(
             church_id=self._church_id,
             sermon_topic=sermon_topic,
+            on_observability_event=self._on_observability_event,
         )
 
         self._state_tracker = SermonStateTracker(
@@ -414,6 +415,7 @@ class ServiceSession:
             on_buffer_hold=self._on_buffer_hold,
             on_caption_merge=self._on_caption_merge,
             on_segment_metadata=self._on_segment_metadata,
+            on_observability_event=self._on_observability_event,
             session_id=self._db_session_id,
             state_tracker=self._state_tracker,
         )
@@ -433,6 +435,18 @@ class ServiceSession:
             "displayScriptureVersion": self._display_scripture_version,
             "sttConfig": self._stt_config.public_payload(),
         })
+        await self._broadcast_pipeline_trace(
+            stage="session.start",
+            summary="session initialized",
+            trace_kind="lifecycle",
+            data={
+                "session_id": self._db_session_id,
+                "sample_rate": sample_rate,
+                "source_scripture_version": self._source_scripture_version,
+                "display_scripture_version": self._display_scripture_version,
+                "stt_config": self._stt_config.public_payload(),
+            },
+        )
         logger.info(
             "[session] Started for church %s (db_id=%s, topic=%r, source_version=%s, display_version=%s, stt_model=%s, stt_languages=%s)",
             self._church_id,
@@ -476,6 +490,12 @@ class ServiceSession:
             await self._topic_tracker.stop()
         if self._db_session_id:
             await close_service_session(self._db_session_id)
+        await self._broadcast_pipeline_trace(
+            stage="session.stop",
+            summary="session closed",
+            trace_kind="lifecycle",
+            data={"session_id": self._db_session_id},
+        )
         logger.info("[session] Closed for church %s", self._church_id)
 
     # --- STT callbacks ---
@@ -517,6 +537,19 @@ class ServiceSession:
                 "[session:%s] STT noise removed (count=%d): %r → %r",
                 self._church_id, self._stt_noise_removed_count, text[:60], clean[:60],
             )
+        await self._broadcast_pipeline_trace(
+            stage="stt.final",
+            summary="speech-to-text final received",
+            trace_kind="ingest",
+            data={
+                "raw_text": text,
+                "cleaned_text": clean,
+                "audio_start": audio_start,
+                "audio_end": audio_end,
+                "noise_removed": clean != text,
+                "stt_meta": stt_meta,
+            },
+        )
         if not clean:
             return
         if self._translation:
@@ -586,6 +619,20 @@ class ServiceSession:
             **stt_context,
             **self._segment_ref(ts),
         })
+        await self._broadcast_pipeline_trace(
+            stage="sentence.flush",
+            summary=f"sentence buffered and flushed via {flush_reason}",
+            segment_id=ts,
+            trace_kind="buffer",
+            data={
+                "text": text,
+                "audio_start": audio_start,
+                "audio_end": audio_end,
+                "flush_reason": flush_reason,
+                "terminal_incomplete": terminal_incomplete,
+                "stt_context": stt_context,
+            },
+        )
         if self._topic_tracker:
             mode = self._state_tracker.settled_mode if self._state_tracker else "exposition"
             self._topic_tracker.add_segment(text, mode=mode)
@@ -658,6 +705,18 @@ class ServiceSession:
                 {"spanish": text, "english": english, "ts": ts, "source": "passthrough"},
             )
             self._recorder.record_timing("translation", ts)
+        await self._broadcast_pipeline_trace(
+            stage="translation.passthrough",
+            summary="english passthrough emitted",
+            segment_id=ts,
+            trace_kind="translation",
+            data={
+                "spanish": text,
+                "english": english,
+                "source": "stt_passthrough",
+                "stt_context": stt_context,
+            },
+        )
         await self._broadcast_live_translation(
             text=english,
             source="stt_passthrough",
@@ -694,6 +753,18 @@ class ServiceSession:
         if self._recorder:
             self._recorder.record_event("translation", {"spanish": spanish, "english": english, "ts": ts})
             self._recorder.record_timing("translation", ts)
+        await self._broadcast_pipeline_trace(
+            stage="translation.google",
+            summary="google sentence translation returned",
+            segment_id=ts,
+            trace_kind="translation",
+            data={
+                "spanish": spanish,
+                "english": english,
+                "source": "google_sentence",
+                "stt_context": stt_context,
+            },
+        )
         await self._broadcast_live_translation(
             text=english,
             source="google_sentence",
@@ -761,12 +832,26 @@ class ServiceSession:
                 "[session:%s] Correction suppressed ts=%d — enrichment already settled",
                 self._church_id, ts,
             )
+            await self._broadcast_pipeline_trace(
+                stage="translation.google_correction",
+                summary="google correction suppressed after llm settled",
+                segment_id=ts,
+                trace_kind="decision",
+                data={"english": english},
+            )
             await self._broadcast({"type": "correction_suppressed", **self._segment_ref(ts)})
             return
         if ts in self._pending_feed_commits:
             self._pending_feed_commits[ts]["english"] = english
             self._pending_feed_commits[ts]["source"] = "google"
             self._pending_feed_commits[ts]["phrase_alignment"] = None
+            await self._broadcast_pipeline_trace(
+                stage="translation.google_correction",
+                summary="google correction updated pending segment",
+                segment_id=ts,
+                trace_kind="translation",
+                data={"english": english},
+            )
             await self._broadcast_live_translation(
                 text=english,
                 source="google_correction",
@@ -775,6 +860,13 @@ class ServiceSession:
                 merge_strategy="replace",
             )
             return
+        await self._broadcast_pipeline_trace(
+            stage="translation.google_correction",
+            summary="google correction revised committed segment",
+            segment_id=ts,
+            trace_kind="translation",
+            data={"english": english},
+        )
         await self._broadcast_feed_revision(
             segment_id=ts,
             english=english,
@@ -799,11 +891,28 @@ class ServiceSession:
             logger.info(
                 "[session:%s] Buffer hold from enrichment: %s (%.1fs)", self._church_id, reason, hold_secs
             )
+            await self._broadcast_pipeline_trace(
+                stage="buffer.hold",
+                summary=f"buffer hold requested: {reason}",
+                trace_kind="decision",
+                data={"reason": reason, "hold_secs": hold_secs},
+            )
 
     async def _on_translation_update(self, ts: int, english: str, phrase_alignment: list[dict] | None = None):
         """LLM-improved translation; replaces the Google translation on the display."""
         logger.info("[session:%s] Translation update ts=%d: %s", self._church_id, ts, english[:200])
         self._enrichment_settled.add(ts)
+        await self._broadcast_pipeline_trace(
+            stage="translation.llm_update",
+            summary="llm translation update applied",
+            segment_id=ts,
+            trace_kind="translation",
+            data={
+                "english": english,
+                "has_phrase_alignment": bool(phrase_alignment),
+                "phrase_alignment": phrase_alignment,
+            },
+        )
         if ts in self._pending_feed_commits:
             pending = self._pending_feed_commits[ts]
             pending["english"] = english
@@ -854,6 +963,16 @@ class ServiceSession:
             )
             return
         signatures[ts] = signature
+        await self._broadcast_pipeline_trace(
+            stage="alignment.emit",
+            summary="phrase alignment emitted",
+            segment_id=ts,
+            trace_kind="alignment",
+            data={
+                "phrase_alignment": phrase_alignment,
+                "phrase_count": len(phrase_alignment),
+            },
+        )
         await self._broadcast_feed_revision(
             segment_id=ts,
             english=english,
@@ -951,6 +1070,13 @@ class ServiceSession:
     async def _on_verse_detected(self, ts: int, verse: dict):
         verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse detected: %s", self._church_id, verse.get("reference"))
+        await self._broadcast_pipeline_trace(
+            stage="verse.detected",
+            summary=f"verse detected: {verse.get('reference')}",
+            segment_id=ts,
+            trace_kind="decision",
+            data={"verse": verse},
+        )
         if ts not in self._committed_segment_ids:
             self._pending_detected_verses[ts] = verse
             return
@@ -985,6 +1111,18 @@ class ServiceSession:
         logger.info(
             "[session:%s] Caption merge: keep=%d absorbs=%d",
             self._church_id, keep_ts, absorb_ts,
+        )
+        await self._broadcast_pipeline_trace(
+            stage="caption.merge",
+            summary=f"segment {keep_ts} absorbed {absorb_ts}",
+            segment_id=keep_ts,
+            trace_kind="merge",
+            data={
+                "segment_id_keep": keep_ts,
+                "segment_id_absorb": absorb_ts,
+                "merged_spanish": merged_spanish,
+                "merged_english": merged_english,
+            },
         )
         keep_was_committed = keep_ts in self._committed_segment_ids
         await self._drop_pending_commit(absorb_ts)
@@ -1047,6 +1185,13 @@ class ServiceSession:
             **metadata,
             **self._ensure_segment_stt_cache().get(ts, {}),
         }
+        await self._broadcast_pipeline_trace(
+            stage="segment.metadata",
+            summary="segment metadata updated",
+            segment_id=ts,
+            trace_kind="metadata",
+            data=metadata,
+        )
         self._pending_segment_metadata[ts] = metadata
         self._segment_metadata_cache[ts] = dict(metadata)
         if metadata.get("pending_completion") and ts in self._pending_feed_commits:
@@ -1112,6 +1257,41 @@ class ServiceSession:
             },
             "capture_active": self._recorder is not None,
         }
+
+    async def _on_observability_event(self, event: dict) -> None:
+        await self._broadcast_pipeline_trace(
+            stage=str(event.get("trace_stage") or "pipeline"),
+            summary=str(event.get("summary") or "trace"),
+            segment_id=event.get("segment_id"),
+            trace_kind=str(event.get("trace_kind") or "event"),
+            data=event.get("data") if isinstance(event.get("data"), dict) else None,
+            call_id=str(event["call_id"]) if event.get("call_id") is not None else None,
+        )
+
+    async def _broadcast_pipeline_trace(
+        self,
+        *,
+        stage: str,
+        summary: str,
+        segment_id: int | None = None,
+        trace_kind: str = "event",
+        data: dict | None = None,
+        call_id: str | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "type": "pipeline_trace",
+            "trace_stage": stage,
+            "trace_kind": trace_kind,
+            "summary": summary,
+            "ts": _now(),
+        }
+        if segment_id is not None:
+            payload["segment_id"] = segment_id
+        if call_id is not None:
+            payload["call_id"] = call_id
+        if data:
+            payload["data"] = data
+        await self._broadcast(payload)
 
     async def _broadcast(self, event: dict):
         await self._broadcaster.publish(self._church_id, event)
@@ -1256,6 +1436,19 @@ class ServiceSession:
         }
         if phrase_alignment:
             payload["phrase_alignment"] = phrase_alignment
+        await self._broadcast_pipeline_trace(
+            stage="display.feed_commit",
+            summary="feed commit broadcast",
+            segment_id=segment_id,
+            trace_kind="emit",
+            data={
+                "spanish": spanish,
+                "english": english,
+                "source": source,
+                "phrase_alignment": phrase_alignment,
+                "stt_context": stt_context,
+            },
+        )
         await self._broadcast(payload)
 
     async def _broadcast_feed_revision(
@@ -1420,6 +1613,20 @@ class ServiceSession:
         if phrase_alignment:
             payload["phrase_alignment"] = phrase_alignment
         self._bump_feed_revision_metric(reason)
+        await self._broadcast_pipeline_trace(
+            stage="display.feed_revision",
+            summary=f"feed revision broadcast: {reason}",
+            segment_id=segment_id,
+            trace_kind="emit",
+            data={
+                "english": english,
+                "spanish": spanish,
+                "source": source,
+                "reason": reason,
+                "phrase_alignment": phrase_alignment,
+                "stt_context": stt_context,
+            },
+        )
         await self._broadcast(payload)
 
     def _bump_feed_revision_metric(self, reason: str) -> None:

@@ -5,6 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 import anthropic
 
@@ -77,7 +78,12 @@ class TopicTracker:
     to correctly classify vocabulary and avoid false verse detections.
     """
 
-    def __init__(self, church_id: str, sermon_topic: str = ""):
+    def __init__(
+        self,
+        church_id: str,
+        sermon_topic: str = "",
+        on_observability_event: Callable[[dict], Awaitable[None]] | None = None,
+    ):
         self._church_id = church_id
         self._sermon_topic = sermon_topic.strip()
         self._segments: list[str] = []
@@ -93,6 +99,8 @@ class TopicTracker:
         self._last_summary_time: float = 0.0
         self._update_task: asyncio.Task | None = None
         self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self._on_observability_event = on_observability_event
+        self._observability_seq = 0
 
     def add_segment(self, spanish_text: str, mode: str = "exposition") -> None:
         """Record a final transcript segment and schedule a summary refresh if due."""
@@ -127,6 +135,40 @@ class TopicTracker:
         """Return the full structured context object."""
         return self._context
 
+    def _next_observability_call_id(self, stage: str) -> str:
+        self._observability_seq += 1
+        return f"{stage}:{self._observability_seq}"
+
+    async def _emit_observability_event(
+        self,
+        *,
+        stage: str,
+        trace_kind: str,
+        summary: str,
+        data: dict | None = None,
+        call_id: str | None = None,
+    ) -> None:
+        if not self._on_observability_event:
+            return
+        payload: dict[str, object] = {
+            "trace_stage": stage,
+            "trace_kind": trace_kind,
+            "summary": summary,
+        }
+        if data:
+            payload["data"] = data
+        if call_id:
+            payload["call_id"] = call_id
+        try:
+            await self._on_observability_event(payload)
+        except Exception as exc:
+            logger.debug(
+                "[topic] observability emit failed for church %s stage=%s: %s",
+                self._church_id,
+                stage,
+                exc,
+            )
+
     def _interval(self) -> int:
         """Return the appropriate update interval based on elapsed session time."""
         elapsed = time.monotonic() - self._session_start
@@ -153,6 +195,7 @@ class TopicTracker:
         mode_hint = f" The current sermon mode appears to be: {self._current_mode}."
 
         response = None
+        call_id = self._next_observability_call_id("summary")
         try:
             prompt_prefix = (
                 f"Analyze this sermon transcript and return a JSON object with these fields:\n"
@@ -171,6 +214,26 @@ class TopicTracker:
                 f'"sermon_arc": "string", "rhetorical_goal": "string" }}'
             )
             transcript_block = f"Transcript:{topic_hint}{mode_hint}\n{recent_text}"
+            system_prompt = (
+                "You summarize live Spanish sermon transcripts for a simultaneous interpreter. "
+                "Be brief and precise. Return ONLY valid JSON â€” no prose, no markdown fences."
+            )
+            await self._emit_observability_event(
+                stage="summary.prompt",
+                trace_kind="llm_prompt",
+                summary="rolling sermon summary prompt",
+                call_id=call_id,
+                data={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 300,
+                    "system": system_prompt,
+                    "system_truncated": False,
+                    "user": f"{prompt_prefix}\n\n{transcript_block}",
+                    "user_truncated": False,
+                    "segment_count": len(self._segments),
+                    "current_mode": self._current_mode,
+                },
+            )
             response = await self._client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=300,
@@ -201,11 +264,29 @@ class TopicTracker:
                 int(getattr(usage, "cache_read_input_tokens", 0) or 0),
             )
             raw = response.content[0].text.strip()
+            raw_before_strip = raw
             # Strip markdown fences if model adds them despite instructions
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
 
             parsed = json.loads(raw)
+            await self._emit_observability_event(
+                stage="summary.response",
+                trace_kind="llm_response",
+                summary="rolling sermon summary response parsed",
+                call_id=call_id,
+                data={
+                    "raw_response": raw_before_strip,
+                    "raw_response_truncated": False,
+                    "parsed_json": parsed,
+                    "usage": {
+                        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+                        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+                        "cache_creation_input_tokens": int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+                        "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+                    },
+                },
+            )
             new_context = SermonContext(
                 summary=parsed.get("summary", self._context.summary),
                 current_mode=self._current_mode,
@@ -215,6 +296,22 @@ class TopicTracker:
                 rhetorical_goal=parsed.get("rhetorical_goal", ""),
             )
             self._context = new_context
+            await self._emit_observability_event(
+                stage="summary.applied",
+                trace_kind="decision",
+                summary="rolling sermon summary applied",
+                call_id=call_id,
+                data={
+                    "context": {
+                        "summary": new_context.summary,
+                        "current_mode": new_context.current_mode,
+                        "key_themes": new_context.key_themes,
+                        "illustration_subject": new_context.illustration_subject,
+                        "sermon_arc": new_context.sermon_arc,
+                        "rhetorical_goal": new_context.rhetorical_goal,
+                    },
+                },
+            )
             logger.info(
                 "[topic] Context updated for church %s (mode=%s): %s",
                 self._church_id, self._current_mode, new_context.to_context_str()[:120],
@@ -222,10 +319,37 @@ class TopicTracker:
         except (json.JSONDecodeError, KeyError):
             # Graceful fallback: store the raw text as a plain summary
             raw_text = response.content[0].text.strip() if response is not None else ""
+            await self._emit_observability_event(
+                stage="summary.response",
+                trace_kind="llm_response",
+                summary="rolling sermon summary parse failed",
+                call_id=call_id,
+                data={
+                    "raw_response": raw_text,
+                    "raw_response_truncated": False,
+                    "parsed_json": None,
+                },
+            )
             if raw_text:
                 self._context = SermonContext(
-                    summary=raw_text[:300],
+                    summary=raw_text,
                     current_mode=self._current_mode,
+                )
+                await self._emit_observability_event(
+                    stage="summary.applied",
+                    trace_kind="decision",
+                    summary="rolling sermon summary applied from fallback text",
+                    call_id=call_id,
+                    data={
+                        "context": {
+                            "summary": self._context.summary,
+                            "current_mode": self._context.current_mode,
+                            "key_themes": self._context.key_themes,
+                            "illustration_subject": self._context.illustration_subject,
+                            "sermon_arc": self._context.sermon_arc,
+                            "rhetorical_goal": self._context.rhetorical_goal,
+                        },
+                    },
                 )
             logger.warning(
                 "[topic] Could not parse structured context for church %s — using plain text",
@@ -234,6 +358,13 @@ class TopicTracker:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            await self._emit_observability_event(
+                stage="summary.error",
+                trace_kind="error",
+                summary="rolling sermon summary update failed",
+                call_id=call_id,
+                data={"error": str(e)},
+            )
             logger.warning("[topic] Context update failed for church %s: %s", self._church_id, e)
 
     async def stop(self) -> None:

@@ -576,6 +576,29 @@ def _cached_text_block(text: str) -> dict[str, object]:
     }
 
 
+def _trim_observability_text(value: str, limit: int = 12000) -> tuple[str, bool]:
+    return value, False
+
+
+def _serialize_message_content(content: str | list[dict[str, object]]) -> str:
+    if isinstance(content, str):
+        return content
+    lines: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            lines.append(str(block))
+            continue
+        block_type = str(block.get("type") or "unknown")
+        if block_type == "text":
+            lines.append(str(block.get("text") or ""))
+            continue
+        try:
+            lines.append(json.dumps(block, ensure_ascii=False, indent=2, default=str))
+        except TypeError:
+            lines.append(str(block))
+    return "\n\n".join(part for part in lines if part)
+
+
 def _parse_json_object(raw: str) -> dict | None:
     raw = _strip_json_fences(raw)
     try:
@@ -1235,6 +1258,7 @@ class LLMEnrichmentService:
         on_buffer_hold: Callable[[str, float], Awaitable[None]] | None = None,
         on_caption_merge: Callable[[int, int, str, str], Awaitable[None]] | None = None,
         on_segment_metadata: Callable[[int, dict], Awaitable[None]] | None = None,
+        on_observability_event: Callable[[dict], Awaitable[None]] | None = None,
         session_id: int = 0,
         state_tracker: "SermonStateTracker | None" = None,
     ):
@@ -1250,6 +1274,7 @@ class LLMEnrichmentService:
         self._on_buffer_hold = on_buffer_hold
         self._on_caption_merge = on_caption_merge
         self._on_segment_metadata = on_segment_metadata
+        self._on_observability_event = on_observability_event
         self._session_id = session_id
         self._structural_system_prompt = _build_structural_system_prompt(church_terms)
         self._translation_system_prompt = _build_translation_system_prompt(church_terms)
@@ -1292,6 +1317,7 @@ class LLMEnrichmentService:
         self._last_emitted_translation: dict[int, str] = {}
         self._pending_alignment_tasks: dict[int, asyncio.Task] = {}
         self._last_alignment_signature: dict[int, tuple[str, str]] = {}
+        self._observability_seq: int = 0
 
         # Verse scratch pad — accumulates detections for temporal range consolidation
         self._verse_scratch: list[VerseScratchEntry] = []
@@ -1781,6 +1807,43 @@ class LLMEnrichmentService:
         self._tasks = [t for t in self._tasks if not t.done()]
         self._tasks.append(task)
 
+    def _next_observability_call_id(self, stage: str, ts: int) -> str:
+        self._observability_seq += 1
+        return f"{stage}:{ts}:{self._observability_seq}"
+
+    async def _emit_observability_event(
+        self,
+        *,
+        stage: str,
+        trace_kind: str,
+        ts: int,
+        summary: str,
+        call_id: str | None = None,
+        data: dict | None = None,
+    ) -> None:
+        if not self._on_observability_event:
+            return
+        payload: dict[str, object] = {
+            "trace_stage": stage,
+            "trace_kind": trace_kind,
+            "summary": summary,
+            "segment_id": ts,
+        }
+        if call_id:
+            payload["call_id"] = call_id
+        if data:
+            payload["data"] = data
+        try:
+            await self._on_observability_event(payload)
+        except Exception as exc:
+            logger.debug(
+                "[enrichment:%s] observability emit failed stage=%s ts=%d: %s",
+                self._church_id,
+                stage,
+                ts,
+                exc,
+            )
+
     def request_phrase_alignment(
         self,
         *,
@@ -1818,6 +1881,26 @@ class LLMEnrichmentService:
             message_content = [{"type": "text", "text": user_message}]
         else:
             message_content = user_message
+        call_id = self._next_observability_call_id(stage, ts)
+        system_text, system_truncated = _trim_observability_text(system)
+        user_text, user_truncated = _trim_observability_text(
+            _serialize_message_content(message_content)
+        )
+        await self._emit_observability_event(
+            stage=stage,
+            trace_kind="llm_prompt",
+            ts=ts,
+            call_id=call_id,
+            summary=f"{stage} prompt",
+            data={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": max_tokens,
+                "system": system_text,
+                "system_truncated": system_truncated,
+                "user": user_text,
+                "user_truncated": user_truncated,
+            },
+        )
         response = await self._client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=max_tokens,
@@ -1841,14 +1924,47 @@ class LLMEnrichmentService:
             cache_read_tokens,
         )
         raw = response.content[0].text.strip()
+        raw_text, raw_truncated = _trim_observability_text(raw)
         stripped = _strip_json_fences(raw)
         result = _parse_json_object(raw)
+        usage = {
+            "input_tokens": _usage_attr(response, "input_tokens"),
+            "output_tokens": _usage_attr(response, "output_tokens"),
+            "cache_creation_input_tokens": cache_write_tokens,
+            "cache_read_input_tokens": cache_read_tokens,
+        }
         if result is not None:
+            await self._emit_observability_event(
+                stage=stage,
+                trace_kind="llm_response",
+                ts=ts,
+                call_id=call_id,
+                summary=f"{stage} response parsed",
+                data={
+                    "raw_response": raw_text,
+                    "raw_response_truncated": raw_truncated,
+                    "parsed_json": result,
+                    "usage": usage,
+                },
+            )
             if raw != stripped:
                 self.metrics["parse_retry_success"] += 1
             return result
 
         self.metrics["parse_failed"] += 1
+        await self._emit_observability_event(
+            stage=stage,
+            trace_kind="llm_response",
+            ts=ts,
+            call_id=call_id,
+            summary=f"{stage} response parse failed",
+            data={
+                "raw_response": raw_text,
+                "raw_response_truncated": raw_truncated,
+                "parsed_json": None,
+                "usage": usage,
+            },
+        )
         logger.warning(
             "[enrichment:%s] Could not parse %s JSON for ts=%d: %.160s",
             self._church_id, stage, ts, raw,
@@ -2377,6 +2493,27 @@ class LLMEnrichmentService:
                 thought_complete, continuation_required, merge_with_previous,
                 paragraph_break, source_quality, translation_register, display_ready,
             )
+            await self._emit_observability_event(
+                stage="structural",
+                trace_kind="decision",
+                ts=ts,
+                summary="structural decision applied",
+                data={
+                    "discourse_tag": discourse_tag,
+                    "introduces_quote": introduces_quote,
+                    "thought_complete": thought_complete,
+                    "continuation_required": continuation_required,
+                    "merge_with_previous": merge_with_previous,
+                    "paragraph_break": paragraph_break,
+                    "source_quality": source_quality,
+                    "translation_register": translation_register,
+                    "sermon_mode": sermon_mode,
+                    "display_ready": display_ready,
+                    "terminal_incomplete": terminal_incomplete,
+                    "best_english": best_english,
+                    "google_english": google_english,
+                },
+            )
             # Store for injection into the next sentence's prompt
             self._prev_discourse = {
                 "discourse_tag": discourse_tag,
@@ -2760,6 +2897,26 @@ class LLMEnrichmentService:
         if prefix:
             user_blocks.append(_cached_text_block(prefix))
         user_blocks.append({"type": "text", "text": f"[SOURCE]\n{spanish}\n\n[TRANSLATION]\n{google_english}"})
+        call_id = self._next_observability_call_id("verse_suggestions", ts)
+        system_text, system_truncated = _trim_observability_text(_VERSE_SUGGESTIONS_SYSTEM)
+        user_text, user_truncated = _trim_observability_text(
+            _serialize_message_content(user_blocks)
+        )
+        await self._emit_observability_event(
+            stage="verse_suggestions",
+            trace_kind="llm_prompt",
+            ts=ts,
+            call_id=call_id,
+            summary="verse suggestions prompt",
+            data={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 400,
+                "system": system_text,
+                "system_truncated": system_truncated,
+                "user": user_text,
+                "user_truncated": user_truncated,
+            },
+        )
 
         try:
             response = await self._client.messages.create(
@@ -2778,6 +2935,7 @@ class LLMEnrichmentService:
                 self._church_id, ts, e,
             )
             return
+        raw_text, raw_truncated = _trim_observability_text(raw)
         logger.info(
             "[enrichment:%s] verse_suggestions usage: input=%d output=%d cache_write=%d cache_read=%d",
             self._church_id,
@@ -2788,6 +2946,28 @@ class LLMEnrichmentService:
         )
 
         suggestions = _extract_suggestions(raw, self._church_id, ts)
+        await self._emit_observability_event(
+            stage="verse_suggestions",
+            trace_kind="llm_response",
+            ts=ts,
+            call_id=call_id,
+            summary=(
+                "verse suggestions response parsed"
+                if suggestions is not None
+                else "verse suggestions response parse failed"
+            ),
+            data={
+                "raw_response": raw_text,
+                "raw_response_truncated": raw_truncated,
+                "parsed_json": {"suggestions": suggestions} if suggestions is not None else None,
+                "usage": {
+                    "input_tokens": _usage_attr(response, "input_tokens"),
+                    "output_tokens": _usage_attr(response, "output_tokens"),
+                    "cache_creation_input_tokens": _usage_attr(response, "cache_creation_input_tokens"),
+                    "cache_read_input_tokens": _usage_attr(response, "cache_read_input_tokens"),
+                },
+            },
+        )
         if suggestions is None:
             return
 
