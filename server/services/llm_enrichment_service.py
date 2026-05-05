@@ -750,6 +750,29 @@ def _google_translation_needs_refinement(
     return False
 
 
+def _google_translation_clearly_unusable(
+    spanish: str,
+    google_english: str,
+    *,
+    discourse_tag: str,
+    translation_register: str,
+) -> bool:
+    stripped = google_english.strip()
+    if not stripped:
+        return True
+    if _translation_looks_incomplete(stripped):
+        return True
+    if "?" in spanish and "?" not in google_english:
+        return True
+    if translation_register == "scripture" and " comes and " in stripped.lower():
+        return True
+    if translation_register == "scripture" and re.search(r"\bPentecostal\s+[A-Z][a-z]+\b", stripped):
+        return True
+    if len(spanish.split()) >= 18 and len(google_english.split()) <= 6:
+        return True
+    return False
+
+
 def _format_deferred_release_text(english: str, google_english: str) -> str:
     candidate = _normalize_translation(english, google_english) if english else ""
     google = _normalize_translation(google_english, google_english) if google_english else ""
@@ -1263,7 +1286,12 @@ class LLMEnrichmentService:
             "prompt_cache_reads": 0,
             "translation_refinement_triggered": 0,
             "translation_refinement_skipped": 0,
+            "repair_triggered": 0,
+            "repair_skipped_hidden_merge": 0,
         }
+
+    def _bump_metric(self, key: str, amount: int = 1) -> None:
+        self.metrics[key] = self.metrics.get(key, 0) + amount
 
     def enrich(
         self,
@@ -1768,11 +1796,28 @@ class LLMEnrichmentService:
                 self._church_id,
                 ts,
             )
+            self._bump_metric("merge_blocked_segment_structure")
             merge_with_previous = False
 
         sermon_mode = result.get("sermon_mode", "exposition")
         if sermon_mode not in _VALID_SERMON_MODES:
             sermon_mode = "exposition"
+
+        if not display_ready:
+            if terminal_incomplete:
+                self._bump_metric("display_suppressed_terminal_incomplete")
+            if not thought_complete:
+                self._bump_metric("display_suppressed_incomplete")
+            if continuation_required:
+                self._bump_metric("display_suppressed_continuation")
+            if source_quality == "fragmented":
+                self._bump_metric("display_suppressed_fragmented")
+            if discourse_tag == "quote_introduction":
+                self._bump_metric("display_suppressed_quote_intro")
+            if isinstance(display_ready_from_llm, bool) and not display_ready_from_llm:
+                self._bump_metric("display_suppressed_llm_false")
+        if merge_with_previous:
+            self._bump_metric("merge_requested")
 
         guard_google_english = google_english
         if merge_with_previous and history:
@@ -1831,24 +1876,39 @@ class LLMEnrichmentService:
             ts=ts,
         )
         if candidate_issues:
-            repair_options = await self._repair_translation_candidates(
-                spanish=spanish,
-                google_english=guard_google_english,
-                current_candidate=improved,
-                issues=candidate_issues,
-                translation_register=translation_register,
-                discourse_tag=discourse_tag,
-                ts=ts,
+            for issue in candidate_issues:
+                self._bump_metric(f"repair_issue_{issue}")
+            skip_hidden_merge_repair = (
+                merge_with_previous
+                and not _google_translation_clearly_unusable(
+                    spanish,
+                    guard_google_english,
+                    discourse_tag=discourse_tag,
+                    translation_register=translation_register,
+                )
             )
-            chosen_english, chosen_source, candidate_issues = self._select_best_translation(
-                google_english=guard_google_english,
-                improved=improved,
-                source_quality=source_quality,
-                translation_register=translation_register,
-                discourse_tag=discourse_tag,
-                ts=ts,
-                repair_options=repair_options,
-            )
+            if skip_hidden_merge_repair:
+                self._bump_metric("repair_skipped_hidden_merge")
+            else:
+                self._bump_metric("repair_triggered")
+                repair_options = await self._repair_translation_candidates(
+                    spanish=spanish,
+                    google_english=guard_google_english,
+                    current_candidate=improved,
+                    issues=candidate_issues,
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    ts=ts,
+                )
+                chosen_english, chosen_source, candidate_issues = self._select_best_translation(
+                    google_english=guard_google_english,
+                    improved=improved,
+                    source_quality=source_quality,
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    ts=ts,
+                    repair_options=repair_options,
+                )
 
         best_english = chosen_english
         if terminal_incomplete:
@@ -1860,7 +1920,7 @@ class LLMEnrichmentService:
                 self._church_id, ts, translation_register, discourse_tag, ",".join(candidate_issues),
             )
         if "reconstruction_risk" in candidate_issues:
-            self.metrics["reconstruction_risk"] += 1
+            self._bump_metric("reconstruction_risk")
 
         # (apply turn already acquired above — proceed directly to state mutation)
 
@@ -1980,6 +2040,7 @@ class LLMEnrichmentService:
                     "(display_ready=false continuation=%s quality=%s)",
                     self._church_id, ts, continuation_required, source_quality,
                 )
+                self._bump_metric("suppressed_translation_update")
 
             # Signal enrichment settled immediately in all cases so Google correction guard fires.
             try:
@@ -2275,6 +2336,7 @@ class LLMEnrichmentService:
                     "(no merge in %.1fs)",
                     self._church_id, ts, delay_s,
                 )
+                self._bump_metric("deferred_release_emitted")
                 # Always emit a release event when we time out a deferred caption,
                 # even if the text matches Google's original output. The client
                 # uses this event to clear pending-completion UI state.

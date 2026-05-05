@@ -726,14 +726,6 @@ class TestSessionCloseIncompleteMetadata:
                     merge_with_previous=True,
                     discourse_tag="answer_to_question",
                 ),
-                (
-                    "{"
-                    "\"literal_translation\": \"What is the proof that we are in the light? "
-                    "We have fellowship with one another.\", "
-                    "\"natural_translation\": \"What is the proof that we are in the light? "
-                    "We have fellowship with one another.\""
-                    "}"
-                ),
             ])
 
             class _Messages:
@@ -783,9 +775,10 @@ class TestSessionCloseIncompleteMetadata:
 
             await service.enrich("Tenemos comunión unos con otros.", "We have fellowship with one another.", 2000)
 
-            assert len(calls) == 2
+            assert len(calls) == 1
             assert service.metrics["translation_refinement_triggered"] == 0
             assert service.metrics["translation_refinement_skipped"] == 1
+            assert service.metrics["repair_skipped_hidden_merge"] == 1
 
         run(run_())
 
@@ -845,6 +838,7 @@ class TestSessionCloseIncompleteMetadata:
             assert service.metrics["translation_refinement_triggered"] == 1
 
         run(run_())
+
 
     def test_session_close_incomplete_flush_is_marked_terminal_incomplete(self):
         async def run_():
