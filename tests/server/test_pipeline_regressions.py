@@ -237,6 +237,14 @@ def make_json_result(
     ).replace("'", '"')
 
 
+def make_translation_only_result(improved_translation: str):
+    return (
+        "{"
+        f"\"improved_translation\": {improved_translation!r}"
+        "}"
+    ).replace("'", '"')
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -659,6 +667,118 @@ class TestSessionCloseIncompleteMetadata:
             assert fragment_translate_calls == [("es el mensaje que hemos", False)]
             assert sentence_translate_calls == [("es el mensaje que hemos", False)]
             assert any(event["type"] == "final_spanish" for event in events)
+
+        run(run_())
+
+    def test_translation_refinement_is_skipped_for_simple_clean_sentence(self):
+        async def run_():
+            calls = []
+
+            class _Messages:
+                async def create(self, **kwargs):
+                    calls.append(kwargs)
+                    usage = type(
+                        "Usage",
+                        (),
+                        {
+                            "input_tokens": 100,
+                            "output_tokens": 40,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    )()
+                    return type(
+                        "Resp",
+                        (),
+                        {"content": [type("Block", (), {"text": make_json_result("God is light.")})()], "usage": usage},
+                    )()
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = type("Client", (), {"messages": _Messages()})()
+
+            await service.enrich("Dios es luz.", "God is light.", 1000)
+
+            assert len(calls) == 1
+            assert service.metrics["translation_refinement_skipped"] == 1
+
+        run(run_())
+
+    def test_translation_refinement_runs_for_merge_repair(self):
+        async def run_():
+            calls = []
+            raws = deque(
+                [
+                    make_json_result(
+                        "We have fellowship with one another.",
+                        merge_with_previous=True,
+                        discourse_tag="answer_to_question",
+                    ),
+                    make_translation_only_result(
+                        "What is the proof that we are in the light? We have fellowship with one another."
+                    ),
+                ]
+            )
+
+            class _Messages:
+                async def create(self, **kwargs):
+                    calls.append(kwargs)
+                    usage = type(
+                        "Usage",
+                        (),
+                        {
+                            "input_tokens": 100,
+                            "output_tokens": 40,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    )()
+                    return type(
+                        "Resp",
+                        (),
+                        {"content": [type("Block", (), {"text": raws.popleft()})()], "usage": usage},
+                    )()
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._sentence_history.append(
+                ("¿Cuál es la prueba de que estamos en la luz?", "What is the proof that we are in the light?")
+            )
+            service._prev_discourse = {
+                "discourse_tag": "rhetorical_question",
+                "introduces_quote": False,
+                "thought_complete": True,
+                "continuation_required": False,
+                "source_quality": "clean",
+                "display_ready": True,
+            }
+            service._prev_sentence_ts = 1000
+            service._client = type("Client", (), {"messages": _Messages()})()
+
+            await service.enrich("Tenemos comunión unos con otros.", "We have fellowship with one another.", 2000)
+
+            assert len(calls) == 2
+            assert service.metrics["translation_refinement_triggered"] == 1
 
         run(run_())
 
@@ -1773,13 +1893,8 @@ class TestTranslationRepairFallback:
                 ),
                 (
                     0.01,
-                    (
-                        "{"
-                        "\"literal_translation\": \"What is the proof that we are in the light? "
-                        "We have fellowship with one another.\", "
-                        "\"natural_translation\": \"What is the proof that we are in the light? "
-                        "We have fellowship with one another.\""
-                        "}"
+                    make_translation_only_result(
+                        "What is the proof that we are in the light? We have fellowship with one another."
                     ),
                 ),
             ])
@@ -1841,6 +1956,10 @@ class TestTranslationRepairFallback:
                 ),
                 (
                     0.01,
+                    make_translation_only_result("We have fellowship with one another."),
+                ),
+                (
+                    0.01,
                     (
                         "{"
                         "\"literal_translation\": \"If we walk in the light as he is in the light, "
@@ -1896,6 +2015,10 @@ class TestTranslationRepairFallback:
                 (
                     0.01,
                     make_json_result("We have fellowship with one another."),
+                ),
+                (
+                    0.01,
+                    make_translation_only_result("We have fellowship with one another."),
                 ),
                 (
                     0.01,

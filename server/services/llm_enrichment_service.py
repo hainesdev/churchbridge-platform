@@ -46,62 +46,17 @@ class VerseScratchEntry:
     ts: int                   # wall-clock ms for client broadcast keying
 
 
-_SYSTEM_PROMPT_BASE = """\
+_STRUCTURAL_SYSTEM_PROMPT_BASE = """\
 You are a bilingual (Spanish/English) theological assistant helping a live church sermon translation system.
 
 {glossary_block}
 
-Your job is to analyze one sentence from a live Spanish sermon and return a JSON object with the fields below.
+Your job is to analyze one sentence from a live Spanish sermon and return a JSON object with the structural fields below.
 
 RULES:
 1. Output ONLY valid JSON. No prose, no markdown fences, no code blocks.
 
-2. improved_translation: provide a better English rendering than the Google Translate output if needed.
-   Preserve the preaching register — declarative, present tense, active voice where natural.
-   If Google's translation is already excellent, return it unchanged.
-   Prefer idiomatic English over literal calques for sermon expressions when meaning is clear.
-   Example: "por el vil metal" should be rendered as "for money" (or equivalent natural wording),
-   not "for the vile metal".
-   For anecdotal/narrative spans, resolve disfluencies into coherent spoken English:
-   - remove accidental immediate repetitions ("yo yo", "ya que ya que")
-   - preserve meaning and emphasis without duplicating filler words
-   - keep speaker references clear ("él", "usted") and avoid role confusion.
-   For rhetorical question/answer sequences, keep explicit Q/A structure in English:
-   - keep questions as clear direct questions
-   - when current line answers the prior rhetorical question, make the answer concise
-   - avoid blending the answer into unrelated trailing clauses.
-   Existential / vague fillers: phrases like "tiene que haber" ("there has to be one/someone")
-   assert existence without naming the referent. Do not substitute a concrete noun
-   ("a connection", "a reason") unless the Spanish names it — keep the same vagueness.
-   Common Spanish Pentecostal sermon interjections ("Santo", "Aleluya", "Gloria", "Amén") that appear
-   mid-sentence and disrupt grammatical flow should be silently removed from the translation — they are
-   STT artifacts of the preaching register, not content words.
-   When [PREVIOUS SENTENCE DISCOURSE] shows thought_complete: false, use that as context to interpret
-   the current sentence correctly. Do NOT include prior sentence content in improved_translation
-   unless merge_with_previous is true and [PREVIOUS SENTENCE — PENDING MERGE] is provided.
-   When [PREVIOUS SENTENCE DISCOURSE] shows discourse_tag: "rhetorical_question", the current sentence
-   is likely the answer. Keep improved_translation crisp and direct — it answers the previous question.
-   When [PREVIOUS SENTENCE DISCOURSE] shows introduces_quote: true, the current sentence is quoted
-   scripture. Use formal, present-tense, verbatim-cadence register in the translation.
-
-   SCRIPTURE FIDELITY: When translation_register is "scripture" or discourse_tag is "scripture_quote",
-   minimize stylistic rewriting. Prioritize accuracy over polish. Preserve the cadence and phrasing
-   of the original. Do NOT paraphrase, expand, or modernize. A slightly wooden but faithful rendering
-   is preferable to a smooth but approximate one.
-
-   CONDITIONAL CLAUSE INTEGRITY: When the source contains "Si..." (if...) constructions, ensure the
-   English conditional is structurally complete — the "if" clause must have a matching consequence.
-   If the source only contains the protasis (the "if" part) with no apodosis (the consequence),
-   set thought_complete: false and continuation_required: true. Do NOT fabricate a consequence.
-
-   SCRIPTURE SPEAKER ATTRIBUTION: When introducing a scripture quote, translate speaker introductions
-   naturally: "Juan dice" → "John says", never "Pentecostal John" or "John comes and says".
-   Any word that is clearly a STT noise prefix before a speaker name should be silently dropped.
-
-   LONG SENTENCE HANDLING: When [LONG SENTENCE] is flagged, prioritize structural accuracy over
-   polish. Preserve all clause relationships. Do not truncate or summarize.
-
-3. discourse_tag: classify the rhetorical function of this sentence. Choose exactly one:
+2. discourse_tag: classify the rhetorical function of this sentence. Choose exactly one:
    - "statement":          a declarative theological claim or exposition ("God is light")
    - "rhetorical_question": a question the preacher asks but answers themselves ("Who is he?")
    - "answer_to_question":  a direct answer to the preacher's own question ("Jesus Christ.")
@@ -111,16 +66,19 @@ RULES:
    - "transition":          moving between topics, passages, or sermon sections
    - "exhortation_appeal":  direct appeal to the congregation ("Come to him", "Do not be afraid")
 
-4. introduces_quote: true if this sentence contains a quote introduction marker such as:
+3. introduces_quote: true if this sentence contains a quote introduction marker such as:
    "Juan dice", "Pedro dice", "Pablo dice", "dice aquí", "dice la Biblia", "la Biblia dice",
    "como dice en", "versículo dice", "leemos que", "escrito está", "está escrito".
    false otherwise.
 
-5. thought_complete: true if this sentence expresses a complete thought on its own.
+4. thought_complete: true if this sentence expresses a complete thought on its own.
    false if it ends mid-clause — a preposition, subordinating conjunction, or relative pronoun
    with no resolution (e.g. "Porque anoche se acuerdan que él", "Si nosotros decimos que").
+   When the source contains "Si..." (if...) constructions, ensure the clause is structurally complete.
+   If the source only contains the protasis (the "if" part) with no consequence yet delivered,
+   set thought_complete: false and continuation_required: true. Do NOT fabricate completion.
 
-6. verse_detected: detect a Bible reference if the speaker explicitly announces or clearly quotes one
+5. verse_detected: detect a Bible reference if the speaker explicitly announces or clearly quotes one
    in any of these forms:
    - Chapter + verse:   "Juan 3:16", "Romanos 8, versículo 28", "Apocalipsis capítulo 1 versículo 5"
    - Chapter-only:      "primera de Juan, capítulo 1", "Salmos capítulo 22", "vamos a Mateo capítulo cinco"
@@ -143,7 +101,7 @@ RULES:
    specific verse text. The word "Pentecostés" alone is never a citation of Acts 2.
    Never hallucinate — if uncertain return null.
 
-8. sermon_mode: classify this sentence into exactly one of these modes:
+6. sermon_mode: classify this sentence into exactly one of these modes:
    - "scripture":    pastor is directly reading or reciting Bible text verbatim
    - "exposition":   explaining, commenting on, or unpacking a biblical passage
    - "illustration": personal story, anecdote, analogy, or parable — even if theological
@@ -152,19 +110,19 @@ RULES:
    - "exhortation":  emotional appeal, motivational call, altar invitation
    - "procedural":   logistics, worship direction, prayer cues (e.g. "please stand", "let us pray")
 
-9. Use English book names in all references (e.g. "John", "Romans", "Revelation").
-10. Infer chapter/verse from quoted text only when highly confident.
+7. Use English book names in all references (e.g. "John", "Romans", "Revelation").
+8. Infer chapter/verse from quoted text only when highly confident.
     When matching quoted Spanish verse text, use the Reina-Valera 1960 (RVR1960) as the
     primary reference to identify the correct book and verse before rendering canonical_english.
 
-11. continuation_required: true if the speaker's thought clearly requires more text to complete —
+9. continuation_required: true if the speaker's thought clearly requires more text to complete —
     stronger and more forward-looking than thought_complete.
     true: sentence ends mid-argument, introduces a list without completing it, ends with a
     conjunction or subject pronoun that sets up a predicate not yet delivered
     (e.g. "Porque anoche se acuerdan que él", "Si nosotros decimos que", "Y la razón es").
     false: sentence is a complete unit, even if brief.
 
-12. merge_with_previous: true ONLY when the caption stream was segmented incorrectly and the
+10. merge_with_previous: true ONLY when the caption stream was segmented incorrectly and the
     current sentence must be merged with the immediately preceding sentence to repair that split.
     This is a segmentation-repair signal, not a normal discourse or stylistic signal.
     Use true only when the previous and current sentences were split at the wrong boundary and would
@@ -185,28 +143,25 @@ RULES:
     - any case where separate stable segments plus in-place revision are acceptable
     - any case where merge would be stylistic preference rather than segmentation repair
     All other cases → false.
-    When true, you MUST write improved_translation as a fluent English rendering of the COMPLETE
-    repaired unit — the [PREVIOUS SENTENCE — PENDING MERGE] text PLUS the current sentence,
-    treated as one utterance. Do not translate only the current sentence.
 
-13. paragraph_break: true if this sentence opens a new major section, topic shift, or
+11. paragraph_break: true if this sentence opens a new major section, topic shift, or
     rhetorical phase. Triggers a visual separator on the display.
     true: shift from exposition to illustration, new scripture passage announced,
     transition from teaching to altar call, return from illustration to main point.
     false: continues the current rhetorical thread.
 
-14. source_quality: assess the apparent quality of the input Spanish text:
+12. source_quality: assess the apparent quality of the input Spanish text:
     "clean":      normal sermon speech, no obvious STT artifacts
     "noisy":      contains apparent repetitions, garbled tokens, or incomplete phonemes
     "fragmented": clearly an incomplete utterance, a mid-word cut, or structurally broken
 
-15. translation_register: the rendering register appropriate for this sentence:
+13. translation_register: the rendering register appropriate for this sentence:
     "scripture":   verbatim Bible text — formal, present tense, liturgical cadence
     "expository":  teaching or explanation — clear, accessible, present tense
     "narrative":   personal story or illustration — past tense, conversational
     "exhortation": direct appeal to the congregation — imperative, energetic
 
-16. display_ready: the authoritative emission control signal for this sentence.
+14. display_ready: the authoritative emission control signal for this sentence.
     Set to false when ANY of the following apply:
     - thought_complete is false
     - continuation_required is true
@@ -218,7 +173,6 @@ RULES:
 
 JSON schema (return exactly this shape):
 {
-  "improved_translation": "string",
   "discourse_tag": "statement" | "rhetorical_question" | "answer_to_question" | "quote_introduction" | "scripture_quote" | "transition" | "exhortation_appeal",
   "introduces_quote": true | false,
   "thought_complete": true | false,
@@ -239,6 +193,45 @@ JSON schema (return exactly this shape):
     "reference": "string",
     "confidence": "explicit" | "quoted"
   } | null
+}\
+"""
+
+
+_TRANSLATION_SYSTEM_BASE = """\
+You are a bilingual (Spanish/English) theological translation assistant helping a live church sermon translation system.
+
+{glossary_block}
+
+Your job is to improve the English rendering for one live sermon sentence after structural decisions were already made.
+
+RULES:
+1. Output ONLY valid JSON. No prose, no markdown fences, no code blocks.
+2. Return one field only: improved_translation.
+3. Provide a better English rendering than the Google Translate output only when needed.
+   If Google's translation is already excellent, return it unchanged.
+4. Preserve the preaching register — declarative, present tense, active voice where natural.
+5. Prefer idiomatic English over literal calques when meaning is clear.
+   Example: "por el vil metal" should be rendered as "for money", not "for the vile metal".
+6. For anecdotal or narrative spans, resolve accidental repetitions and disfluencies into coherent spoken English.
+7. Preserve rhetorical question and answer structure.
+8. Existential or vague fillers such as "tiene que haber" should stay vague unless the Spanish names the referent.
+9. Common Spanish Pentecostal interjections ("Santo", "Aleluya", "Gloria", "Amén") that interrupt grammar may be removed.
+10. When [PREVIOUS SENTENCE DISCOURSE] shows thought_complete: false, use that as context to interpret
+    the current sentence correctly. Do NOT include prior sentence content in improved_translation
+    unless merge_with_previous is true and [PREVIOUS SENTENCE — PENDING MERGE] is provided.
+11. When [PREVIOUS SENTENCE DISCOURSE] shows discourse_tag: "rhetorical_question", the current sentence
+    is likely the answer. Keep improved_translation crisp and direct.
+12. When [PREVIOUS SENTENCE DISCOURSE] shows introduces_quote: true, the current sentence is quoted
+    scripture. Use formal, present-tense, verbatim-cadence register.
+13. When translation_register is "scripture" or discourse_tag is "scripture_quote", prioritize fidelity over polish.
+    Do NOT paraphrase, expand, or modernize.
+14. When [LONG SENTENCE] is flagged, preserve all clause relationships. Do not truncate or summarize.
+15. If merge_with_previous is true, improved_translation MUST cover the COMPLETE repaired unit:
+    the [PREVIOUS SENTENCE — PENDING MERGE] text PLUS the current sentence as one utterance.
+
+JSON schema:
+{
+  "improved_translation": "string"
 }\
 """
 
@@ -807,7 +800,7 @@ def _build_alignment_request_message(
     return "\n\n".join(parts)
 
 
-def _build_system_prompt(church_terms: dict[str, str]) -> str:
+def _build_prompt(base_prompt: str, church_terms: dict[str, str]) -> str:
     if church_terms:
         lines = "\n".join(f"  {es} → {en}" for es, en in church_terms.items())
         glossary_block = (
@@ -816,7 +809,15 @@ def _build_system_prompt(church_terms: dict[str, str]) -> str:
         )
     else:
         glossary_block = ""
-    return _SYSTEM_PROMPT_BASE.replace("{glossary_block}", glossary_block)
+    return base_prompt.replace("{glossary_block}", glossary_block)
+
+
+def _build_structural_system_prompt(church_terms: dict[str, str]) -> str:
+    return _build_prompt(_STRUCTURAL_SYSTEM_PROMPT_BASE, church_terms)
+
+
+def _build_translation_system_prompt(church_terms: dict[str, str]) -> str:
+    return _build_prompt(_TRANSLATION_SYSTEM_BASE, church_terms)
 
 
 def _normalize_segment_structure(stt_context: dict | None) -> dict:
@@ -1049,6 +1050,81 @@ def _build_user_message(
     )
 
 
+def _build_translation_message_blocks(
+    spanish: str,
+    google_english: str,
+    sentence_history: list[tuple[str, str]],
+    active_passage: dict | None,
+    prev_discourse: dict | None,
+    *,
+    discourse_tag: str,
+    translation_register: str,
+    merge_with_previous: bool,
+    sermon_mode: str,
+    source_quality: str,
+) -> list[dict[str, object]]:
+    prefix_parts: list[str] = [
+        "[STRUCTURAL DECISIONS]\n"
+        f"discourse_tag: {discourse_tag}\n"
+        f"translation_register: {translation_register}\n"
+        f"merge_with_previous: {str(merge_with_previous).lower()}\n"
+        f"sermon_mode: {sermon_mode}\n"
+        f"source_quality: {source_quality}"
+    ]
+
+    if active_passage:
+        prefix_parts.append(
+            f"[ACTIVE PASSAGE]\n"
+            f"The preacher is currently expounding: "
+            f"{active_passage['reference']} — {active_passage['canonical_english']}"
+        )
+
+    if prev_discourse:
+        tag = prev_discourse.get("discourse_tag", "statement")
+        introduces = prev_discourse.get("introduces_quote", False)
+        complete = prev_discourse.get("thought_complete", True)
+        continuation = prev_discourse.get("continuation_required", False)
+        quality = prev_discourse.get("source_quality", "clean")
+        ready = prev_discourse.get("display_ready", True)
+        prefix_parts.append(
+            f"[PREVIOUS SENTENCE DISCOURSE]\n"
+            f"discourse_tag: {tag}\n"
+            f"introduces_quote: {str(introduces).lower()}\n"
+            f"thought_complete: {str(complete).lower()}\n"
+            f"continuation_required: {str(continuation).lower()}\n"
+            f"source_quality: {quality}\n"
+            f"display_ready: {str(ready).lower()}"
+        )
+        if merge_with_previous and sentence_history:
+            prev_sp, prev_en = sentence_history[-1]
+            prefix_parts.append(
+                f"[PREVIOUS SENTENCE — PENDING MERGE]\n"
+                f"  ES: {prev_sp}\n"
+                f"  EN: {prev_en}"
+            )
+
+    suffix_parts: list[str] = []
+    word_count = len(spanish.split())
+    if word_count > 25:
+        suffix_parts.append(
+            f"[LONG SENTENCE — {word_count} words]\n"
+            f"This is a long sentence ({word_count} words). "
+            f"Preserve all clause relationships. Do not truncate or summarize."
+        )
+    suffix_parts.append(f"[SOURCE — Spanish original]\n{spanish}")
+    suffix_parts.append(f"[GOOGLE TRANSLATION — may need improvement]\n{google_english}")
+
+    blocks: list[dict[str, object]] = [
+        {
+            "type": "text",
+            "text": "\n\n".join(prefix_parts),
+            "cache_control": _PROMPT_CACHE_CONTROL,
+        },
+        {"type": "text", "text": "\n\n".join(suffix_parts)},
+    ]
+    return blocks
+
+
 class LLMEnrichmentService:
     """Post-translation enrichment via Claude structured output.
 
@@ -1094,7 +1170,8 @@ class LLMEnrichmentService:
         self._on_caption_merge = on_caption_merge
         self._on_segment_metadata = on_segment_metadata
         self._session_id = session_id
-        self._system_prompt = _build_system_prompt(church_terms)
+        self._structural_system_prompt = _build_structural_system_prompt(church_terms)
+        self._translation_system_prompt = _build_translation_system_prompt(church_terms)
         self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self._tasks: list[asyncio.Task] = []
         # Serializes post-completion state mutations so concurrent tasks that finish
@@ -1159,6 +1236,8 @@ class LLMEnrichmentService:
             "long_sentence_handled_count": 0,   # sentences > 25 words sent to LLM
             "prompt_cache_writes": 0,
             "prompt_cache_reads": 0,
+            "translation_refinement_triggered": 0,
+            "translation_refinement_skipped": 0,
         }
 
     def enrich(
@@ -1336,6 +1415,75 @@ class LLMEnrichmentService:
             "literal_translation": str(result.get("literal_translation", "")).strip(),
             "natural_translation": str(result.get("natural_translation", "")).strip(),
         }
+
+    def _should_run_translation_refinement(
+        self,
+        *,
+        spanish: str,
+        google_english: str,
+        discourse_tag: str,
+        thought_complete: bool,
+        continuation_required: bool,
+        merge_with_previous: bool,
+        source_quality: str,
+        translation_register: str,
+        sermon_mode: str,
+        terminal_incomplete: bool,
+    ) -> bool:
+        if terminal_incomplete:
+            return False
+        if merge_with_previous:
+            return True
+        if not thought_complete or continuation_required:
+            return False
+        if source_quality != "clean":
+            return True
+        if translation_register != "expository":
+            return True
+        if sermon_mode in {"illustration", "application", "exhortation"}:
+            return True
+        if discourse_tag in {"scripture_quote", "answer_to_question"}:
+            return True
+        if len(spanish.split()) >= 14 or len(google_english.split()) >= 14:
+            return True
+        return False
+
+    async def _run_translation_refinement(
+        self,
+        *,
+        spanish: str,
+        google_english: str,
+        sentence_history: list[tuple[str, str]],
+        active_passage: dict | None,
+        prev_discourse: dict | None,
+        discourse_tag: str,
+        translation_register: str,
+        merge_with_previous: bool,
+        sermon_mode: str,
+        source_quality: str,
+        ts: int,
+    ) -> str:
+        result = await self._create_json_response(
+            system=self._translation_system_prompt,
+            user_message=_build_translation_message_blocks(
+                spanish,
+                google_english,
+                sentence_history,
+                active_passage,
+                prev_discourse,
+                discourse_tag=discourse_tag,
+                translation_register=translation_register,
+                merge_with_previous=merge_with_previous,
+                sermon_mode=sermon_mode,
+                source_quality=source_quality,
+            ),
+            ts=ts,
+            stage="translation_refinement",
+            max_tokens=700,
+        )
+        if result is None:
+            return ""
+        return str(result.get("improved_translation", "")).strip()
 
     async def _generate_phrase_alignment(
         self,
@@ -1527,10 +1675,10 @@ class LLMEnrichmentService:
 
         try:
             result = await self._create_json_response(
-                system=self._system_prompt,
+                system=self._structural_system_prompt,
                 user_message=user_blocks,
                 ts=ts,
-                stage="enrichment",
+                stage="structural",
             )
         except asyncio.CancelledError:
             await self._finish_apply_turn(ts)
@@ -1593,7 +1741,49 @@ class LLMEnrichmentService:
         if merge_with_previous and history:
             guard_google_english = f"{history[-1][1]} {google_english}".strip()
 
-        improved = result.get("improved_translation", "").strip()
+        improved = str(result.get("improved_translation", "")).strip()
+        if self._should_run_translation_refinement(
+            spanish=spanish,
+            google_english=guard_google_english,
+            discourse_tag=discourse_tag,
+            thought_complete=thought_complete,
+            continuation_required=continuation_required,
+            merge_with_previous=merge_with_previous,
+            source_quality=source_quality,
+            translation_register=translation_register,
+            sermon_mode=sermon_mode,
+            terminal_incomplete=terminal_incomplete,
+        ):
+            self.metrics["translation_refinement_triggered"] += 1
+            try:
+                refined = await self._run_translation_refinement(
+                    spanish=spanish,
+                    google_english=guard_google_english,
+                    sentence_history=history,
+                    active_passage=active_passage,
+                    prev_discourse=prev_discourse,
+                    discourse_tag=discourse_tag,
+                    translation_register=translation_register,
+                    merge_with_previous=merge_with_previous,
+                    sermon_mode=sermon_mode,
+                    source_quality=source_quality,
+                    ts=ts,
+                )
+                if refined:
+                    improved = refined
+            except asyncio.CancelledError:
+                await self._finish_apply_turn(ts)
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[enrichment:%s] translation refinement failed for ts=%d: %s",
+                    self._church_id,
+                    ts,
+                    e,
+                )
+        else:
+            self.metrics["translation_refinement_skipped"] += 1
+
         chosen_english, chosen_source, candidate_issues = self._select_best_translation(
             google_english=guard_google_english,
             improved=improved,
