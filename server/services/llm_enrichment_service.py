@@ -725,6 +725,31 @@ def _translation_looks_incomplete(text: str) -> bool:
     return False
 
 
+def _google_translation_needs_refinement(
+    spanish: str,
+    google_english: str,
+    *,
+    discourse_tag: str,
+    translation_register: str,
+) -> bool:
+    stripped = google_english.strip()
+    if not stripped:
+        return True
+    if _translation_looks_incomplete(stripped):
+        return True
+    if discourse_tag == "answer_to_question" and len(stripped.split()) > 10:
+        return True
+    if translation_register == "scripture" and " comes and " in stripped.lower():
+        return True
+    if translation_register == "scripture" and re.search(r"\bPentecostal\s+[A-Z][a-z]+\b", stripped):
+        return True
+    if "?" in spanish and "?" not in google_english:
+        return True
+    if len(spanish.split()) >= 18 and len(google_english.split()) <= 6:
+        return True
+    return False
+
+
 def _format_deferred_release_text(english: str, google_english: str) -> str:
     candidate = _normalize_translation(english, google_english) if english else ""
     google = _normalize_translation(google_english, google_english) if google_english else ""
@@ -1421,6 +1446,7 @@ class LLMEnrichmentService:
         *,
         spanish: str,
         google_english: str,
+        display_ready: bool,
         discourse_tag: str,
         thought_complete: bool,
         continuation_required: bool,
@@ -1432,19 +1458,30 @@ class LLMEnrichmentService:
     ) -> bool:
         if terminal_incomplete:
             return False
+        if not display_ready:
+            return False
         if merge_with_previous:
-            return True
+            return False
         if not thought_complete or continuation_required:
             return False
         if source_quality != "clean":
+            return False
+        if _google_translation_needs_refinement(
+            spanish,
+            google_english,
+            discourse_tag=discourse_tag,
+            translation_register=translation_register,
+        ):
             return True
-        if translation_register != "expository":
+        if translation_register == "scripture":
             return True
-        if sermon_mode in {"illustration", "application", "exhortation"}:
+        if discourse_tag == "scripture_quote":
             return True
-        if discourse_tag in {"scripture_quote", "answer_to_question"}:
+        if sermon_mode in {"illustration", "application", "exhortation"} and len(spanish.split()) >= 16:
             return True
-        if len(spanish.split()) >= 14 or len(google_english.split()) >= 14:
+        if discourse_tag == "answer_to_question" and len(google_english.split()) <= 8:
+            return True
+        if len(spanish.split()) >= 22 and len(google_english.split()) >= 12:
             return True
         return False
 
@@ -1745,6 +1782,7 @@ class LLMEnrichmentService:
         if self._should_run_translation_refinement(
             spanish=spanish,
             google_english=guard_google_english,
+            display_ready=display_ready,
             discourse_tag=discourse_tag,
             thought_complete=thought_complete,
             continuation_required=continuation_required,
