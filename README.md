@@ -4,6 +4,16 @@ A discourse-aware real-time sermon interpreter. Accepts live Spanish sermon audi
 
 The system does not simply translate sentences as they arrive. It holds partial utterances until it is confident a thought is complete, uses an LLM to classify discourse structure and detect when fragments should be merged, suppresses incomplete captions until they can be finalised, and corrects itself retroactively via caption merges.
 
+## Documentation map
+
+Use these entry points depending on what you are trying to do:
+
+- Project/docs index: [`docs/README.md`](docs/README.md)
+- Deployment and production operations: [`DEPLOYMENT.md`](DEPLOYMENT.md)
+- Testing and benchmarks: [`TESTING_AND_BENCHMARKS.md`](TESTING_AND_BENCHMARKS.md)
+- Technical directive and architecture guardrails: [`DIRECTIVE.md`](DIRECTIVE.md)
+- Topic-tracker semantic memory plan: [`docs/plans/topic-tracker-semantic-memory-plan.md`](docs/plans/topic-tracker-semantic-memory-plan.md)
+
 ## How the pipeline works
 
 ```
