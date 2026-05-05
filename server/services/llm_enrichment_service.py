@@ -1288,10 +1288,85 @@ class LLMEnrichmentService:
             "translation_refinement_skipped": 0,
             "repair_triggered": 0,
             "repair_skipped_hidden_merge": 0,
+            "merge_chain_opened": 0,
+            "merge_chain_extended": 0,
+            "merge_chain_closed": 0,
+            "deferred_release_cancelled_for_merge": 0,
         }
 
     def _bump_metric(self, key: str, amount: int = 1) -> None:
         self.metrics[key] = self.metrics.get(key, 0) + amount
+
+    def _pending_reason(
+        self,
+        *,
+        display_ready: bool,
+        merge_with_previous: bool,
+        terminal_incomplete: bool,
+        thought_complete: bool,
+        continuation_required: bool,
+        source_quality: str,
+        discourse_tag: str,
+    ) -> str | None:
+        if merge_with_previous:
+            return "merge_with_previous"
+        if terminal_incomplete:
+            return "terminal_incomplete"
+        if continuation_required:
+            return "continuation_required"
+        if not thought_complete:
+            return "thought_incomplete"
+        if source_quality == "fragmented":
+            return "fragmented_source"
+        if discourse_tag == "quote_introduction":
+            return "quote_introduction"
+        if not display_ready:
+            return "llm_suppressed"
+        return None
+
+    def _chain_debug_metadata(
+        self,
+        *,
+        ts: int,
+        display_ready: bool,
+        merge_with_previous: bool,
+        terminal_incomplete: bool,
+        thought_complete: bool,
+        continuation_required: bool,
+        source_quality: str,
+        discourse_tag: str,
+    ) -> dict[str, object]:
+        pending_reason = self._pending_reason(
+            display_ready=display_ready,
+            merge_with_previous=merge_with_previous,
+            terminal_incomplete=terminal_incomplete,
+            thought_complete=thought_complete,
+            continuation_required=continuation_required,
+            source_quality=source_quality,
+            discourse_tag=discourse_tag,
+        )
+
+        chain = self._merge_chain_head
+        if merge_with_previous and chain is not None:
+            chain_state = "merge_chain"
+            chain_head_ts = int(chain.get("head_ts", ts))
+            chain_length = int(chain.get("length", 2))
+        elif pending_reason is not None:
+            chain_state = "deferred_pending"
+            chain_head_ts = ts
+            chain_length = 1
+        else:
+            chain_state = "stable_single"
+            chain_head_ts = ts
+            chain_length = 1
+
+        return {
+            "chain_state": chain_state,
+            "chain_head_ts": chain_head_ts,
+            "chain_length": chain_length,
+            "pending_reason": pending_reason,
+            "released_from_fallback": False,
+        }
 
     def enrich(
         self,
@@ -2081,11 +2156,13 @@ class LLMEnrichmentService:
                     chain_spanish = chain["spanish"] + " " + spanish
                     chain_len = chain["length"] + 1
                     head_ts = chain["head_ts"]
+                    self._bump_metric("merge_chain_extended")
 
                     # Cancel deferred update for the fragment being absorbed (current ts).
                     if ts in self._deferred_updates:
                         _, dt = self._deferred_updates.pop(ts)
                         dt.cancel()
+                        self._bump_metric("deferred_release_cancelled_for_merge")
                         logger.info(
                             "[enrichment:%s] decision=merge_cancelled_deferred_update absorbed=%d",
                             self._church_id, ts,
@@ -2127,12 +2204,14 @@ class LLMEnrichmentService:
                     # Starting a new segmentation-repair chain — prev_ts becomes the head anchor; current ts absorbed.
                     prev_spanish = hist[-2][0] if len(hist) >= 2 else spanish
                     chain_spanish = prev_spanish + " " + spanish
+                    self._bump_metric("merge_chain_opened")
 
                     # Cancel deferreds for both the head (prev_ts) and the absorbed sentence (ts).
                     for cancel_ts in (prev_ts, ts):
                         if cancel_ts in self._deferred_updates:
                             _, dt = self._deferred_updates.pop(cancel_ts)
                             dt.cancel()
+                            self._bump_metric("deferred_release_cancelled_for_merge")
                             logger.info(
                                 "[enrichment:%s] decision=merge_cancelled_deferred_update "
                                 "cancelled=%d",
@@ -2167,6 +2246,7 @@ class LLMEnrichmentService:
             else:
                 # No merge — reset chain.
                 if self._merge_chain_head is not None:
+                    self._bump_metric("merge_chain_closed")
                     logger.debug(
                         "[enrichment:%s] Chain closed at ts=%d (display_ready=%s, merge=%s)",
                         self._church_id, ts, display_ready, merge_with_previous,
@@ -2185,6 +2265,18 @@ class LLMEnrichmentService:
                     "pending_completion": pending_completion,
                     "terminal_incomplete": terminal_incomplete,
                 }
+                metadata.update(
+                    self._chain_debug_metadata(
+                        ts=ts,
+                        display_ready=display_ready,
+                        merge_with_previous=merge_with_previous,
+                        terminal_incomplete=terminal_incomplete,
+                        thought_complete=thought_complete,
+                        continuation_required=continuation_required,
+                        source_quality=source_quality,
+                        discourse_tag=discourse_tag,
+                    )
+                )
                 try:
                     await self._on_segment_metadata(ts, metadata)
                 except Exception as e:

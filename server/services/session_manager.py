@@ -1255,6 +1255,7 @@ class SessionManager:
     def __init__(self, broadcaster: Broadcaster):
         self._broadcaster = broadcaster
         self._sessions: dict[str, ServiceSession] = {}
+        self._recent_stats: dict[str, dict] = {}
 
     async def create(
         self,
@@ -1267,7 +1268,9 @@ class SessionManager:
         stt_config: STTConfig | None = None,
     ) -> ServiceSession:
         if church_id in self._sessions:
-            await self._sessions[church_id].close()
+            prior = self._sessions[church_id]
+            self._recent_stats[church_id] = prior.get_stats()
+            await prior.close()
 
         session = ServiceSession(church_id, ws, self._broadcaster)
         self._sessions[church_id] = session
@@ -1283,10 +1286,14 @@ class SessionManager:
     async def remove(self, church_id: str):
         session = self._sessions.pop(church_id, None)
         if session:
+            self._recent_stats[church_id] = session.get_stats()
             await session.close()
 
     def get(self, church_id: str) -> ServiceSession | None:
         return self._sessions.get(church_id)
+
+    def get_last_stats(self, church_id: str) -> dict:
+        return dict(self._recent_stats.get(church_id, {}))
 
 
 def _now() -> int:

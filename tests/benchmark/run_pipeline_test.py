@@ -211,6 +211,35 @@ def resolve_ws_base_url(server_port: int | None = None, server_base_url: str = "
     return f"ws://localhost:{server_port}"
 
 
+def resolve_http_base_url(server_port: int | None = None, server_base_url: str = "") -> str:
+    raw = server_base_url.strip()
+    if raw:
+        parsed = urlparse(raw)
+        if parsed.scheme in {"http", "https"}:
+            return raw.rstrip("/")
+        if parsed.scheme in {"ws", "wss"}:
+            http_scheme = "https" if parsed.scheme == "wss" else "http"
+            return f"{http_scheme}://{parsed.netloc}".rstrip("/")
+        raise ValueError(f"Unsupported server base URL: {server_base_url}")
+
+    if server_port is None:
+        raise ValueError("server_port is required when server_base_url is not provided")
+    return f"http://localhost:{server_port}"
+
+
+async def fetch_session_stats(
+    church_id: str,
+    server_port: int | None = None,
+    server_base_url: str = "",
+) -> dict:
+    http_base_url = resolve_http_base_url(server_port=server_port, server_base_url=server_base_url)
+    stats_url = f"{http_base_url}/api/churches/{church_id}/stats"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(stats_url, timeout=5.0)
+        response.raise_for_status()
+        return response.json()
+
+
 async def run_pipeline(
     samples: np.ndarray,
     sample_rate: int,
@@ -219,8 +248,8 @@ async def run_pipeline(
     server_base_url: str = "",
     stt_config: dict | None = None,
     client_profile: str = "benchmark",
-) -> tuple[list[dict], float, dict]:
-    """Stream audio through the live pipeline and return (all_messages, wall_time_s, transport)."""
+) -> tuple[list[dict], float, dict, dict]:
+    """Stream audio through the live pipeline and return messages, wall time, transport, and stats."""
     import websockets  # noqa: PLC0415
 
     ws_base_url = resolve_ws_base_url(server_port=server_port, server_base_url=server_base_url)
@@ -236,6 +265,7 @@ async def run_pipeline(
     session_started = asyncio.Event()
     idle_drain_s = IDLE_DRAIN_S
     chunk_n = int(sample_rate * CHUNK_MS / 1000)
+    session_stats: dict | None = None
     transport = {
         "client_profile": client_profile,
         "ws_base_url": ws_base_url,
@@ -253,7 +283,7 @@ async def run_pipeline(
     }
 
     async def listen() -> None:
-        nonlocal last_msg_at
+        nonlocal last_msg_at, session_stats
         async with websockets.connect(display_url) as ws:
             transport["display_connected_at_s"] = round(time.monotonic() - test_start, 3)
             listener_ready.set()
@@ -264,6 +294,14 @@ async def run_pipeline(
                     data["_elapsed_s"] = round(time.monotonic() - test_start, 3)
                     messages.append(data)
                     last_msg_at = time.monotonic()
+                    if audio_done.is_set():
+                        stats_snapshot = await fetch_session_stats(
+                            church_id,
+                            server_port=server_port,
+                            server_base_url=server_base_url,
+                        )
+                        if stats_snapshot.get("active"):
+                            session_stats = stats_snapshot
 
                     kind = data.get("type", "?")
                     preview = data.get("text") or data.get("spanish") or ""
@@ -271,6 +309,12 @@ async def run_pipeline(
 
                 except asyncio.TimeoutError:
                     if audio_done.is_set() and time.monotonic() - last_msg_at >= idle_drain_s:
+                        if session_stats is None:
+                            session_stats = await fetch_session_stats(
+                                church_id,
+                                server_port=server_port,
+                                server_base_url=server_base_url,
+                            )
                         stop_listener.set()
                 except Exception as exc:
                     transport["display_disconnect_count"] += 1
@@ -334,7 +378,13 @@ async def run_pipeline(
 
     await stream()
     await listener_task
-    return messages, round(time.monotonic() - test_start, 1), transport
+    if session_stats is None:
+        session_stats = await fetch_session_stats(
+            church_id,
+            server_port=server_port,
+            server_base_url=server_base_url,
+        )
+    return messages, round(time.monotonic() - test_start, 1), transport, session_stats
 
 
 def build_result(
@@ -351,6 +401,7 @@ def build_result(
     note: str,
     stt_config: dict | None = None,
     transport: dict | None = None,
+    session_stats: dict | None = None,
     client_profile: str = "benchmark",
 ) -> dict:
     stt_finals = [m for m in messages if m["type"] == "stt_final"]
@@ -376,6 +427,7 @@ def build_result(
         "client_profile": client_profile,
         "stt_config": stt_config or {},
         "transport": transport or {},
+        "session_stats": session_stats or {},
         "wall_time_s": wall_s,
         "srt_reference": {
             "segments": len(ref_segments),
@@ -519,6 +571,27 @@ def print_report(result: dict) -> None:
         for item in meta:
             filtered = {k: v for k, v in item.items() if not k.startswith("_") and k != "type"}
             print(f"    ts={item.get('ts')}: {filtered}")
+
+    enrichment = (result.get("session_stats") or {}).get("enrichment") or {}
+    if enrichment:
+        print("\n  Enrichment Stats:")
+        for key in (
+            "merge_requested",
+            "merge_blocked_segment_structure",
+            "merge_chain_opened",
+            "merge_chain_extended",
+            "merge_chain_closed",
+            "repair_triggered",
+            "repair_skipped_hidden_merge",
+            "suppressed_translation_update",
+            "deferred_release_emitted",
+            "deferred_release_cancelled_for_merge",
+            "display_suppressed_quote_intro",
+            "display_suppressed_continuation",
+            "display_suppressed_fragmented",
+        ):
+            if key in enrichment:
+                print(f"    {key}: {enrichment[key]}")
 
     modes = result["layers"]["mode_changes"]
     if modes:
@@ -670,7 +743,7 @@ async def main() -> None:
             print("Server ready.\n")
 
         print("Streaming audio through pipeline...")
-        messages, wall_s, transport = await run_pipeline(
+        messages, wall_s, transport, session_stats = await run_pipeline(
             samples,
             sample_rate,
             church_id,
@@ -702,6 +775,7 @@ async def main() -> None:
         note=args.note,
         stt_config=stt_config,
         transport=transport,
+        session_stats=session_stats,
         client_profile=args.client_profile,
     )
 

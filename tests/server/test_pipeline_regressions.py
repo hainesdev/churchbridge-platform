@@ -504,6 +504,11 @@ class TestTerminalIncompleteEnrichment:
                         "source_quality": "clean",
                         "pending_completion": True,
                         "terminal_incomplete": True,
+                        "chain_state": "deferred_pending",
+                        "chain_head_ts": 1000,
+                        "chain_length": 1,
+                        "pending_reason": "terminal_incomplete",
+                        "released_from_fallback": False,
                     },
                 )
             ]
@@ -670,6 +675,55 @@ class TestSessionCloseIncompleteMetadata:
             assert fragment_translate_calls == [("es el mensaje que hemos", False)]
             assert sentence_translate_calls == [("es el mensaje que hemos", False)]
             assert any(event["type"] == "final_spanish" for event in events)
+
+        run(run_())
+
+    def test_merge_segment_metadata_includes_chain_debug_fields(self):
+        async def run_():
+            metadata = []
+
+            async def on_segment_metadata(ts, payload):
+                metadata.append((ts, payload))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=lambda *args: asyncio.sleep(0),
+                on_segment_metadata=on_segment_metadata,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "primero": (0.01, make_json_result("First")),
+                "segundo": (0.01, make_json_result("Merged second", merge_with_previous=True)),
+            })
+
+            await service.enrich("primero", "First", 1000)
+            await service.enrich("segundo", "Second", 2000)
+
+            assert metadata[1] == (
+                2000,
+                {
+                    "translation_register": "expository",
+                    "paragraph_break": False,
+                    "source_quality": "clean",
+                    "pending_completion": False,
+                    "terminal_incomplete": False,
+                    "chain_state": "merge_chain",
+                    "chain_head_ts": 1000,
+                    "chain_length": 2,
+                    "pending_reason": "merge_with_previous",
+                    "released_from_fallback": False,
+                },
+            )
+            assert service.metrics["merge_chain_opened"] == 1
+            assert service.metrics["deferred_release_cancelled_for_merge"] == 0
 
         run(run_())
 
@@ -1338,6 +1392,44 @@ class TestLowConfidenceHold:
             assert broadcasts[0]["low_confidence"] is True
 
         run(run_())
+
+
+class TestSessionStats:
+    def test_service_session_stats_include_chain_and_repair_metrics(self):
+        from server.services.session_manager import ServiceSession
+
+        session = ServiceSession.__new__(ServiceSession)
+        session._sentence_buffer = SimpleNamespace(
+            structural_flush_block_count=1,
+            forced_release_count=2,
+            conditional_flush_block_count=3,
+        )
+        session._enrichment = SimpleNamespace(metrics={
+            "merge_chain_opened": 4,
+            "merge_chain_extended": 5,
+            "repair_triggered": 6,
+            "repair_skipped_hidden_merge": 7,
+        })
+        session._stt_session = None
+        session._stt_noise_removed_count = 8
+        session._enrichment_settled = {1000, 2000}
+        session._db_session_id = 42
+        session._recorder = None
+
+        stats = session.get_stats()
+
+        assert stats["session_id"] == 42
+        assert stats["sentence_buffer"] == {
+            "structural_flush_block_count": 1,
+            "forced_release_count": 2,
+            "conditional_flush_block_count": 3,
+        }
+        assert stats["enrichment"]["merge_chain_opened"] == 4
+        assert stats["enrichment"]["merge_chain_extended"] == 5
+        assert stats["enrichment"]["repair_triggered"] == 6
+        assert stats["enrichment"]["repair_skipped_hidden_merge"] == 7
+        assert stats["stt_noise_removed_count"] == 8
+        assert stats["_enrichment_settled_size"] == 2
 
 
 class TestCodeSwitchingPassthrough:

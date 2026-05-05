@@ -119,7 +119,7 @@ async def get_session_stats(church_id: str):
         raise HTTPException(status_code=503, detail="Session manager not initialized")
     session = _session_manager.get(church_id)
     if session is None:
-        return {"active": False}
+        return {"active": False, **_session_manager.get_last_stats(church_id)}
     return {"active": True, **session.get_stats()}
 
 
