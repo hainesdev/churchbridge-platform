@@ -34,6 +34,7 @@ export interface SessionStats {
     repair_triggered: number;
     repair_skipped_hidden_merge: number;
     suppressed_translation_update: number;
+    suppressed_translation_update_for_merge: number;
     deferred_release_emitted: number;
     deferred_release_cancelled_for_merge: number;
     display_suppressed_terminal_incomplete: number;

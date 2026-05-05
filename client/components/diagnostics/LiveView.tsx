@@ -1,6 +1,6 @@
 'use client';
 import { useState } from 'react';
-import { useSessionStats } from '@/lib/useSessionStats';
+import { useSessionStats, type SessionStats } from '@/lib/useSessionStats';
 import { useEventLog } from '@/lib/useEventLog';
 import { LatencyBars } from './LatencyBars';
 import { EnrichmentHealth } from './EnrichmentHealth';
@@ -50,7 +50,7 @@ export function LiveView({ churchId }: LiveViewProps) {
     translation_to_enrichment: { p50: null, p90: null, count: 0 },
   };
 
-  const emptyEnrichment = {
+  const emptyEnrichment: SessionStats['enrichment'] = {
     noisy_input_detected: 0,
     reconstruction_risk: 0,
     parse_failed: 0,
@@ -60,6 +60,23 @@ export function LiveView({ churchId }: LiveViewProps) {
     fragment_merge_count: 0,
     long_sentence_handled_count: 0,
     merge_chain_max_length: 0,
+    merge_requested: 0,
+    merge_blocked_segment_structure: 0,
+    merge_chain_opened: 0,
+    merge_chain_extended: 0,
+    merge_chain_closed: 0,
+    repair_triggered: 0,
+    repair_skipped_hidden_merge: 0,
+    suppressed_translation_update: 0,
+    suppressed_translation_update_for_merge: 0,
+    deferred_release_emitted: 0,
+    deferred_release_cancelled_for_merge: 0,
+    display_suppressed_terminal_incomplete: 0,
+    display_suppressed_incomplete: 0,
+    display_suppressed_continuation: 0,
+    display_suppressed_fragmented: 0,
+    display_suppressed_quote_intro: 0,
+    display_suppressed_llm_false: 0,
   };
 
   const emptyBuffer = {
