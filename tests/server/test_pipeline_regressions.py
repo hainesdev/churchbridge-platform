@@ -1953,7 +1953,7 @@ class TestFollowUpPhraseAlignment:
 
 
 class TestMergeAlignmentReschedule:
-    def test_caption_merge_requests_fresh_alignment_for_kept_segment(self):
+    def test_caption_merge_does_not_request_alignment_immediately(self):
         async def run_():
             events = []
             alignment_requests = []
@@ -1995,15 +1995,7 @@ class TestMergeAlignmentReschedule:
                 "If we say that we have fellowship with him, but walk in darkness, we lie.",
             )
 
-            assert alignment_requests == [
-                {
-                    "ts": 1000,
-                    "spanish": "Si decimos que tenemos comuniÃ³n con Ã©l, pero andamos en tinieblas, mentimos.",
-                    "english": "If we say that we have fellowship with him, but walk in darkness, we lie.",
-                    "source_quality": "clean",
-                    "translation_register": "scripture",
-                }
-            ]
+            assert alignment_requests == []
             assert any(event["type"] == "caption_merge" for event in events)
 
         run(run_())

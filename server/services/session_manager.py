@@ -941,15 +941,6 @@ class ServiceSession:
                 reason="segmentation_repair",
                 phrase_alignment=None,
             )
-        if self._enrichment:
-            metadata = self._segment_metadata_cache.get(keep_ts, {})
-            self._enrichment.request_phrase_alignment(
-                ts=keep_ts,
-                spanish=merged_spanish,
-                english=merged_english,
-                source_quality=str(metadata.get("source_quality", "clean")),
-                translation_register=str(metadata.get("translation_register", "expository")),
-            )
 
     async def _on_segment_metadata(self, ts: int, metadata: dict):
         """Broadcast scaffolding metadata for a committed segment.
