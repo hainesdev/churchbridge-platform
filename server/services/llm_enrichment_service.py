@@ -1263,6 +1263,7 @@ class LLMEnrichmentService:
         # emissions when chain extends (prevents UI flickering on the head segment).
         self._last_emitted_translation: dict[int, str] = {}
         self._pending_alignment_tasks: dict[int, asyncio.Task] = {}
+        self._last_alignment_signature: dict[int, tuple[str, str]] = {}
 
         # Verse scratch pad — accumulates detections for temporal range consolidation
         self._verse_scratch: list[VerseScratchEntry] = []
@@ -1454,9 +1455,13 @@ class LLMEnrichmentService:
             return
         if english.endswith("...") or len(english.split()) < 2:
             return
+        signature = (spanish.strip(), english.strip())
+        if self._last_alignment_signature.get(ts) == signature:
+            return
         existing_task = self._pending_alignment_tasks.pop(ts, None)
         if existing_task is not None:
             existing_task.cancel()
+        self._last_alignment_signature[ts] = signature
         task = asyncio.create_task(
             self._generate_phrase_alignment(
                 ts=ts,
@@ -2749,6 +2754,7 @@ class LLMEnrichmentService:
         for alignment_task in list(self._pending_alignment_tasks.values()):
             alignment_task.cancel()
         self._pending_alignment_tasks.clear()
+        self._last_alignment_signature.clear()
         self._last_emitted_translation.clear()
         self._tasks = [task for task in self._tasks if not task.done()]
         if self._tasks:
