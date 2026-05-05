@@ -404,10 +404,11 @@ class TestDeferredRelease:
                 state_tracker=StubStateTracker(),
             )
 
-            task = asyncio.create_task(
-                service._deferred_translation_release(123, "Same text", "Same text")
+            task = service._schedule_deferred_release(
+                owner_ts=123,
+                english="Same text",
+                google_english="Same text",
             )
-            service._deferred_updates[123] = ("Same text", task)
             await asyncio.wait_for(task, timeout=7.5)
 
             assert updates == [(123, "Same text", None)]
@@ -429,14 +430,11 @@ class TestDeferredRelease:
                 state_tracker=StubStateTracker(),
             )
 
-            task = asyncio.create_task(
-                service._deferred_translation_release(
-                    456,
-                    "Now, let's understand this phrase by phrase, word by word, what",
-                    "Now, let's understand, phrase by phrase, word by word, what",
-                )
+            task = service._schedule_deferred_release(
+                owner_ts=456,
+                english="Now, let's understand this phrase by phrase, word by word, what",
+                google_english="Now, let's understand, phrase by phrase, word by word, what",
             )
-            service._deferred_updates[456] = ("placeholder", task)
             await asyncio.wait_for(task, timeout=7.5)
 
             assert updates == [
@@ -505,6 +503,7 @@ class TestTerminalIncompleteEnrichment:
                         "pending_completion": True,
                         "terminal_incomplete": True,
                         "chain_state": "deferred_pending",
+                        "chain_phase": "deferred_pending",
                         "chain_head_ts": 1000,
                         "chain_length": 1,
                         "pending_reason": "terminal_incomplete",
@@ -513,7 +512,7 @@ class TestTerminalIncompleteEnrichment:
                 )
             ]
             assert settled == [1000]
-            task = service._deferred_updates[1000][1]
+            task = service._deferred_updates[1000].task
             await asyncio.wait_for(task, timeout=7.5)
             assert updates == [
                 (1000, "Now, let's understand, phrase by phrase, word by word, what...", None)
@@ -548,6 +547,10 @@ class TestCorrectionSuppressedEvent:
             await session._on_correction(1000, "Late Google correction")
             # ts=2000 is not settled → should emit normal correction
             await session._on_correction(2000, "Normal correction")
+
+            # The feed_revision broadcast is debounced; drain so the test can
+            # assert against the actually-shipped events.
+            await session._flush_all_pending_feed_revisions()
 
             assert events == [
                 {"type": "correction_suppressed", "segment_id": 1000, "ts": 1000},
@@ -716,6 +719,7 @@ class TestSessionCloseIncompleteMetadata:
                     "pending_completion": False,
                     "terminal_incomplete": False,
                     "chain_state": "merge_chain",
+                    "chain_phase": "open_chain",
                     "chain_head_ts": 1000,
                     "chain_length": 2,
                     "pending_reason": "merge_with_previous",
@@ -724,6 +728,222 @@ class TestSessionCloseIncompleteMetadata:
             )
             assert service.metrics["merge_chain_opened"] == 1
             assert service.metrics["deferred_release_cancelled_for_merge"] == 0
+
+        run(run_())
+
+    def test_merge_chain_rehomes_deferred_release_to_head_owner(self):
+        async def run_():
+            updates = []
+            merges = []
+
+            async def on_caption_merge(absorb_ts, keep_ts, merged_spanish, merged_english):
+                merges.append((absorb_ts, keep_ts, merged_spanish, merged_english))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda ts, english, phrase_alignment=None: updates.append((ts, english, phrase_alignment)) or asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=on_caption_merge,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "Juan dice": (
+                    0.01,
+                    make_json_result(
+                        "John says",
+                        display_ready=False,
+                        thought_complete=False,
+                        continuation_required=True,
+                        discourse_tag="quote_introduction",
+                    ),
+                ),
+                "Dios es luz": (
+                    0.01,
+                    make_json_result(
+                        "God is light",
+                        merge_with_previous=True,
+                        discourse_tag="scripture_quote",
+                    ),
+                ),
+            })
+
+            await service.enrich("Juan dice", "John says", 1000)
+            first_task = service._deferred_updates[1000].task
+
+            await service.enrich("Dios es luz", "God is light", 2000)
+
+            assert list(service._deferred_updates.keys()) == [1000]
+            assert service._deferred_updates[1000].chain_owned is True
+            assert service._deferred_updates[1000].spanish == "Juan dice Dios es luz"
+            assert service._deferred_updates[1000].task is not first_task
+            assert 2000 not in service._deferred_updates
+            assert service.metrics["deferred_release_cancelled_for_merge"] == 1
+            assert all(ts != 2000 for ts, _, _ in updates), (
+                "absorbed segment must not emit its own translation_update; "
+                f"got {updates!r}"
+            )
+            assert merges == [(2000, 1000, "Juan dice Dios es luz", "John says God is light")]
+
+        run(run_())
+
+    def test_merge_segment_metadata_tracks_chain_extension_phase(self):
+        async def run_():
+            metadata = []
+
+            async def on_segment_metadata(ts, payload):
+                metadata.append((ts, payload))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=lambda *args: asyncio.sleep(0),
+                on_segment_metadata=on_segment_metadata,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "primero": (0.01, make_json_result("First")),
+                "segundo": (0.01, make_json_result("Merged second", merge_with_previous=True)),
+                "tercero": (
+                    0.01,
+                    make_json_result(
+                        "Merged third",
+                        merge_with_previous=True,
+                        discourse_tag="answer_to_question",
+                    ),
+                ),
+            })
+
+            await service.enrich("primero", "First", 1000)
+            await service.enrich("segundo", "Second", 2000)
+            await service.enrich("tercero", "Third", 3000)
+
+            assert metadata[2] == (
+                3000,
+                {
+                    "translation_register": "expository",
+                    "paragraph_break": False,
+                    "source_quality": "clean",
+                    "pending_completion": False,
+                    "terminal_incomplete": False,
+                    "chain_state": "merge_chain",
+                    "chain_phase": "extending_chain",
+                    "chain_head_ts": 1000,
+                    "chain_length": 3,
+                    "pending_reason": "merge_with_previous",
+                    "released_from_fallback": False,
+                },
+            )
+            assert service._active_chain is not None
+            assert service._active_chain.phase == "extending_chain"
+            assert service._active_chain.length == 3
+
+        run(run_())
+
+    def test_chain_action_classifier_distinguishes_open_extend_finalize_and_stable(self):
+        service = LLMEnrichmentService(
+            church_id="test",
+            church_terms={},
+            topic_tracker=StubTopicTracker(),
+            on_translation_update=lambda *args: asyncio.sleep(0),
+            on_verse_detected=lambda *args: asyncio.sleep(0),
+            on_verse_range_update=lambda *args: asyncio.sleep(0),
+            on_verse_suggestion=lambda *args: asyncio.sleep(0),
+            on_enrichment_settled=lambda *args: asyncio.sleep(0),
+            on_caption_merge=lambda *args: asyncio.sleep(0),
+            state_tracker=StubStateTracker(),
+        )
+
+        assert service._classify_chain_action(prev_ts=None, merge_with_previous=False) == "stable_single"
+        assert service._classify_chain_action(prev_ts=1000, merge_with_previous=True) == "open_chain"
+
+        service._set_active_chain(
+            head_ts=1000,
+            tail_ts=2000,
+            spanish="uno dos",
+            english="One two",
+            google_english="One two",
+            length=2,
+            source_quality="clean",
+            translation_register="expository",
+            discourse_tag="statement",
+            verse_detected=None,
+            phase="open_chain",
+        )
+
+        assert service._classify_chain_action(prev_ts=2000, merge_with_previous=True) == "extending_chain"
+        assert service._classify_chain_action(prev_ts=3000, merge_with_previous=False) == "finalizing_chain"
+
+    def test_finalizing_chain_action_closes_chain_and_schedules_alignment_once(self):
+        async def run_():
+            alignment_requests = []
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+            service._schedule_phrase_alignment = lambda **kwargs: alignment_requests.append(kwargs)
+            service._set_active_chain(
+                head_ts=1000,
+                tail_ts=2000,
+                spanish="uno dos",
+                english="One two",
+                google_english="One two",
+                length=2,
+                source_quality="clean",
+                translation_register="expository",
+                discourse_tag="statement",
+                verse_detected=None,
+                phase="open_chain",
+            )
+
+            await service._apply_chain_action(
+                chain_action="finalizing_chain",
+                prev_ts=2000,
+                ts=3000,
+                spanish="tres",
+                best_english="Three",
+                guard_google_english="Three",
+                source_quality="clean",
+                translation_register="expository",
+                discourse_tag="statement",
+                verse_detected=None,
+            )
+
+            assert service._active_chain is None
+            assert service.metrics["merge_chain_closed"] == 1
+            assert alignment_requests == [
+                {
+                    "ts": 1000,
+                    "spanish": "uno dos",
+                    "english": "One two",
+                    "google_english": "One two",
+                    "source_quality": "clean",
+                    "translation_register": "expository",
+                    "discourse_tag": "statement",
+                    "verse_detected": None,
+                    "merge_with_previous": False,
+                }
+            ]
 
         run(run_())
 
@@ -778,6 +998,111 @@ class TestSessionCloseIncompleteMetadata:
                 and request["english"] == "First Second"
                 for request in alignment_requests
             )
+
+        run(run_())
+
+    def test_absorbed_segment_translation_update_suppressed_during_merge_chain(self):
+        async def run_():
+            translation_updates = []
+            merges = []
+
+            async def on_translation_update(ts, english, alignment=None):
+                translation_updates.append((ts, english))
+
+            async def on_caption_merge(absorb_ts, keep_ts, merged_spanish, merged_english):
+                merges.append((absorb_ts, keep_ts, merged_spanish, merged_english))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=on_translation_update,
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=on_caption_merge,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._client = FakeAnthropicClient({
+                "primero": (0.01, make_json_result("First")),
+                "segundo": (
+                    0.01,
+                    make_json_result(
+                        "First Second merged",
+                        merge_with_previous=True,
+                        discourse_tag="answer_to_question",
+                    ),
+                ),
+                "tercero": (
+                    0.01,
+                    make_json_result(
+                        "First Second Third merged",
+                        merge_with_previous=True,
+                        discourse_tag="answer_to_question",
+                    ),
+                ),
+            })
+
+            await service.enrich("primero", "First", 1000)
+            assert translation_updates == [], (
+                "stable single with English==Google should not emit translation_update; "
+                f"got {translation_updates!r}"
+            )
+
+            await service.enrich("segundo", "Second", 2000)
+
+            assert all(ts != 2000 for ts, _ in translation_updates), (
+                "open_chain absorbed segment must not fire translation_update; "
+                f"got {translation_updates!r}"
+            )
+            # hidden_chain_uses_google forces best_english to the merged Google text;
+            # the LLM rewrite is intentionally ignored on hidden merges.
+            assert merges == [(2000, 1000, "primero segundo", "First Second")]
+
+            await service.enrich("tercero", "Third", 3000)
+
+            assert all(ts != 3000 for ts, _ in translation_updates), (
+                "extending_chain absorbed segment must not fire translation_update; "
+                f"got {translation_updates!r}"
+            )
+            assert service.metrics["suppressed_translation_update_for_merge"] == 2
+
+        run(run_())
+
+    def test_verse_suggestions_suppressed_for_merge_chain_segments(self):
+        async def run_():
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=lambda *args: asyncio.sleep(0),
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: True
+            service._client = FakeAnthropicClient({
+                "primero": (0.01, make_json_result("First")),
+                "segundo": (
+                    0.01,
+                    make_json_result(
+                        "First Second merged",
+                        merge_with_previous=True,
+                        discourse_tag="statement",
+                    ),
+                ),
+            })
+
+            await service.enrich("primero", "First", 1000)
+            await service.enrich("segundo", "Second", 2000)
+
+            assert service.metrics["verse_suggestion_triggered"] == 1
+            assert service.metrics["verse_suggestion_gated"] == 1
 
         run(run_())
 
@@ -1469,6 +1794,14 @@ class TestSessionStats:
         session._enrichment_settled = {1000, 2000}
         session._db_session_id = 42
         session._recorder = None
+        session._feed_revision_metrics = {
+            "emitted_total": 0,
+            "emitted_context_repair": 0,
+            "emitted_segmentation_repair": 0,
+            "emitted_phrase_alignment": 0,
+            "emitted_forward_context_correction": 0,
+            "emitted_other": 0,
+        }
 
         stats = session.get_stats()
 
@@ -1484,6 +1817,320 @@ class TestSessionStats:
         assert stats["enrichment"]["repair_skipped_hidden_merge"] == 7
         assert stats["stt_noise_removed_count"] == 8
         assert stats["_enrichment_settled_size"] == 2
+        assert stats["feed_revision"] == {
+            "emitted_total": 0,
+            "emitted_context_repair": 0,
+            "emitted_segmentation_repair": 0,
+            "emitted_phrase_alignment": 0,
+            "emitted_forward_context_correction": 0,
+            "emitted_other": 0,
+        }
+
+    def test_feed_revision_metrics_track_per_reason_emissions(self):
+        from server.services.session_manager import ServiceSession
+
+        session = ServiceSession.__new__(ServiceSession)
+        session._feed_revision_metrics = {
+            "emitted_total": 0,
+            "emitted_context_repair": 0,
+            "emitted_segmentation_repair": 0,
+            "emitted_phrase_alignment": 0,
+            "emitted_forward_context_correction": 0,
+            "emitted_other": 0,
+        }
+
+        for reason in (
+            "context_repair",
+            "context_repair",
+            "segmentation_repair",
+            "phrase_alignment",
+            "phrase_alignment",
+            "phrase_alignment",
+            "forward_context_correction",
+            "novel_unexpected_reason",
+        ):
+            session._bump_feed_revision_metric(reason)
+
+        assert session._feed_revision_metrics == {
+            "emitted_total": 8,
+            "emitted_context_repair": 2,
+            "emitted_segmentation_repair": 1,
+            "emitted_phrase_alignment": 3,
+            "emitted_forward_context_correction": 1,
+            "emitted_other": 1,
+        }
+
+
+class TestFeedRevisionCoalescer:
+    @staticmethod
+    def _make_session():
+        from server.services.session_manager import ServiceSession
+
+        session = ServiceSession.__new__(ServiceSession)
+        session._segment_text_cache = {}
+        session._segment_stt_cache = {}
+        session._feed_revision_metrics = {
+            "emitted_total": 0,
+            "emitted_context_repair": 0,
+            "emitted_segmentation_repair": 0,
+            "emitted_phrase_alignment": 0,
+            "emitted_forward_context_correction": 0,
+            "emitted_other": 0,
+            "coalesced_count": 0,
+        }
+        session._pending_feed_revisions = {}
+        session._feed_revision_timers = {}
+        broadcasts: list[dict] = []
+
+        async def _broadcast(payload):
+            broadcasts.append(payload)
+
+        session._broadcast = _broadcast
+        session._segment_ref = lambda segment_id: {"segment_id": segment_id, "ts": segment_id}
+        session._ensure_segment_stt_cache = lambda: session._segment_stt_cache
+        return session, broadcasts
+
+    def test_feed_revision_coalesces_within_window(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._broadcast_feed_revision(
+                segment_id=1000,
+                english="First English",
+                source="llm",
+                reason="context_repair",
+                phrase_alignment=None,
+            )
+            await session._broadcast_feed_revision(
+                segment_id=1000,
+                english="Second English",
+                source="llm",
+                reason="phrase_alignment",
+                phrase_alignment=[{"english_text": "Second", "spanish_text": "Segundo"}],
+            )
+
+            assert broadcasts == [], "payloads must be debounced, not emitted yet"
+
+            await asyncio.sleep(0.2)
+
+            assert len(broadcasts) == 1
+            payload = broadcasts[0]
+            assert payload["english"] == "Second English"
+            # context_repair beats phrase_alignment in the precedence table.
+            assert payload["reason"] == "context_repair"
+            assert payload["phrase_alignment"] == [
+                {"english_text": "Second", "spanish_text": "Segundo"}
+            ]
+            assert session._feed_revision_metrics["coalesced_count"] == 1
+            assert session._feed_revision_metrics["emitted_total"] == 1
+            assert session._feed_revision_metrics["emitted_context_repair"] == 1
+
+        run(run_())
+
+    def test_feed_revision_segmentation_repair_wins_on_collapse(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._broadcast_feed_revision(
+                segment_id=1000,
+                english="Alignment-stage English",
+                source="llm",
+                reason="phrase_alignment",
+                phrase_alignment=[{"english_text": "Hi", "spanish_text": "Hola"}],
+            )
+            await session._broadcast_feed_revision(
+                segment_id=1000,
+                english="Merged English",
+                source="llm",
+                reason="segmentation_repair",
+                spanish="Hola adios",
+                phrase_alignment=None,
+            )
+
+            await asyncio.sleep(0.2)
+
+            assert len(broadcasts) == 1
+            payload = broadcasts[0]
+            assert payload["reason"] == "segmentation_repair"
+            assert payload["english"] == "Merged English"
+            assert payload["spanish"] == "Hola adios"
+            assert payload["phrase_alignment"] == [
+                {"english_text": "Hi", "spanish_text": "Hola"}
+            ], "alignment from the earlier payload should be preserved across collapse"
+
+        run(run_())
+
+    def test_feed_revision_distinct_segments_are_not_coalesced(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._broadcast_feed_revision(
+                segment_id=1000,
+                english="Head A",
+                source="llm",
+                reason="context_repair",
+                phrase_alignment=None,
+            )
+            await session._broadcast_feed_revision(
+                segment_id=2000,
+                english="Head B",
+                source="llm",
+                reason="phrase_alignment",
+                phrase_alignment=None,
+            )
+
+            await asyncio.sleep(0.2)
+
+            segment_ids = sorted(b["segment_id"] for b in broadcasts)
+            assert segment_ids == [1000, 2000]
+            assert session._feed_revision_metrics["coalesced_count"] == 0
+
+        run(run_())
+
+    def test_feed_revision_flushes_on_session_teardown(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._broadcast_feed_revision(
+                segment_id=1000,
+                english="Pending English",
+                source="llm",
+                reason="context_repair",
+                phrase_alignment=None,
+            )
+            assert broadcasts == []
+
+            await session._flush_all_pending_feed_revisions()
+
+            assert len(broadcasts) == 1
+            assert broadcasts[0]["english"] == "Pending English"
+            assert session._feed_revision_timers == {}
+            assert session._pending_feed_revisions == {}
+
+        run(run_())
+
+    def test_feed_revision_discarded_for_absorbed_segment(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._broadcast_feed_revision(
+                segment_id=2000,
+                english="About-to-be-absorbed",
+                source="llm",
+                reason="context_repair",
+                phrase_alignment=None,
+            )
+            session._discard_pending_feed_revision(2000)
+
+            await asyncio.sleep(0.2)
+
+            assert broadcasts == []
+            assert session._pending_feed_revisions == {}
+            assert session._feed_revision_timers == {}
+
+        run(run_())
+
+
+class TestPhraseAlignmentDedup:
+    @staticmethod
+    def _make_session():
+        from server.services.session_manager import ServiceSession
+
+        session = ServiceSession.__new__(ServiceSession)
+        session._church_id = "test"
+        session._pending_feed_commits = {}
+        session._segment_text_cache = {1000: {"english": "Hello world", "spanish": "Hola mundo"}}
+        session._segment_stt_cache = {}
+        session._segment_alignment_signature = {}
+        session._feed_revision_metrics = {
+            "emitted_total": 0,
+            "emitted_context_repair": 0,
+            "emitted_segmentation_repair": 0,
+            "emitted_phrase_alignment": 0,
+            "emitted_forward_context_correction": 0,
+            "emitted_other": 0,
+            "coalesced_count": 0,
+            "suppressed_alignment_unchanged": 0,
+        }
+        session._pending_feed_revisions = {}
+        session._feed_revision_timers = {}
+        broadcasts: list[dict] = []
+
+        async def _broadcast(payload):
+            broadcasts.append(payload)
+
+        session._broadcast = _broadcast
+        session._segment_ref = lambda segment_id: {"segment_id": segment_id, "ts": segment_id}
+        session._ensure_segment_stt_cache = lambda: session._segment_stt_cache
+        return session, broadcasts
+
+    def test_phrase_alignment_dedupes_on_unchanged_payload(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+            alignment = [
+                {"english_text": "Hello", "spanish_text": "Hola"},
+                {"english_text": "world", "spanish_text": "mundo"},
+            ]
+
+            await session._on_phrase_alignment(1000, alignment)
+            await session._flush_all_pending_feed_revisions()
+            await session._on_phrase_alignment(1000, list(alignment))
+            await session._flush_all_pending_feed_revisions()
+
+            assert len(broadcasts) == 1, (
+                "duplicate alignment should be deduped; "
+                f"got {len(broadcasts)} broadcasts"
+            )
+            assert session._feed_revision_metrics["suppressed_alignment_unchanged"] == 1
+            assert session._feed_revision_metrics["emitted_phrase_alignment"] == 1
+
+        run(run_())
+
+    def test_phrase_alignment_emits_when_english_changes(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+            alignment = [{"english_text": "Hello", "spanish_text": "Hola"}]
+
+            await session._on_phrase_alignment(1000, alignment)
+            await session._flush_all_pending_feed_revisions()
+
+            session._segment_text_cache[1000] = {
+                "english": "Hello world (revised)",
+                "spanish": "Hola mundo",
+            }
+            await session._on_phrase_alignment(1000, list(alignment))
+            await session._flush_all_pending_feed_revisions()
+
+            assert len(broadcasts) == 2, (
+                "alignment must re-emit when the head English changes; "
+                f"got {len(broadcasts)} broadcasts"
+            )
+            assert session._feed_revision_metrics["suppressed_alignment_unchanged"] == 0
+
+        run(run_())
+
+    def test_phrase_alignment_emits_when_chunking_changes(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._on_phrase_alignment(
+                1000,
+                [{"english_text": "Hello world", "spanish_text": "Hola mundo"}],
+            )
+            await session._flush_all_pending_feed_revisions()
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {"english_text": "Hello", "spanish_text": "Hola"},
+                    {"english_text": "world", "spanish_text": "mundo"},
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+
+            assert len(broadcasts) == 2
+            assert session._feed_revision_metrics["suppressed_alignment_unchanged"] == 0
+
+        run(run_())
 
 
 class TestCodeSwitchingPassthrough:
@@ -2114,10 +2761,12 @@ class TestTranslationRepairFallback:
                     "What is the proof that we are in the light? We have fellowship with one another.",
                 )
             ]
-            assert updates[-1] == (
-                2000,
-                "What is the proof that we are in the light? We have fellowship with one another.",
-                None,
+            # caption_merge carries the full merged English (the refined unit).
+            # The absorbed-ts translation_update is intentionally suppressed since
+            # caption_merge already delivers the merged caption to the head.
+            assert all(ts != 2000 for ts, _, _ in updates), (
+                "absorbed segment must not fire translation_update; "
+                f"got {updates!r}"
             )
 
         run(run_())

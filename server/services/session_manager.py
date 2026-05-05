@@ -262,6 +262,30 @@ def _preferred_commit_delay_s(text: str, *, terminal_incomplete: bool) -> float:
     return PREFERRED_COMMIT_DELAY_S
 
 
+# Co-incident `feed_revision` debounce window. 150 ms is short enough to stay
+# below the perceptual threshold for revision-event arrival but long enough to
+# catch the structural collision pattern (`context_repair` → `phrase_alignment`
+# → `segmentation_repair` for the same head segment within the same enrichment
+# turn).
+FEED_REVISION_DEBOUNCE_S = 0.15
+
+# Higher = more structurally significant. When two payloads collapse, the
+# higher-priority `reason` wins so the client UI can still distinguish what
+# kind of change shipped.
+_FEED_REVISION_REASON_PRIORITY: dict[str, int] = {
+    "segmentation_repair": 4,
+    "context_repair": 3,
+    "phrase_alignment": 2,
+    "forward_context_correction": 1,
+}
+
+
+def _select_higher_priority_feed_revision_reason(existing: str, incoming: str) -> str:
+    existing_priority = _FEED_REVISION_REASON_PRIORITY.get(existing, 0)
+    incoming_priority = _FEED_REVISION_REASON_PRIORITY.get(incoming, 0)
+    return incoming if incoming_priority > existing_priority else existing
+
+
 class ServiceSession:
     """One active session per church_id. Owns the STT session, sentence
     buffer, translation, enrichment, topic tracking, and the admin WebSocket."""
@@ -295,6 +319,35 @@ class ServiceSession:
         self._segment_text_cache: dict[int, dict] = {}
         self._segment_stt_cache: dict[int, dict] = {}
         self._segment_metadata_cache: dict[int, dict] = {}
+        # Per-reason feed_revision broadcast counters. Bumped inside
+        # `_emit_feed_revision_now` so the values reflect what actually shipped
+        # to the client (post-coalesce volume), not what producers tried to send.
+        # Surfaced via `get_stats()` under the "feed_revision" block so downstream
+        # optimization work can target the dominant reason without parsing the
+        # raw event log.
+        self._feed_revision_metrics: dict[str, int] = {
+            "emitted_total": 0,
+            "emitted_context_repair": 0,
+            "emitted_segmentation_repair": 0,
+            "emitted_phrase_alignment": 0,
+            "emitted_forward_context_correction": 0,
+            "emitted_other": 0,
+            "coalesced_count": 0,
+            "suppressed_alignment_unchanged": 0,
+        }
+        # Last-broadcast phrase-alignment signature per segment_id, keyed by
+        # `(english, ((en_text, es_text), ...))`. A repeated alignment payload
+        # whose signature matches the previous emit is dropped — those revisions
+        # are pure no-ops on the wire and the user sees no change.
+        self._segment_alignment_signature: dict[int, tuple] = {}
+        # Co-incident `feed_revision` payloads for the same segment_id are
+        # collapsed inside a short debounce window so the head's
+        # context_repair / phrase_alignment / segmentation_repair triple does not
+        # ship as three distinct revisions for what the client experiences as
+        # one update. The window is intentionally short (sub-perceptual) so it
+        # never delays first-visible captions; only revisions are buffered.
+        self._pending_feed_revisions: dict[int, dict] = {}
+        self._feed_revision_timers: dict[int, asyncio.TimerHandle] = {}
         self._pending_segment_metadata: dict[int, dict] = {}
         self._pending_detected_verses: dict[int, dict] = {}
         self._pending_suggested_verses: dict[int, list[dict]] = {}
@@ -418,6 +471,7 @@ class ServiceSession:
         if self._enrichment:
             await self._enrichment.close()
         await self._flush_all_pending_commits()
+        await self._flush_all_pending_feed_revisions()
         if self._topic_tracker:
             await self._topic_tracker.stop()
         if self._db_session_id:
@@ -781,12 +835,41 @@ class ServiceSession:
         cached = self._segment_text_cache.get(ts)
         if not cached:
             return
+        english = cached.get("english", "")
+        signature = self._build_alignment_signature(english, phrase_alignment)
+        signatures = getattr(self, "_segment_alignment_signature", None)
+        if signatures is None:
+            signatures = {}
+            self._segment_alignment_signature = signatures
+        if signatures.get(ts) == signature:
+            metrics = getattr(self, "_feed_revision_metrics", None)
+            if metrics is not None:
+                metrics["suppressed_alignment_unchanged"] = (
+                    metrics.get("suppressed_alignment_unchanged", 0) + 1
+                )
+            logger.debug(
+                "[session:%s] phrase_alignment dedup ts=%d (signature unchanged)",
+                self._church_id,
+                ts,
+            )
+            return
+        signatures[ts] = signature
         await self._broadcast_feed_revision(
             segment_id=ts,
-            english=cached.get("english", ""),
+            english=english,
             source="llm",
             reason="phrase_alignment",
             phrase_alignment=phrase_alignment,
+        )
+
+    @staticmethod
+    def _build_alignment_signature(english: str, phrase_alignment: list[dict]) -> tuple:
+        return (
+            english,
+            tuple(
+                (str(item.get("english_text", "")), str(item.get("spanish_text", "")))
+                for item in phrase_alignment
+            ),
         )
 
     async def _on_enrichment_settled(self, ts: int):
@@ -905,6 +988,17 @@ class ServiceSession:
         )
         keep_was_committed = keep_ts in self._committed_segment_ids
         await self._drop_pending_commit(absorb_ts)
+        # Cancel any in-flight debounced revision targeting the absorbed
+        # segment — its visible identity is gone, so a late flush would emit
+        # a revision for a segment the client no longer renders.
+        self._discard_pending_feed_revision(absorb_ts)
+        # The alignment signature for the absorbed ts is no longer addressable;
+        # the head's signature must also be invalidated since its English is
+        # about to change.
+        signatures = getattr(self, "_segment_alignment_signature", None)
+        if signatures is not None:
+            signatures.pop(absorb_ts, None)
+            signatures.pop(keep_ts, None)
         self._segment_text_cache.pop(absorb_ts, None)
         self._ensure_segment_stt_cache().pop(absorb_ts, None)
         self._segment_metadata_cache.pop(absorb_ts, None)
@@ -1006,6 +1100,7 @@ class ServiceSession:
                 ),
             },
             "enrichment": dict(self._enrichment.metrics) if self._enrichment else {},
+            "feed_revision": dict(getattr(self, "_feed_revision_metrics", {}) or {}),
             "stt_session": self._stt_session.get_stats() if self._stt_session else {},
             "stt_noise_removed_count": self._stt_noise_removed_count,
             "_enrichment_settled_size": len(self._enrichment_settled),
@@ -1172,11 +1267,145 @@ class ServiceSession:
         spanish: str | None = None,
         phrase_alignment: list[dict] | None = None,
     ) -> None:
+        # Update the segment text cache eagerly so other producers (e.g. the
+        # phrase_alignment handler reading `_segment_text_cache.get(ts)`) see
+        # the latest English even while the broadcast is debounced.
         cached = self._segment_text_cache.get(segment_id, {})
         self._segment_text_cache[segment_id] = {
             "spanish": spanish if spanish is not None else cached.get("spanish", ""),
             "english": english,
         }
+        self._enqueue_feed_revision(
+            segment_id=segment_id,
+            english=english,
+            source=source,
+            reason=reason,
+            spanish=spanish,
+            phrase_alignment=phrase_alignment,
+        )
+
+    def _enqueue_feed_revision(
+        self,
+        *,
+        segment_id: int,
+        english: str,
+        source: str,
+        reason: str,
+        spanish: str | None,
+        phrase_alignment: list[dict] | None,
+    ) -> None:
+        pending_map = getattr(self, "_pending_feed_revisions", None)
+        if pending_map is None:
+            pending_map = {}
+            self._pending_feed_revisions = pending_map
+        timer_map = getattr(self, "_feed_revision_timers", None)
+        if timer_map is None:
+            timer_map = {}
+            self._feed_revision_timers = timer_map
+
+        existing = pending_map.get(segment_id)
+        if existing is None:
+            pending_map[segment_id] = {
+                "segment_id": segment_id,
+                "english": english,
+                "source": source,
+                "reason": reason,
+                "spanish": spanish,
+                "phrase_alignment": phrase_alignment,
+            }
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No running loop (e.g. unit-test harness invoking the
+                # producer outside an event loop). Emit synchronously.
+                pending_map.pop(segment_id, None)
+                asyncio.run(
+                    self._emit_feed_revision_now(
+                        segment_id=segment_id,
+                        english=english,
+                        source=source,
+                        reason=reason,
+                        spanish=spanish,
+                        phrase_alignment=phrase_alignment,
+                    )
+                )
+                return
+            timer_map[segment_id] = loop.call_later(
+                FEED_REVISION_DEBOUNCE_S,
+                self._schedule_feed_revision_flush,
+                segment_id,
+            )
+            return
+
+        # Coalesce with the existing pending payload.
+        existing_alignment = existing.get("phrase_alignment")
+        existing["english"] = english
+        existing["source"] = source
+        existing["reason"] = _select_higher_priority_feed_revision_reason(
+            existing["reason"], reason
+        )
+        if spanish is not None:
+            existing["spanish"] = spanish
+        # Keep an alignment that was already attached when a follow-up
+        # segmentation_repair / context_repair drops by without one.
+        if phrase_alignment:
+            existing["phrase_alignment"] = phrase_alignment
+        elif existing_alignment is not None:
+            existing["phrase_alignment"] = existing_alignment
+        metrics = getattr(self, "_feed_revision_metrics", None)
+        if metrics is not None:
+            metrics["coalesced_count"] = metrics.get("coalesced_count", 0) + 1
+
+    def _schedule_feed_revision_flush(self, segment_id: int) -> None:
+        try:
+            asyncio.get_running_loop().create_task(
+                self._flush_pending_feed_revision(segment_id)
+            )
+        except RuntimeError:
+            # Loop already torn down — let `close()` flush via the sync path.
+            return
+
+    async def _flush_pending_feed_revision(self, segment_id: int) -> None:
+        timer_map = getattr(self, "_feed_revision_timers", None)
+        if timer_map is not None:
+            timer = timer_map.pop(segment_id, None)
+            if timer is not None:
+                timer.cancel()
+        pending_map = getattr(self, "_pending_feed_revisions", None)
+        if pending_map is None:
+            return
+        pending = pending_map.pop(segment_id, None)
+        if pending is None:
+            return
+        await self._emit_feed_revision_now(**pending)
+
+    async def _flush_all_pending_feed_revisions(self) -> None:
+        pending_map = getattr(self, "_pending_feed_revisions", None)
+        if not pending_map:
+            return
+        for segment_id in list(pending_map.keys()):
+            await self._flush_pending_feed_revision(segment_id)
+
+    def _discard_pending_feed_revision(self, segment_id: int) -> None:
+        timer_map = getattr(self, "_feed_revision_timers", None)
+        if timer_map is not None:
+            timer = timer_map.pop(segment_id, None)
+            if timer is not None:
+                timer.cancel()
+        pending_map = getattr(self, "_pending_feed_revisions", None)
+        if pending_map is not None:
+            pending_map.pop(segment_id, None)
+
+    async def _emit_feed_revision_now(
+        self,
+        *,
+        segment_id: int,
+        english: str,
+        source: str,
+        reason: str,
+        spanish: str | None = None,
+        phrase_alignment: list[dict] | None = None,
+    ) -> None:
         stt_context = self._ensure_segment_stt_cache().get(segment_id, {})
         payload = {
             "type": "feed_revision",
@@ -1190,7 +1419,19 @@ class ServiceSession:
             payload["spanish"] = spanish
         if phrase_alignment:
             payload["phrase_alignment"] = phrase_alignment
+        self._bump_feed_revision_metric(reason)
         await self._broadcast(payload)
+
+    def _bump_feed_revision_metric(self, reason: str) -> None:
+        metrics = getattr(self, "_feed_revision_metrics", None)
+        if metrics is None:
+            return
+        metrics["emitted_total"] = metrics.get("emitted_total", 0) + 1
+        key = f"emitted_{reason}"
+        if key in metrics:
+            metrics[key] = metrics.get(key, 0) + 1
+        else:
+            metrics["emitted_other"] = metrics.get("emitted_other", 0) + 1
 
     async def _send(self, msg: dict):
         try:

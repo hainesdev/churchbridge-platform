@@ -46,6 +46,39 @@ class VerseScratchEntry:
     ts: int                   # wall-clock ms for client broadcast keying
 
 
+@dataclass
+class CaptionChain:
+    head_ts: int
+    tail_ts: int
+    spanish: str
+    english: str
+    google_english: str
+    length: int
+    source_quality: str
+    translation_register: str
+    discourse_tag: str
+    verse_detected: dict | None = None
+    alignment_scheduled: bool = False
+    fallback_emitted: bool = False
+    phase: str = "open_chain"
+
+
+@dataclass
+class DeferredReleaseEntry:
+    owner_ts: int
+    english: str
+    google_english: str
+    phrase_alignment: list[dict] | None
+    spanish: str | None
+    allow_alignment: bool
+    translation_register: str
+    discourse_tag: str
+    source_quality: str
+    verse_detected: dict | None
+    chain_owned: bool = False
+    task: asyncio.Task | None = None
+
+
 _STRUCTURAL_SYSTEM_PROMPT_BASE = """\
 You are a bilingual (Spanish/English) theological assistant helping a live church sermon translation system.
 
@@ -1244,18 +1277,13 @@ class LLMEnrichmentService:
         self._prev_stt_context: dict | None = None
         # Timestamp of the previously enriched sentence — used for segmentation-repair targeting
         self._prev_sentence_ts: int | None = None
-        # Deferred translation updates: ts → (english, asyncio.Task)
-        # When display_ready is false, translation_update is held pending segmentation repair or timeout.
-        self._deferred_updates: dict[int, tuple[str, asyncio.Task]] = {}
-        # Chain-aware segmentation repair. Anchored to the EARLIEST visible segment so the caption
-        # stays at a stable screen position if a bad split must be repaired.
-        # {
-        #   "head_ts": int,   # oldest visible segment (ts_keep in every merge)
-        #   "tail_ts": int,   # most recently absorbed fragment (used to detect chain extension)
-        #   "spanish": str,   # full accumulated chain Spanish
-        #   "length": int,
-        # }
-        self._merge_chain_head: dict | None = None
+        # Deferred translation updates keyed by their current owner segment.
+        # For standalone suppressed captions, the owner is the segment ts.
+        # For merge chains, the owner becomes the head segment ts.
+        self._deferred_updates: dict[int, DeferredReleaseEntry] = {}
+        # Chain-aware segmentation repair. Anchored to the earliest visible
+        # segment so the caption stays at a stable screen position as the chain grows.
+        self._active_chain: CaptionChain | None = None
         # Rolling sermon mode trajectory (last 3 modes) — injected into prompt for
         # better mode classification at rhetorical transitions.
         self._recent_modes: deque[str] = deque(maxlen=3)
@@ -1294,10 +1322,277 @@ class LLMEnrichmentService:
             "merge_chain_extended": 0,
             "merge_chain_closed": 0,
             "deferred_release_cancelled_for_merge": 0,
+            "suppressed_translation_update_for_merge": 0,
         }
 
     def _bump_metric(self, key: str, amount: int = 1) -> None:
         self.metrics[key] = self.metrics.get(key, 0) + amount
+
+    def _set_active_chain(
+        self,
+        *,
+        head_ts: int,
+        tail_ts: int,
+        spanish: str,
+        english: str,
+        google_english: str,
+        length: int,
+        source_quality: str,
+        translation_register: str,
+        discourse_tag: str,
+        verse_detected: dict | None,
+        phase: str,
+    ) -> CaptionChain:
+        chain = CaptionChain(
+            head_ts=head_ts,
+            tail_ts=tail_ts,
+            spanish=spanish,
+            english=english,
+            google_english=google_english,
+            length=length,
+            source_quality=source_quality,
+            translation_register=translation_register,
+            discourse_tag=discourse_tag,
+            verse_detected=verse_detected if isinstance(verse_detected, dict) else None,
+            phase=phase,
+        )
+        self._active_chain = chain
+        return chain
+
+    def _classify_chain_action(
+        self,
+        *,
+        prev_ts: int | None,
+        merge_with_previous: bool,
+    ) -> str:
+        if merge_with_previous and prev_ts is not None and self._on_caption_merge:
+            chain = self._active_chain
+            if chain is not None and prev_ts == chain.tail_ts:
+                return "extending_chain"
+            return "open_chain"
+        if self._active_chain is not None:
+            return "finalizing_chain"
+        return "stable_single"
+
+    def _chain_allows_expensive_downstream(self, chain_action: str) -> bool:
+        """Translation refinement / verse suggestions run only for settled units.
+
+        Merge-chain interiors (open/extend) rely on the structural pass plus merge
+        recomputation at the head; follow-up refinement is deferred until close or
+        a genuine stable single.
+        """
+        return chain_action in {"stable_single", "finalizing_chain"}
+
+    async def _apply_chain_action(
+        self,
+        *,
+        chain_action: str,
+        prev_ts: int | None,
+        ts: int,
+        spanish: str,
+        best_english: str,
+        guard_google_english: str,
+        source_quality: str,
+        translation_register: str,
+        discourse_tag: str,
+        verse_detected: dict | None,
+    ) -> None:
+        if chain_action == "stable_single":
+            return
+        if chain_action == "finalizing_chain":
+            self._finalize_open_chain_alignment()
+            self._bump_metric("merge_chain_closed")
+            logger.debug(
+                "[enrichment:%s] Chain closed at ts=%d (action=%s)",
+                self._church_id,
+                ts,
+                chain_action,
+            )
+            self._active_chain = None
+            return
+
+        if prev_ts is None or not self._on_caption_merge:
+            return
+
+        self.metrics["fragment_merge_count"] += 1
+        hist = list(self._sentence_history)
+
+        if chain_action == "extending_chain":
+            chain = self._active_chain
+            if chain is None:
+                return
+            chain_spanish = chain.spanish + " " + spanish
+            chain_len = chain.length + 1
+            head_ts = chain.head_ts
+            self._bump_metric("merge_chain_extended")
+
+            if self._cancel_deferred_release(ts, count_metric=True) is not None:
+                logger.info(
+                    "[enrichment:%s] decision=merge_cancelled_deferred_update absorbed=%d",
+                    self._church_id, ts,
+                )
+            if chain.head_ts in self._deferred_updates:
+                self._schedule_deferred_release(
+                    owner_ts=head_ts,
+                    english=best_english,
+                    google_english=best_english,
+                    phrase_alignment=None,
+                    spanish=chain_spanish,
+                    allow_alignment=False,
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    source_quality=source_quality,
+                    verse_detected=verse_detected,
+                    chain_owned=True,
+                )
+
+            self._set_active_chain(
+                head_ts=head_ts,
+                tail_ts=ts,
+                spanish=chain_spanish,
+                english=best_english,
+                google_english=guard_google_english,
+                length=chain_len,
+                source_quality=source_quality,
+                translation_register=translation_register,
+                discourse_tag=discourse_tag,
+                verse_detected=verse_detected,
+                phase="extending_chain",
+            )
+            if chain_len > self.metrics["merge_chain_max_length"]:
+                self.metrics["merge_chain_max_length"] = chain_len
+            logger.debug(
+                "[enrichment:%s] decision=merge_chain_extended ts=%d absorbed_by_head=%d "
+                "chain_len=%d spanish_len=%d",
+                self._church_id, ts, head_ts, chain_len, len(chain_spanish),
+            )
+            logger.info(
+                "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
+                "chain_len=%d action=%s",
+                self._church_id, ts, head_ts, chain_len, chain_action,
+            )
+            if self._last_emitted_translation.get(head_ts) != best_english:
+                try:
+                    await self._on_caption_merge(ts, head_ts, chain_spanish, best_english)
+                    self._last_emitted_translation[head_ts] = best_english
+                except Exception as e:
+                    logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+            else:
+                logger.debug(
+                    "[enrichment:%s] decision=merge_skipped_no_change head=%d ts=%d",
+                    self._church_id, head_ts, ts,
+                )
+            return
+
+        if chain_action == "open_chain":
+            prev_spanish = hist[-2][0] if len(hist) >= 2 else spanish
+            chain_spanish = prev_spanish + " " + spanish
+            self._bump_metric("merge_chain_opened")
+
+            head_pending = prev_ts in self._deferred_updates
+            for cancel_ts in (prev_ts, ts):
+                if self._cancel_deferred_release(cancel_ts, count_metric=True) is not None:
+                    logger.info(
+                        "[enrichment:%s] decision=merge_cancelled_deferred_update "
+                        "cancelled=%d",
+                        self._church_id, cancel_ts,
+                    )
+
+            self._set_active_chain(
+                head_ts=prev_ts,
+                tail_ts=ts,
+                spanish=chain_spanish,
+                english=best_english,
+                google_english=guard_google_english,
+                length=2,
+                source_quality=source_quality,
+                translation_register=translation_register,
+                discourse_tag=discourse_tag,
+                verse_detected=verse_detected,
+                phase="open_chain",
+            )
+            if head_pending:
+                self._schedule_deferred_release(
+                    owner_ts=prev_ts,
+                    english=best_english,
+                    google_english=best_english,
+                    phrase_alignment=None,
+                    spanish=chain_spanish,
+                    allow_alignment=False,
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    source_quality=source_quality,
+                    verse_detected=verse_detected,
+                    chain_owned=True,
+                )
+            logger.info(
+                "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
+                "chain_len=2 action=%s",
+                self._church_id, ts, prev_ts, chain_action,
+            )
+            if self._last_emitted_translation.get(prev_ts) != best_english:
+                try:
+                    await self._on_caption_merge(ts, prev_ts, chain_spanish, best_english)
+                    self._last_emitted_translation[prev_ts] = best_english
+                except Exception as e:
+                    logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
+            else:
+                logger.debug(
+                    "[enrichment:%s] decision=merge_skipped_no_change head=%d ts=%d",
+                    self._church_id, prev_ts, ts,
+                )
+
+    def _chain_phase_for_metadata(self, *, pending_reason: str | None) -> str:
+        chain = self._active_chain
+        if chain is not None:
+            return chain.phase
+        if pending_reason is not None:
+            return "deferred_pending"
+        return "stable_single"
+
+    def _cancel_deferred_release(self, owner_ts: int, *, count_metric: bool = False) -> DeferredReleaseEntry | None:
+        entry = self._deferred_updates.pop(owner_ts, None)
+        if entry is None:
+            return None
+        if entry.task is not None:
+            entry.task.cancel()
+        if count_metric:
+            self._bump_metric("deferred_release_cancelled_for_merge")
+        return entry
+
+    def _schedule_deferred_release(
+        self,
+        *,
+        owner_ts: int,
+        english: str,
+        google_english: str,
+        phrase_alignment: list[dict] | None = None,
+        spanish: str | None = None,
+        allow_alignment: bool = False,
+        translation_register: str = "expository",
+        discourse_tag: str = "statement",
+        source_quality: str = "clean",
+        verse_detected: dict | None = None,
+        chain_owned: bool = False,
+    ) -> asyncio.Task:
+        self._cancel_deferred_release(owner_ts)
+        entry = DeferredReleaseEntry(
+            owner_ts=owner_ts,
+            english=english,
+            google_english=google_english,
+            phrase_alignment=phrase_alignment,
+            spanish=spanish,
+            allow_alignment=allow_alignment,
+            translation_register=translation_register,
+            discourse_tag=discourse_tag,
+            source_quality=source_quality,
+            verse_detected=verse_detected if isinstance(verse_detected, dict) else None,
+            chain_owned=chain_owned,
+        )
+        task = asyncio.create_task(self._deferred_translation_release(owner_ts))
+        entry.task = task
+        self._deferred_updates[owner_ts] = entry
+        return task
 
     def _pending_reason(
         self,
@@ -1348,11 +1643,11 @@ class LLMEnrichmentService:
             discourse_tag=discourse_tag,
         )
 
-        chain = self._merge_chain_head
+        chain = self._active_chain
         if merge_with_previous and chain is not None:
             chain_state = "merge_chain"
-            chain_head_ts = int(chain.get("head_ts", ts))
-            chain_length = int(chain.get("length", 2))
+            chain_head_ts = chain.head_ts
+            chain_length = chain.length
         elif pending_reason is not None:
             chain_state = "deferred_pending"
             chain_head_ts = ts
@@ -1364,10 +1659,11 @@ class LLMEnrichmentService:
 
         return {
             "chain_state": chain_state,
+            "chain_phase": self._chain_phase_for_metadata(pending_reason=pending_reason),
             "chain_head_ts": chain_head_ts,
             "chain_length": chain_length,
             "pending_reason": pending_reason,
-            "released_from_fallback": False,
+            "released_from_fallback": chain.fallback_emitted if chain is not None else False,
         }
 
     def _hidden_chain_should_use_google(
@@ -1380,25 +1676,26 @@ class LLMEnrichmentService:
         return merge_with_previous and not terminal_incomplete
 
     def _finalize_open_chain_alignment(self) -> None:
-        chain = self._merge_chain_head
+        chain = self._active_chain
         if not chain:
             return
-        if chain.get("alignment_scheduled"):
+        if chain.alignment_scheduled:
             return
-        chain_english = str(chain.get("english", "")).strip()
-        chain_spanish = str(chain.get("spanish", "")).strip()
+        chain_english = chain.english.strip()
+        chain_spanish = chain.spanish.strip()
         if not chain_english or not chain_spanish:
             return
-        chain["alignment_scheduled"] = True
+        chain.phase = "finalizing_chain"
+        chain.alignment_scheduled = True
         self._schedule_phrase_alignment(
-            ts=int(chain["head_ts"]),
+            ts=chain.head_ts,
             spanish=chain_spanish,
             english=chain_english,
-            google_english=str(chain.get("google_english", "")),
-            source_quality=str(chain.get("source_quality", "clean")),
-            translation_register=str(chain.get("translation_register", "expository")),
-            discourse_tag=str(chain.get("discourse_tag", "statement")),
-            verse_detected=chain.get("verse_detected") if isinstance(chain.get("verse_detected"), dict) else None,
+            google_english=chain.google_english,
+            source_quality=chain.source_quality,
+            translation_register=chain.translation_register,
+            discourse_tag=chain.discourse_tag,
+            verse_detected=chain.verse_detected,
             merge_with_previous=False,
         )
 
@@ -1942,6 +2239,11 @@ class LLMEnrichmentService:
         if merge_with_previous:
             self._bump_metric("merge_requested")
 
+        chain_action_preview = self._classify_chain_action(
+            prev_ts=self._prev_sentence_ts,
+            merge_with_previous=merge_with_previous,
+        )
+
         guard_google_english = google_english
         if merge_with_previous and history:
             guard_google_english = f"{history[-1][1]} {google_english}".strip()
@@ -1955,18 +2257,21 @@ class LLMEnrichmentService:
         improved = str(result.get("improved_translation", "")).strip()
         if hidden_chain_uses_google:
             improved = ""
-        if self._should_run_translation_refinement(
-            spanish=spanish,
-            google_english=guard_google_english,
-            display_ready=display_ready,
-            discourse_tag=discourse_tag,
-            thought_complete=thought_complete,
-            continuation_required=continuation_required,
-            merge_with_previous=merge_with_previous,
-            source_quality=source_quality,
-            translation_register=translation_register,
-            sermon_mode=sermon_mode,
-            terminal_incomplete=terminal_incomplete,
+        if (
+            self._chain_allows_expensive_downstream(chain_action_preview)
+            and self._should_run_translation_refinement(
+                spanish=spanish,
+                google_english=guard_google_english,
+                display_ready=display_ready,
+                discourse_tag=discourse_tag,
+                thought_complete=thought_complete,
+                continuation_required=continuation_required,
+                merge_with_previous=merge_with_previous,
+                source_quality=source_quality,
+                translation_register=translation_register,
+                sermon_mode=sermon_mode,
+                terminal_incomplete=terminal_incomplete,
+            )
         ):
             self.metrics["translation_refinement_triggered"] += 1
             try:
@@ -2125,8 +2430,20 @@ class LLMEnrichmentService:
                 self.metrics["long_sentence_handled_count"] += 1
 
             if display_ready:
-                # Sentence is finalised — emit translation update immediately.
-                if best_english != _normalize_translation(google_english):
+                # When the chain action will be open_chain or extending_chain, this
+                # segment is the absorbed tail. The follow-up _on_caption_merge call
+                # rewrites the head's caption with the merged English, so emitting an
+                # immediate translation_update for the absorbed ts only generates a
+                # redundant feed_revision(context_repair) that is superseded within
+                # milliseconds by the head's feed_revision(segmentation_repair).
+                if chain_action_preview in {"open_chain", "extending_chain"}:
+                    self._bump_metric("suppressed_translation_update_for_merge")
+                    logger.info(
+                        "[enrichment:%s] decision=suppressed_translation_update_for_merge "
+                        "ts=%d action=%s",
+                        self._church_id, ts, chain_action_preview,
+                    )
+                elif best_english != _normalize_translation(google_english):
                     logger.info(
                         "[enrichment:%s] decision=immediate_translation_update ts=%d "
                         "source=%s:\n"
@@ -2147,29 +2464,27 @@ class LLMEnrichmentService:
             else:
                 # Sentence is not display_ready — suppress translation update and defer.
                 # The deferred release uses an adaptive timeout if no merge arrives.
-                defer_task = asyncio.create_task(
-                    self._deferred_translation_release(
-                        ts,
-                        best_english,
-                        google_english,
-                        phrase_alignment=None,
-                        spanish=spanish,
-                        allow_alignment=(
-                            not merge_with_previous
-                            and _alignment_allowed(
-                                source_quality=source_quality,
-                                translation_register=translation_register,
-                                discourse_tag=discourse_tag,
-                                verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
-                            )
-                        ),
-                        translation_register=translation_register,
-                        discourse_tag=discourse_tag,
-                        source_quality=source_quality,
-                        verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
-                    )
+                self._schedule_deferred_release(
+                    owner_ts=ts,
+                    english=best_english,
+                    google_english=google_english,
+                    phrase_alignment=None,
+                    spanish=spanish,
+                    allow_alignment=(
+                        not merge_with_previous
+                        and _alignment_allowed(
+                            source_quality=source_quality,
+                            translation_register=translation_register,
+                            discourse_tag=discourse_tag,
+                            verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                        )
+                    ),
+                    translation_register=translation_register,
+                    discourse_tag=discourse_tag,
+                    source_quality=source_quality,
+                    verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                    chain_owned=False,
                 )
-                self._deferred_updates[ts] = (best_english, defer_task)
                 logger.info(
                     "[enrichment:%s] decision=suppressed_translation_update ts=%d "
                     "(display_ready=false continuation=%s quality=%s)",
@@ -2186,7 +2501,13 @@ class LLMEnrichmentService:
             # Append to sentence history using the best available translation
             self._sentence_history.append((spanish, best_english))
 
-            if display_ready and not merge_with_previous:
+            prev_ts = self._prev_sentence_ts
+            chain_action = self._classify_chain_action(
+                prev_ts=prev_ts,
+                merge_with_previous=merge_with_previous,
+            )
+
+            if display_ready and self._chain_allows_expensive_downstream(chain_action):
                 self._schedule_phrase_alignment(
                     ts=ts,
                     spanish=spanish,
@@ -2199,134 +2520,18 @@ class LLMEnrichmentService:
                     merge_with_previous=merge_with_previous,
                 )
 
-            # --- Caption merge (head-anchored chain) ---
-            # The repair chain is always anchored to the EARLIEST visible segment (head_ts = ts_keep).
-            # Every subsequent fragment is absorbed INTO the head so the caption stays at a
-            # stable screen position as the chain grows.
-            #
-            # on_caption_merge(absorb_ts, keep_ts, ...) → ts_absorb=absorb_ts, ts_keep=keep_ts
-            prev_ts = self._prev_sentence_ts
-            if merge_with_previous and prev_ts is not None and self._on_caption_merge:
-                self.metrics["fragment_merge_count"] += 1
-                hist = list(self._sentence_history)
-
-                chain = self._merge_chain_head
-                if chain is not None and prev_ts == chain["tail_ts"]:
-                    # Extending an active segmentation-repair chain — absorb current ts into the head anchor.
-                    chain_spanish = chain["spanish"] + " " + spanish
-                    chain_len = chain["length"] + 1
-                    head_ts = chain["head_ts"]
-                    self._bump_metric("merge_chain_extended")
-
-                    # Cancel deferred update for the fragment being absorbed (current ts).
-                    if ts in self._deferred_updates:
-                        _, dt = self._deferred_updates.pop(ts)
-                        dt.cancel()
-                        self._bump_metric("deferred_release_cancelled_for_merge")
-                        logger.info(
-                            "[enrichment:%s] decision=merge_cancelled_deferred_update absorbed=%d",
-                            self._church_id, ts,
-                        )
-
-                    self._merge_chain_head = {
-                        "head_ts": head_ts,
-                        "tail_ts": ts,
-                        "spanish": chain_spanish,
-                        "length": chain_len,
-                        "english": best_english,
-                        "google_english": guard_google_english,
-                        "source_quality": source_quality,
-                        "translation_register": translation_register,
-                        "discourse_tag": discourse_tag,
-                        "verse_detected": result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
-                        "alignment_scheduled": False,
-                    }
-                    if chain_len > self.metrics["merge_chain_max_length"]:
-                        self.metrics["merge_chain_max_length"] = chain_len
-                    logger.debug(
-                        "[enrichment:%s] decision=merge_chain_extended ts=%d absorbed_by_head=%d "
-                        "chain_len=%d spanish_len=%d",
-                        self._church_id, ts, head_ts, chain_len, len(chain_spanish),
-                    )
-                    logger.info(
-                        "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
-                        "chain_len=%d",
-                        self._church_id, ts, head_ts, chain_len,
-                    )
-                    # Lock-in guard: skip emission if the merged translation is identical
-                    # to what was last emitted for the head, preventing UI flickering.
-                    if self._last_emitted_translation.get(head_ts) != best_english:
-                        try:
-                            await self._on_caption_merge(ts, head_ts, chain_spanish, best_english)
-                            self._last_emitted_translation[head_ts] = best_english
-                        except Exception as e:
-                            logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
-                    else:
-                        logger.debug(
-                            "[enrichment:%s] decision=merge_skipped_no_change head=%d ts=%d",
-                            self._church_id, head_ts, ts,
-                        )
-
-                else:
-                    # Starting a new segmentation-repair chain — prev_ts becomes the head anchor; current ts absorbed.
-                    prev_spanish = hist[-2][0] if len(hist) >= 2 else spanish
-                    chain_spanish = prev_spanish + " " + spanish
-                    self._bump_metric("merge_chain_opened")
-
-                    # Cancel deferreds for both the head (prev_ts) and the absorbed sentence (ts).
-                    for cancel_ts in (prev_ts, ts):
-                        if cancel_ts in self._deferred_updates:
-                            _, dt = self._deferred_updates.pop(cancel_ts)
-                            dt.cancel()
-                            self._bump_metric("deferred_release_cancelled_for_merge")
-                            logger.info(
-                                "[enrichment:%s] decision=merge_cancelled_deferred_update "
-                                "cancelled=%d",
-                                self._church_id, cancel_ts,
-                            )
-
-                    self._merge_chain_head = {
-                        "head_ts": prev_ts,
-                        "tail_ts": ts,
-                        "spanish": chain_spanish,
-                        "length": 2,
-                        "english": best_english,
-                        "google_english": guard_google_english,
-                        "source_quality": source_quality,
-                        "translation_register": translation_register,
-                        "discourse_tag": discourse_tag,
-                        "verse_detected": result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
-                        "alignment_scheduled": False,
-                    }
-                    logger.info(
-                        "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
-                        "chain_len=2",
-                        self._church_id, ts, prev_ts,
-                    )
-                    # Lock-in guard: only emit if the merged translation differs from
-                    # what was last shown for the head, preventing redundant UI updates.
-                    if self._last_emitted_translation.get(prev_ts) != best_english:
-                        try:
-                            await self._on_caption_merge(ts, prev_ts, chain_spanish, best_english)
-                            self._last_emitted_translation[prev_ts] = best_english
-                        except Exception as e:
-                            logger.warning("[enrichment:%s] on_caption_merge failed: %s", self._church_id, e)
-                    else:
-                        logger.debug(
-                            "[enrichment:%s] decision=merge_skipped_no_change head=%d ts=%d",
-                            self._church_id, prev_ts, ts,
-                        )
-
-            else:
-                # No merge — reset chain.
-                if self._merge_chain_head is not None:
-                    self._finalize_open_chain_alignment()
-                    self._bump_metric("merge_chain_closed")
-                    logger.debug(
-                        "[enrichment:%s] Chain closed at ts=%d (display_ready=%s, merge=%s)",
-                        self._church_id, ts, display_ready, merge_with_previous,
-                    )
-                self._merge_chain_head = None
+            await self._apply_chain_action(
+                chain_action=chain_action,
+                prev_ts=prev_ts,
+                ts=ts,
+                spanish=spanish,
+                best_english=best_english,
+                guard_google_english=guard_google_english,
+                source_quality=source_quality,
+                translation_register=translation_register,
+                discourse_tag=discourse_tag,
+                verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+            )
 
             # --- Segment metadata ---
             # pending_completion signals that this segment may be updated or merged.
@@ -2407,6 +2612,7 @@ class LLMEnrichmentService:
         _suggest_eligible = (
             self._should_suggest()
             and display_ready
+            and not merge_with_previous
             and self._should_generate_verse_suggestions(
                 spanish, source_quality, discourse_tag, _vs_active
             )
@@ -2466,19 +2672,7 @@ class LLMEnrichmentService:
             return False
         return True
 
-    async def _deferred_translation_release(
-        self,
-        ts: int,
-        english: str,
-        google_english: str,
-        phrase_alignment: list[dict] | None = None,
-        spanish: str | None = None,
-        allow_alignment: bool = False,
-        translation_register: str = "expository",
-        discourse_tag: str = "statement",
-        source_quality: str = "clean",
-        verse_detected: dict | None = None,
-    ) -> None:
+    async def _deferred_translation_release(self, ts: int) -> None:
         """Fallback: release a suppressed translation after an adaptive timeout if no segmentation repair arrived.
 
         Called when display_ready was false. If caption_merge fires first as segmentation repair, this task
@@ -2486,41 +2680,47 @@ class LLMEnrichmentService:
         translation is emitted so the caption is not permanently blank.
         """
         try:
+            entry = self._deferred_updates.get(ts)
+            if entry is None:
+                return
             delay_s = _deferred_release_delay_s(
-                spanish=spanish,
-                english=english,
-                google_english=google_english,
-                discourse_tag=discourse_tag,
-                source_quality=source_quality,
-                translation_register=translation_register,
+                spanish=entry.spanish,
+                english=entry.english,
+                google_english=entry.google_english,
+                discourse_tag=entry.discourse_tag,
+                source_quality=entry.source_quality,
+                translation_register=entry.translation_register,
             )
 
             await asyncio.sleep(delay_s)
             if ts in self._deferred_updates:
-                del self._deferred_updates[ts]
+                self._deferred_updates.pop(ts, None)
                 logger.info(
                     "[enrichment:%s] decision=deferred_translation_released ts=%d "
                     "(no merge in %.1fs)",
                     self._church_id, ts, delay_s,
                 )
                 self._bump_metric("deferred_release_emitted")
+                if entry.chain_owned and self._active_chain is not None and self._active_chain.head_ts == ts:
+                    self._active_chain.fallback_emitted = True
+                    self._active_chain.phase = "fallback_released"
                 # Always emit a release event when we time out a deferred caption,
                 # even if the text matches Google's original output. The client
                 # uses this event to clear pending-completion UI state.
-                release_text = _format_deferred_release_text(english, google_english)
+                release_text = _format_deferred_release_text(entry.english, entry.google_english)
                 if release_text:
                     try:
-                        await self._on_translation_update(ts, release_text, phrase_alignment)
-                        if allow_alignment and spanish:
+                        await self._on_translation_update(ts, release_text, entry.phrase_alignment)
+                        if entry.allow_alignment and entry.spanish:
                             self._schedule_phrase_alignment(
                                 ts=ts,
-                                spanish=spanish,
+                                spanish=entry.spanish,
                                 english=release_text,
-                                google_english=google_english,
+                                google_english=entry.google_english,
                                 source_quality="clean",
-                                translation_register=translation_register,
-                                discourse_tag=discourse_tag,
-                                verse_detected=verse_detected,
+                                translation_register=entry.translation_register,
+                                discourse_tag=entry.discourse_tag,
+                                verse_detected=entry.verse_detected,
                                 merge_with_previous=False,
                             )
                     except Exception as e:
@@ -2747,9 +2947,11 @@ class LLMEnrichmentService:
         # Flush any pending verse range before shutting down
         await self._flush_scratch("session close")
         self._finalize_open_chain_alignment()
+        self._active_chain = None
         # Cancel deferred translation updates
-        for _, (_, defer_task) in list(self._deferred_updates.items()):
-            defer_task.cancel()
+        for entry in list(self._deferred_updates.values()):
+            if entry.task is not None:
+                entry.task.cancel()
         self._deferred_updates.clear()
         for alignment_task in list(self._pending_alignment_tasks.values()):
             alignment_task.cancel()
