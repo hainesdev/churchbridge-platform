@@ -11,6 +11,16 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+PROMPT_CACHE_TTL = os.getenv("ANTHROPIC_PROMPT_CACHE_TTL", "5m")
+_PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": PROMPT_CACHE_TTL}
+
+
+def _cached_text_block(text: str) -> dict[str, object]:
+    return {
+        "type": "text",
+        "text": text,
+        "cache_control": _PROMPT_CACHE_CONTROL,
+    }
 
 FIRST_SUMMARY_MIN_SEGMENTS = 3    # fire once early to capture the passage announcement
 MIN_SEGMENTS_BEFORE_SUMMARY = 8   # subsequent summaries require more content
@@ -144,36 +154,51 @@ class TopicTracker:
 
         response = None
         try:
+            prompt_prefix = (
+                f"Analyze this sermon transcript and return a JSON object with these fields:\n"
+                f"- summary: 2-3 sentences on theological themes and current direction\n"
+                f"- key_themes: array of 2-4 short theme strings\n"
+                f"- illustration_subject: if the pastor is currently telling a personal "
+                f"story or analogy, describe it in one sentence; otherwise null\n"
+                f"- sermon_arc: where the sermon is in its arc — one of: "
+                f'"opening", "development", "climax", "application", "closing", "altar_call"\n'
+                f"- rhetorical_goal: one sentence describing what the preacher is trying "
+                f"to accomplish right now (e.g. 'establishing biblical authority for the main claim', "
+                f"'moving congregation toward repentance', 'illustrating grace with a personal story')\n\n"
+                f"JSON schema: "
+                f'{{ "summary": "string", "key_themes": ["string"], '
+                f'"illustration_subject": "string | null", '
+                f'"sermon_arc": "string", "rhetorical_goal": "string" }}'
+            )
+            transcript_block = f"Transcript:{topic_hint}{mode_hint}\n{recent_text}"
             response = await self._client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=300,
                 temperature=0,
-                system=(
-                    "You summarize live Spanish sermon transcripts for a simultaneous interpreter. "
-                    "Be brief and precise. Return ONLY valid JSON — no prose, no markdown fences."
-                ),
+                system=[
+                    _cached_text_block(
+                        "You summarize live Spanish sermon transcripts for a simultaneous interpreter. "
+                        "Be brief and precise. Return ONLY valid JSON — no prose, no markdown fences."
+                    )
+                ],
                 messages=[
                     {
                         "role": "user",
-                        "content": (
-                            f"Analyze this sermon transcript and return a JSON object with these fields:\n"
-                            f"- summary: 2-3 sentences on theological themes and current direction\n"
-                            f"- key_themes: array of 2-4 short theme strings\n"
-                            f"- illustration_subject: if the pastor is currently telling a personal "
-                            f"story or analogy, describe it in one sentence; otherwise null\n"
-                            f"- sermon_arc: where the sermon is in its arc — one of: "
-                            f'"opening", "development", "climax", "application", "closing", "altar_call"\n'
-                            f"- rhetorical_goal: one sentence describing what the preacher is trying "
-                            f"to accomplish right now (e.g. 'establishing biblical authority for the main claim', "
-                            f"'moving congregation toward repentance', 'illustrating grace with a personal story')\n\n"
-                            f"JSON schema: "
-                            f'{{ "summary": "string", "key_themes": ["string"], '
-                            f'"illustration_subject": "string | null", '
-                            f'"sermon_arc": "string", "rhetorical_goal": "string" }}\n\n'
-                            f"Transcript:{topic_hint}{mode_hint}\n{recent_text}"
-                        ),
+                        "content": [
+                            _cached_text_block(prompt_prefix),
+                            {"type": "text", "text": transcript_block},
+                        ],
                     }
                 ],
+            )
+            usage = getattr(response, "usage", None)
+            logger.info(
+                "[topic] Usage for church %s: input=%d output=%d cache_write=%d cache_read=%d",
+                self._church_id,
+                int(getattr(usage, "input_tokens", 0) or 0),
+                int(getattr(usage, "output_tokens", 0) or 0),
+                int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+                int(getattr(usage, "cache_read_input_tokens", 0) or 0),
             )
             raw = response.content[0].text.strip()
             # Strip markdown fences if model adds them despite instructions

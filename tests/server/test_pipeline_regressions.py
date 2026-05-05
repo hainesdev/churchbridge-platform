@@ -119,11 +119,23 @@ class FakeAnthropicMessages:
 
     async def create(self, *, messages, **kwargs):
         prompt = messages[0]["content"]
+        if isinstance(prompt, list):
+            prompt = "\n\n".join(block["text"] for block in prompt)
         marker = "[SOURCE — Spanish original]\n"
         spanish = prompt.split(marker, 1)[1].split("\n\n[GOOGLE TRANSLATION", 1)[0]
         delay_s, raw = self._responses_by_ts[spanish]
         await asyncio.sleep(delay_s)
-        return type("Resp", (), {"content": [type("Block", (), {"text": raw})()]})()
+        usage = type(
+            "Usage",
+            (),
+            {
+                "input_tokens": 100,
+                "output_tokens": 40,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        )()
+        return type("Resp", (), {"content": [type("Block", (), {"text": raw})()], "usage": usage})()
 
 
 class FakeAnthropicClient:
@@ -138,12 +150,51 @@ class SequentialFakeAnthropicMessages:
     async def create(self, **kwargs):
         delay_s, raw = self._responses.pop(0)
         await asyncio.sleep(delay_s)
-        return type("Resp", (), {"content": [type("Block", (), {"text": raw})()]})()
+        usage = type(
+            "Usage",
+            (),
+            {
+                "input_tokens": 100,
+                "output_tokens": 40,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        )()
+        return type("Resp", (), {"content": [type("Block", (), {"text": raw})()], "usage": usage})()
 
 
 class SequentialFakeAnthropicClient:
     def __init__(self, responses: list[tuple[float, str]]):
         self.messages = SequentialFakeAnthropicMessages(responses)
+
+
+class CaptureAnthropicMessages:
+    def __init__(self, raw: str):
+        self.raw = raw
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        usage = type(
+            "Usage",
+            (),
+            {
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        )()
+        return type(
+            "Resp",
+            (),
+            {"content": [type("Block", (), {"text": self.raw})()], "usage": usage},
+        )()
+
+
+class CaptureAnthropicClient:
+    def __init__(self, raw: str):
+        self.messages = CaptureAnthropicMessages(raw)
 
 
 def make_json_result(
@@ -247,6 +298,37 @@ class TestGoogleSentenceConcurrency:
 
 
 class TestEnrichmentOrdering:
+    def test_create_json_response_enables_prompt_cache(self):
+        async def run_():
+            service = LLMEnrichmentService(
+                church_id="church",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: None,
+                on_verse_detected=lambda *args: None,
+                on_verse_range_update=lambda *args: None,
+                on_verse_suggestion=lambda *args: None,
+                on_enrichment_settled=lambda *args: None,
+                session_id=1,
+                on_caption_merge=lambda *args: None,
+                on_segment_metadata=lambda *args: None,
+                state_tracker=StubStateTracker(),
+            )
+            service._client = CaptureAnthropicClient(make_json_result("Test translation"))
+
+            result = await service._create_json_response(
+                system="system",
+                user_message="user",
+                ts=1,
+                stage="enrichment",
+            )
+
+            assert result is not None
+            call = service._client.messages.calls[0]
+            assert call["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+
+        run(run_())
+
     def test_merge_targets_prior_sentence_order_not_completion_order(self):
         async def run_():
             merges = []

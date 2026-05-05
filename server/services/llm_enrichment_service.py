@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 MAX_ENRICHMENT_TOKENS = 1100
+PROMPT_CACHE_TTL = os.getenv("ANTHROPIC_PROMPT_CACHE_TTL", "5m")
 DEFERRED_RELEASE_DEFAULT_S = 3.0
 DEFERRED_RELEASE_MERGE_PRONE_S = 3.5
 DEFERRED_RELEASE_SHORT_FRAGMENT_S = 4.5
@@ -525,12 +526,28 @@ JSON schema:
 }
 """
 
+_PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": PROMPT_CACHE_TTL}
+
 
 def _strip_json_fences(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
     return raw
+
+
+def _usage_attr(response, name: str) -> int:
+    usage = getattr(response, "usage", None)
+    value = getattr(usage, name, 0) if usage is not None else 0
+    return int(value or 0)
+
+
+def _cached_text_block(text: str) -> dict[str, object]:
+    return {
+        "type": "text",
+        "text": text,
+        "cache_control": _PROMPT_CACHE_CONTROL,
+    }
 
 
 def _parse_json_object(raw: str) -> dict | None:
@@ -900,6 +917,107 @@ def _merge_blocked_by_segment_structure(
     return False
 
 
+def _build_user_message_blocks(
+    spanish: str,
+    google_english: str,
+    topic_context: str,
+    sentence_history: list[tuple[str, str]],
+    active_passage: dict | None,
+    shown_suggestions: set[str],
+    current_mode_label: str = "",
+    prev_discourse: dict | None = None,
+    recent_modes: list[str] | None = None,
+    current_stt_context: dict | None = None,
+    prev_stt_context: dict | None = None,
+) -> list[dict[str, object]]:
+    prefix_parts: list[str] = []
+
+    if topic_context:
+        prefix_parts.append(f"[SERMON CONTEXT]\n{topic_context}")
+
+    if current_mode_label:
+        prefix_parts.append(f"[CURRENT MODE]\n{current_mode_label}")
+
+    if recent_modes and len(recent_modes) > 1:
+        prefix_parts.append(f"[MODE TRAJECTORY — most recent last]\n{' → '.join(recent_modes)}")
+
+    if active_passage:
+        prefix_parts.append(
+            f"[ACTIVE PASSAGE]\n"
+            f"The preacher is currently expounding: "
+            f"{active_passage['reference']} — {active_passage['canonical_english']}"
+        )
+
+    if shown_suggestions:
+        prefix_parts.append(f"[ALREADY SUGGESTED]\n{', '.join(sorted(shown_suggestions))}")
+
+    if sentence_history:
+        lines = []
+        for sp, en in sentence_history:
+            lines.append(f"  ES: {sp}")
+            lines.append(f"  EN: {en}")
+        prefix_parts.append("[RECENT SENTENCES — most recent last]\n" + "\n".join(lines))
+
+    if prev_discourse:
+        tag = prev_discourse.get("discourse_tag", "statement")
+        introduces = prev_discourse.get("introduces_quote", False)
+        complete = prev_discourse.get("thought_complete", True)
+        continuation = prev_discourse.get("continuation_required", False)
+        quality = prev_discourse.get("source_quality", "clean")
+        ready = prev_discourse.get("display_ready", True)
+        prefix_parts.append(
+            f"[PREVIOUS SENTENCE DISCOURSE]\n"
+            f"discourse_tag: {tag}\n"
+            f"introduces_quote: {str(introduces).lower()}\n"
+            f"thought_complete: {str(complete).lower()}\n"
+            f"continuation_required: {str(continuation).lower()}\n"
+            f"source_quality: {quality}\n"
+            f"display_ready: {str(ready).lower()}"
+        )
+        if not ready and sentence_history:
+            prev_sp, prev_en = sentence_history[-1]
+            prefix_parts.append(
+                f"[PREVIOUS SENTENCE — PENDING MERGE]\n"
+                f"  ES: {prev_sp}\n"
+                f"  EN: {prev_en}\n"
+                f"If merge_with_previous is true, treat it as segmentation repair only. "
+                f"improved_translation MUST cover both this previous sentence AND the current sentence "
+                f"as one repaired unit."
+            )
+
+    current_structure = _segment_structure_block("CURRENT SEGMENT STRUCTURE", current_stt_context)
+    if current_structure:
+        prefix_parts.append(current_structure)
+    previous_structure = _segment_structure_block("PREVIOUS SEGMENT STRUCTURE", prev_stt_context)
+    if previous_structure:
+        prefix_parts.append(previous_structure)
+
+    suffix_parts: list[str] = []
+    word_count = len(spanish.split())
+    if word_count > 25:
+        suffix_parts.append(
+            f"[LONG SENTENCE — {word_count} words]\n"
+            f"This is a long sentence ({word_count} words). "
+            f"Prioritize structural accuracy. Preserve all clause relationships. "
+            f"Do not truncate or summarize. Prefer coherent segmentation over polish."
+        )
+
+    suffix_parts.append(f"[SOURCE — Spanish original]\n{spanish}")
+    suffix_parts.append(f"[GOOGLE TRANSLATION — may need improvement]\n{google_english}")
+
+    blocks: list[dict[str, object]] = []
+    if prefix_parts:
+        blocks.append(
+            {
+                "type": "text",
+                "text": "\n\n".join(prefix_parts),
+                "cache_control": _PROMPT_CACHE_CONTROL,
+            }
+        )
+    blocks.append({"type": "text", "text": "\n\n".join(suffix_parts)})
+    return blocks
+
+
 def _build_user_message(
     spanish: str,
     google_english: str,
@@ -913,82 +1031,22 @@ def _build_user_message(
     current_stt_context: dict | None = None,
     prev_stt_context: dict | None = None,
 ) -> str:
-    parts: list[str] = []
-
-    if topic_context:
-        parts.append(f"[SERMON CONTEXT]\n{topic_context}")
-
-    if current_mode_label:
-        parts.append(f"[CURRENT MODE]\n{current_mode_label}")
-
-    if recent_modes and len(recent_modes) > 1:
-        parts.append(f"[MODE TRAJECTORY — most recent last]\n{' → '.join(recent_modes)}")
-
-    if active_passage:
-        parts.append(
-            f"[ACTIVE PASSAGE]\n"
-            f"The preacher is currently expounding: "
-            f"{active_passage['reference']} — {active_passage['canonical_english']}"
+    return "\n\n".join(
+        str(block["text"])
+        for block in _build_user_message_blocks(
+            spanish,
+            google_english,
+            topic_context,
+            sentence_history,
+            active_passage,
+            shown_suggestions,
+            current_mode_label,
+            prev_discourse,
+            recent_modes,
+            current_stt_context,
+            prev_stt_context,
         )
-
-    if shown_suggestions:
-        parts.append(f"[ALREADY SUGGESTED]\n{', '.join(sorted(shown_suggestions))}")
-
-    if sentence_history:
-        lines = []
-        for sp, en in sentence_history:
-            lines.append(f"  ES: {sp}")
-            lines.append(f"  EN: {en}")
-        parts.append("[RECENT SENTENCES — most recent last]\n" + "\n".join(lines))
-
-    if prev_discourse:
-        tag = prev_discourse.get("discourse_tag", "statement")
-        introduces = prev_discourse.get("introduces_quote", False)
-        complete = prev_discourse.get("thought_complete", True)
-        continuation = prev_discourse.get("continuation_required", False)
-        quality = prev_discourse.get("source_quality", "clean")
-        ready = prev_discourse.get("display_ready", True)
-        parts.append(
-            f"[PREVIOUS SENTENCE DISCOURSE]\n"
-            f"discourse_tag: {tag}\n"
-            f"introduces_quote: {str(introduces).lower()}\n"
-            f"thought_complete: {str(complete).lower()}\n"
-            f"continuation_required: {str(continuation).lower()}\n"
-            f"source_quality: {quality}\n"
-            f"display_ready: {str(ready).lower()}"
-        )
-        # When the previous sentence was held (not display_ready), inject its text
-        # prominently so the model can write a correct merged improved_translation.
-        if not ready and sentence_history:
-            prev_sp, prev_en = sentence_history[-1]
-            parts.append(
-                f"[PREVIOUS SENTENCE — PENDING MERGE]\n"
-                f"  ES: {prev_sp}\n"
-                f"  EN: {prev_en}\n"
-                f"If merge_with_previous is true, treat it as segmentation repair only. "
-                f"improved_translation MUST cover both this previous sentence AND the current sentence "
-                f"as one repaired unit."
-            )
-
-    current_structure = _segment_structure_block("CURRENT SEGMENT STRUCTURE", current_stt_context)
-    if current_structure:
-        parts.append(current_structure)
-    previous_structure = _segment_structure_block("PREVIOUS SEGMENT STRUCTURE", prev_stt_context)
-    if previous_structure:
-        parts.append(previous_structure)
-
-    word_count = len(spanish.split())
-    if word_count > 25:
-        parts.append(
-            f"[LONG SENTENCE — {word_count} words]\n"
-            f"This is a long sentence ({word_count} words). "
-            f"Prioritize structural accuracy. Preserve all clause relationships. "
-            f"Do not truncate or summarize. Prefer coherent segmentation over polish."
-        )
-
-    parts.append(f"[SOURCE — Spanish original]\n{spanish}")
-    parts.append(f"[GOOGLE TRANSLATION — may need improvement]\n{google_english}")
-    return "\n\n".join(parts)
+    )
 
 
 class LLMEnrichmentService:
@@ -1099,6 +1157,8 @@ class LLMEnrichmentService:
             "conditional_flush_block_count": 0, # conditional-clause holds (mirror of sentence_buffer)
             "fragment_merge_count": 0,          # times a fragment was merged into a chain
             "long_sentence_handled_count": 0,   # sentences > 25 words sent to LLM
+            "prompt_cache_writes": 0,
+            "prompt_cache_reads": 0,
         }
 
     def enrich(
@@ -1197,17 +1257,36 @@ class LLMEnrichmentService:
         self,
         *,
         system: str,
-        user_message: str,
+        user_message: str | list[dict[str, object]],
         ts: int,
         stage: str,
         max_tokens: int = MAX_ENRICHMENT_TOKENS,
     ) -> dict | None:
+        if isinstance(user_message, str):
+            message_content = [{"type": "text", "text": user_message}]
+        else:
+            message_content = user_message
         response = await self._client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=max_tokens,
             temperature=0,
-            system=system,
-            messages=[{"role": "user", "content": user_message}],
+            system=[_cached_text_block(system)],
+            messages=[{"role": "user", "content": message_content}],
+        )
+        cache_write_tokens = _usage_attr(response, "cache_creation_input_tokens")
+        cache_read_tokens = _usage_attr(response, "cache_read_input_tokens")
+        if cache_write_tokens:
+            self.metrics["prompt_cache_writes"] += 1
+        if cache_read_tokens:
+            self.metrics["prompt_cache_reads"] += 1
+        logger.info(
+            "[enrichment:%s] %s usage: input=%d output=%d cache_write=%d cache_read=%d",
+            self._church_id,
+            stage,
+            _usage_attr(response, "input_tokens"),
+            _usage_attr(response, "output_tokens"),
+            cache_write_tokens,
+            cache_read_tokens,
         )
         raw = response.content[0].text.strip()
         stripped = _strip_json_fences(raw)
@@ -1441,7 +1520,7 @@ class LLMEnrichmentService:
             current_mode_label or "unknown",
         )
 
-        user_msg = _build_user_message(
+        user_blocks = _build_user_message_blocks(
             spanish, google_english, topic_context, history, active_passage, shown,
             current_mode_label, prev_discourse, recent_modes, stt_context, prev_stt_context,
         )
@@ -1449,7 +1528,7 @@ class LLMEnrichmentService:
         try:
             result = await self._create_json_response(
                 system=self._system_prompt,
-                user_message=user_msg,
+                user_message=user_blocks,
                 ts=ts,
                 stage="enrichment",
             )
@@ -2019,17 +2098,19 @@ class LLMEnrichmentService:
             )
         if shown:
             parts.append(f"[ALREADY SUGGESTED]\n{', '.join(sorted(shown))}")
-        parts.append(f"[SOURCE]\n{spanish}")
-        parts.append(f"[TRANSLATION]\n{google_english}")
-        user_msg = "\n\n".join(parts)
+        prefix = "\n\n".join(parts)
+        user_blocks = []
+        if prefix:
+            user_blocks.append(_cached_text_block(prefix))
+        user_blocks.append({"type": "text", "text": f"[SOURCE]\n{spanish}\n\n[TRANSLATION]\n{google_english}"})
 
         try:
             response = await self._client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=400,
                 temperature=0,
-                system=_VERSE_SUGGESTIONS_SYSTEM,
-                messages=[{"role": "user", "content": user_msg}],
+                system=[_cached_text_block(_VERSE_SUGGESTIONS_SYSTEM)],
+                messages=[{"role": "user", "content": user_blocks}],
             )
             raw = response.content[0].text.strip()
         except asyncio.CancelledError:
@@ -2040,6 +2121,14 @@ class LLMEnrichmentService:
                 self._church_id, ts, e,
             )
             return
+        logger.info(
+            "[enrichment:%s] verse_suggestions usage: input=%d output=%d cache_write=%d cache_read=%d",
+            self._church_id,
+            _usage_attr(response, "input_tokens"),
+            _usage_attr(response, "output_tokens"),
+            _usage_attr(response, "cache_creation_input_tokens"),
+            _usage_attr(response, "cache_read_input_tokens"),
+        )
 
         suggestions = _extract_suggestions(raw, self._church_id, ts)
         if suggestions is None:
