@@ -1262,6 +1262,7 @@ class LLMEnrichmentService:
         # Last translation emitted per ts — guards against redundant segmentation-repair
         # emissions when chain extends (prevents UI flickering on the head segment).
         self._last_emitted_translation: dict[int, str] = {}
+        self._pending_alignment_tasks: dict[int, asyncio.Task] = {}
 
         # Verse scratch pad — accumulates detections for temporal range consolidation
         self._verse_scratch: list[VerseScratchEntry] = []
@@ -1368,6 +1369,38 @@ class LLMEnrichmentService:
             "released_from_fallback": False,
         }
 
+    def _hidden_chain_should_use_google(
+        self,
+        *,
+        merge_with_previous: bool,
+        display_ready: bool,
+        terminal_incomplete: bool,
+    ) -> bool:
+        return merge_with_previous and not terminal_incomplete
+
+    def _finalize_open_chain_alignment(self) -> None:
+        chain = self._merge_chain_head
+        if not chain:
+            return
+        if chain.get("alignment_scheduled"):
+            return
+        chain_english = str(chain.get("english", "")).strip()
+        chain_spanish = str(chain.get("spanish", "")).strip()
+        if not chain_english or not chain_spanish:
+            return
+        chain["alignment_scheduled"] = True
+        self._schedule_phrase_alignment(
+            ts=int(chain["head_ts"]),
+            spanish=chain_spanish,
+            english=chain_english,
+            google_english=str(chain.get("google_english", "")),
+            source_quality=str(chain.get("source_quality", "clean")),
+            translation_register=str(chain.get("translation_register", "expository")),
+            discourse_tag=str(chain.get("discourse_tag", "statement")),
+            verse_detected=chain.get("verse_detected") if isinstance(chain.get("verse_detected"), dict) else None,
+            merge_with_previous=False,
+        )
+
     def enrich(
         self,
         spanish: str,
@@ -1421,6 +1454,9 @@ class LLMEnrichmentService:
             return
         if english.endswith("...") or len(english.split()) < 2:
             return
+        existing_task = self._pending_alignment_tasks.pop(ts, None)
+        if existing_task is not None:
+            existing_task.cancel()
         task = asyncio.create_task(
             self._generate_phrase_alignment(
                 ts=ts,
@@ -1431,6 +1467,13 @@ class LLMEnrichmentService:
                 translation_register=translation_register,
                 discourse_tag=discourse_tag,
                 verse_detected=verse_detected,
+            )
+        )
+        self._pending_alignment_tasks[ts] = task
+        task.add_done_callback(
+            lambda done_task, segment_ts=ts: (
+                self._pending_alignment_tasks.pop(segment_ts, None)
+                if self._pending_alignment_tasks.get(segment_ts) is done_task else None
             )
         )
         self._tasks = [t for t in self._tasks if not t.done()]
@@ -1898,7 +1941,15 @@ class LLMEnrichmentService:
         if merge_with_previous and history:
             guard_google_english = f"{history[-1][1]} {google_english}".strip()
 
+        hidden_chain_uses_google = self._hidden_chain_should_use_google(
+            merge_with_previous=merge_with_previous,
+            display_ready=display_ready,
+            terminal_incomplete=terminal_incomplete,
+        )
+
         improved = str(result.get("improved_translation", "")).strip()
+        if hidden_chain_uses_google:
+            improved = ""
         if self._should_run_translation_refinement(
             spanish=spanish,
             google_english=guard_google_english,
@@ -1986,6 +2037,10 @@ class LLMEnrichmentService:
                 )
 
         best_english = chosen_english
+        if hidden_chain_uses_google:
+            best_english = _normalize_translation(guard_google_english, guard_google_english)
+            chosen_source = "google_hidden_chain"
+            candidate_issues = []
         if terminal_incomplete:
             best_english = _format_deferred_release_text(best_english, google_english)
         if chosen_source == "google_fallback":
@@ -2126,7 +2181,7 @@ class LLMEnrichmentService:
             # Append to sentence history using the best available translation
             self._sentence_history.append((spanish, best_english))
 
-            if display_ready:
+            if display_ready and not merge_with_previous:
                 self._schedule_phrase_alignment(
                     ts=ts,
                     spanish=spanish,
@@ -2173,6 +2228,13 @@ class LLMEnrichmentService:
                         "tail_ts": ts,
                         "spanish": chain_spanish,
                         "length": chain_len,
+                        "english": best_english,
+                        "google_english": guard_google_english,
+                        "source_quality": source_quality,
+                        "translation_register": translation_register,
+                        "discourse_tag": discourse_tag,
+                        "verse_detected": result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                        "alignment_scheduled": False,
                     }
                     if chain_len > self.metrics["merge_chain_max_length"]:
                         self.metrics["merge_chain_max_length"] = chain_len
@@ -2223,6 +2285,13 @@ class LLMEnrichmentService:
                         "tail_ts": ts,
                         "spanish": chain_spanish,
                         "length": 2,
+                        "english": best_english,
+                        "google_english": guard_google_english,
+                        "source_quality": source_quality,
+                        "translation_register": translation_register,
+                        "discourse_tag": discourse_tag,
+                        "verse_detected": result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
+                        "alignment_scheduled": False,
                     }
                     logger.info(
                         "[enrichment:%s] decision=merge_applied ts=%d absorbed_by_head=%d "
@@ -2246,6 +2315,7 @@ class LLMEnrichmentService:
             else:
                 # No merge — reset chain.
                 if self._merge_chain_head is not None:
+                    self._finalize_open_chain_alignment()
                     self._bump_metric("merge_chain_closed")
                     logger.debug(
                         "[enrichment:%s] Chain closed at ts=%d (display_ready=%s, merge=%s)",
@@ -2671,10 +2741,14 @@ class LLMEnrichmentService:
     async def close(self) -> None:
         # Flush any pending verse range before shutting down
         await self._flush_scratch("session close")
+        self._finalize_open_chain_alignment()
         # Cancel deferred translation updates
         for _, (_, defer_task) in list(self._deferred_updates.items()):
             defer_task.cancel()
         self._deferred_updates.clear()
+        for alignment_task in list(self._pending_alignment_tasks.values()):
+            alignment_task.cancel()
+        self._pending_alignment_tasks.clear()
         self._last_emitted_translation.clear()
         self._tasks = [task for task in self._tasks if not task.done()]
         if self._tasks:

@@ -380,7 +380,7 @@ class TestEnrichmentOrdering:
             await asyncio.gather(t1, t2, t3)
 
             assert merges == [
-                (3000, 2000, "segundo tercero", "Second third merged"),
+                (3000, 2000, "segundo tercero", "Second Third"),
             ]
             assert settled == [1000, 2000, 3000]
             assert [ts for ts, _ in metadata] == [1000, 2000, 3000]
@@ -724,6 +724,60 @@ class TestSessionCloseIncompleteMetadata:
             )
             assert service.metrics["merge_chain_opened"] == 1
             assert service.metrics["deferred_release_cancelled_for_merge"] == 0
+
+        run(run_())
+
+    def test_hidden_merge_prefers_google_chain_text_and_defers_head_alignment_until_close(self):
+        async def run_():
+            merges = []
+            alignment_requests = []
+
+            async def on_caption_merge(absorb_ts, keep_ts, merged_spanish, merged_english):
+                merges.append((absorb_ts, keep_ts, merged_spanish, merged_english))
+
+            service = LLMEnrichmentService(
+                church_id="test",
+                church_terms={},
+                topic_tracker=StubTopicTracker(),
+                on_translation_update=lambda *args: asyncio.sleep(0),
+                on_verse_detected=lambda *args: asyncio.sleep(0),
+                on_verse_range_update=lambda *args: asyncio.sleep(0),
+                on_verse_suggestion=lambda *args: asyncio.sleep(0),
+                on_enrichment_settled=lambda *args: asyncio.sleep(0),
+                on_caption_merge=on_caption_merge,
+                state_tracker=StubStateTracker(),
+            )
+            service._should_generate_verse_suggestions = lambda *args: False
+            service._schedule_phrase_alignment = lambda **kwargs: alignment_requests.append(kwargs)
+            service._client = FakeAnthropicClient({
+                "primero": (0.01, make_json_result("First")),
+                "segundo": (
+                    0.01,
+                    make_json_result(
+                        "LLM merge rewrite that should be ignored",
+                        merge_with_previous=True,
+                        discourse_tag="answer_to_question",
+                    ),
+                ),
+                "tercero": (0.01, make_json_result("Third")),
+            })
+
+            await service.enrich("primero", "First", 1000)
+            alignment_requests.clear()
+
+            await service.enrich("segundo", "Second", 2000)
+
+            assert merges == [(2000, 1000, "primero segundo", "First Second")]
+            assert alignment_requests == []
+
+            await service.enrich("tercero", "Third", 3000)
+
+            assert any(
+                request["ts"] == 1000
+                and request["spanish"] == "primero segundo"
+                and request["english"] == "First Second"
+                for request in alignment_requests
+            )
 
         run(run_())
 
