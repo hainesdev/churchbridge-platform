@@ -43,6 +43,7 @@ async def stream_audio(
                 source_scripture_version = msg.get("sourceScriptureVersion", "rvr1960")
                 display_scripture_version = msg.get("displayScriptureVersion", "kjv")
                 stt_config = STTConfig.from_payload(msg.get("sttConfig"))
+                benchmark_capture = msg.get("benchmarkCapture")
                 session = await _session_manager.create(
                     church_id,
                     ws,
@@ -51,6 +52,7 @@ async def stream_audio(
                     source_scripture_version=source_scripture_version,
                     display_scripture_version=display_scripture_version,
                     stt_config=stt_config,
+                    benchmark_capture=benchmark_capture,
                 )
 
             elif msg_type == "audio":

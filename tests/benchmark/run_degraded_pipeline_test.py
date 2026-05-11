@@ -252,11 +252,11 @@ async def main() -> None:
 
             print(f"[{index}/{len(specs)}] Running {case_label}")
             print(f"  Degradation: {spec.metadata()}")
-            messages, wall_s = await run_pipeline(
+            messages, wall_s, transport = await run_pipeline(
                 degraded_samples,
                 sample_rate,
-                args.port,
                 church_scope,
+                server_port=args.port,
                 stt_config=stt_config,
             )
 
@@ -272,6 +272,7 @@ async def main() -> None:
                 start_offset_s=start_offset_s,
                 audio_dir=case_label,
                 note=_case_note(args.note, spec),
+                transport=transport,
             )
             result["benchmark_variant"] = "degraded_replay"
             result["source_audio_dir"] = args.audio_dir

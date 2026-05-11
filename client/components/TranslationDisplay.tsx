@@ -2,7 +2,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ScripturePopover } from './ScripturePopover';
-import { useTranslationFeed, type VerseDetection, type VerseSuggestion } from '@/lib/useTranslationFeed';
+import {
+  useTranslationFeed,
+  type VerseDetection,
+  type VerseSuggestion,
+} from '@/lib/useTranslationFeed';
 
 interface TranslationDisplayProps {
   churchId: string;
@@ -27,7 +31,9 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
   } | null>(null);
 
   const [scrolledUp, setScrolledUp] = useState(false);
-  const [revealedPhraseBySegment, setRevealedPhraseBySegment] = useState<Record<number, string | null>>({});
+  const [hoveredPhraseBySegment, setHoveredPhraseBySegment] = useState<Record<number, string | null>>({});
+  const [lockedPhraseBySegment, setLockedPhraseBySegment] = useState<Record<number, string | null>>({});
+  const [selectedSegmentId, setSelectedSegmentId] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
 
@@ -104,61 +110,361 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     </div>
   ), []);
 
-  const togglePhraseReveal = useCallback((segmentId: number, phraseId: string) => {
-    setRevealedPhraseBySegment(prev => ({
+  const setHoveredPhrase = useCallback((segmentId: number, phraseId: string | null) => {
+    setHoveredPhraseBySegment(prev => ({
       ...prev,
-      [segmentId]: prev[segmentId] === phraseId ? null : phraseId,
+      [segmentId]: phraseId,
     }));
   }, []);
 
-  const renderAlignedEnglish = useCallback((segment: typeof segments[number], tone: string) => {
+  const toggleLockedPhrase = useCallback((segmentId: number, phraseId: string) => {
+    setLockedPhraseBySegment(prev => ({
+      ...prev,
+      [segmentId]: prev[segmentId] === phraseId ? null : phraseId,
+    }));
+    setSelectedSegmentId(segmentId);
+  }, []);
+
+  const resolvePhraseId = useCallback((segmentId: number, phraseId: string | null | undefined) => {
+    if (!phraseId) return null;
+    const segment = segments.find((entry) => entry.id === segmentId);
+    if (!segment) return phraseId;
     const phraseAlignment = segment.phraseAlignment ?? [];
+    const currentIds = new Set(
+      phraseAlignment.flatMap((phrase) => (
+        phrase.chunk_id && phrase.chunk_id.trim() ? [phrase.chunk_id.trim()] : []
+      )),
+    );
+    if (currentIds.has(phraseId)) return phraseId;
+    const safeDescendants = phraseAlignment.filter((phrase) => {
+      if (!phrase.chunk_id || !phrase.derived_from_chunk_ids?.includes(phraseId)) {
+        return false;
+      }
+      const ambiguityReason = phrase.ambiguity_reason?.trim() ?? null;
+      return ambiguityReason === null || ambiguityReason === 'adjacent_merge';
+    });
+    if (safeDescendants.length === 1) {
+      return safeDescendants[0].chunk_id ?? phraseId;
+    }
+    return phraseId;
+  }, [segments]);
+
+  const activePhraseId = useCallback((segmentId: number) => {
+    return (
+      resolvePhraseId(segmentId, lockedPhraseBySegment[segmentId])
+      ?? resolvePhraseId(segmentId, hoveredPhraseBySegment[segmentId])
+      ?? null
+    );
+  }, [hoveredPhraseBySegment, lockedPhraseBySegment, resolvePhraseId]);
+
+  const escapeRegExp = useCallback((value: string) => (
+    value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  ), []);
+
+  const buildFlexiblePattern = useCallback((phrase: string) => {
+    const tokens = phrase.match(/[A-Za-z0-9']+|[^A-Za-z0-9'\s]+/g) ?? [];
+    if (tokens.length === 0) return null;
+    return tokens
+      .map((token) => (
+        /^[A-Za-z0-9']+$/.test(token)
+          ? escapeRegExp(token)
+          : escapeRegExp(token).replace(/\\\./g, '.?')
+      ))
+      .join(`[\\s\\u00A0,.;:!?'"“”‘’()\\-–—]*`);
+  }, [escapeRegExp]);
+
+  const buildAlignedRuns = useCallback((text: string, phrases: Array<{ id: string; text: string }>) => {
+    const runs: Array<{ text: string; id?: string }> = [];
+    let cursor = 0;
+
+    for (const phrase of phrases) {
+      const directIndex = text.toLowerCase().indexOf(phrase.text.toLowerCase(), cursor);
+      let index = directIndex;
+      let matchLength = phrase.text.length;
+
+      if (index < 0) {
+        const pattern = buildFlexiblePattern(phrase.text);
+        if (!pattern) {
+          return null;
+        }
+        const matcher = new RegExp(pattern, 'i');
+        const searchSlice = text.slice(cursor);
+        const matched = matcher.exec(searchSlice);
+        if (!matched || matched.index === undefined) {
+          return null;
+        }
+        index = cursor + matched.index;
+        matchLength = matched[0].length;
+      }
+
+      if (index < 0) {
+        return null;
+      }
+      if (index > cursor) {
+        runs.push({ text: text.slice(cursor, index) });
+      }
+      runs.push({
+        text: text.slice(index, index + matchLength),
+        id: phrase.id,
+      });
+      cursor = index + matchLength;
+    }
+
+    if (cursor < text.length) {
+      runs.push({ text: text.slice(cursor) });
+    }
+
+    return runs;
+  }, [buildFlexiblePattern]);
+
+  const renderInteractiveLine = useCallback((
+    text: string,
+    segmentId: number,
+    lineId: string,
+    lineClass: string,
+    idleInteractiveClass: string,
+    activeInteractiveClass: string,
+    lockedInteractiveClass: string,
+  ) => {
+    const active = activePhraseId(segmentId) === lineId;
+    const locked = resolvePhraseId(segmentId, lockedPhraseBySegment[segmentId]) === lineId;
+    return (
+      <button
+        type="button"
+        aria-pressed={locked}
+        onMouseEnter={() => setHoveredPhrase(segmentId, lineId)}
+        onMouseLeave={() => setHoveredPhrase(segmentId, null)}
+        onClick={() => toggleLockedPhrase(segmentId, lineId)}
+        className={`${lineClass} rounded-2xl px-2 py-1 text-left transition-colors ${
+          locked ? lockedInteractiveClass : active ? activeInteractiveClass : idleInteractiveClass
+        }`}
+      >
+        {text}
+      </button>
+    );
+  }, [activePhraseId, lockedPhraseBySegment, resolvePhraseId, setHoveredPhrase, toggleLockedPhrase]);
+
+  const buildAlignedRunsFromSpans = useCallback((
+    text: string,
+    phrases: Array<{ id: string; span?: { start: number; end: number } | null }>,
+  ) => {
+    const sorted = phrases
+      .flatMap((phrase) => {
+        if (!phrase.span) return [];
+        const { start, end } = phrase.span;
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > text.length) {
+          return [];
+        }
+        return [{ ...phrase, span: { start, end } }];
+      })
+      .sort((left, right) => left.span.start - right.span.start);
+
+    if (sorted.length !== phrases.length) {
+      return null;
+    }
+
+    const runs: Array<{ text: string; id?: string }> = [];
+    let cursor = 0;
+    for (const phrase of sorted) {
+      if (!phrase.span || phrase.span.start < cursor) {
+        return null;
+      }
+      if (phrase.span.start > cursor) {
+        runs.push({ text: text.slice(cursor, phrase.span.start) });
+      }
+      runs.push({
+        text: text.slice(phrase.span.start, phrase.span.end),
+        id: phrase.id,
+      });
+      cursor = phrase.span.end;
+    }
+    if (cursor < text.length) {
+      runs.push({ text: text.slice(cursor) });
+    }
+    return runs;
+  }, []);
+
+  const renderAlignedLine = useCallback((
+    text: string,
+    phrases: Array<{ id: string; text: string; span?: { start: number; end: number } | null }>,
+    segmentId: number,
+    lineClass: string,
+    idleInteractiveClass: string,
+    activeInteractiveClass: string,
+    lockedInteractiveClass: string,
+  ) => {
+    const runs = buildAlignedRunsFromSpans(text, phrases) ?? buildAlignedRuns(text, phrases);
+    if (!runs) {
+      return null;
+    }
+
+    return (
+      <div className={lineClass}>
+        {runs.map((run, index) => {
+          if (!run.id) {
+            return <span key={`${segmentId}-text-${index}`} className="whitespace-pre-wrap">{run.text}</span>;
+          }
+          const active = activePhraseId(segmentId) === run.id;
+          const locked = resolvePhraseId(segmentId, lockedPhraseBySegment[segmentId]) === run.id;
+          return (
+            <button
+              key={run.id}
+              type="button"
+              data-chunk-id={run.id}
+              aria-pressed={locked}
+              onMouseEnter={() => setHoveredPhrase(segmentId, run.id ?? null)}
+              onMouseLeave={() => setHoveredPhrase(segmentId, null)}
+              onClick={() => toggleLockedPhrase(segmentId, run.id!)}
+              className={`rounded-xl px-1 py-0.5 whitespace-pre-wrap transition-colors ${
+                locked ? lockedInteractiveClass : active ? activeInteractiveClass : idleInteractiveClass
+              }`}
+            >
+              {run.text}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }, [activePhraseId, buildAlignedRuns, buildAlignedRunsFromSpans, lockedPhraseBySegment, resolvePhraseId, setHoveredPhrase, toggleLockedPhrase]);
+
+  const renderLinkedPair = useCallback((segment: typeof segments[number], variant: 'full' | 'bilingual') => {
+    const phraseAlignment = segment.phraseAlignment ?? [];
+    const segmentSelected = selectedSegmentId === null || selectedSegmentId === segment.id;
+    const cardClass = variant === 'full'
+      ? `rounded-[28px] border px-5 py-4 transition-colors ${
+          segmentSelected
+            ? 'border-white/10 bg-white/[0.03]'
+            : 'border-white/5 bg-white/[0.015]'
+        }`
+      : `rounded-[28px] border px-5 py-4 transition-colors ${
+          segmentSelected
+            ? 'border-sky-300/20 bg-sky-300/[0.05]'
+            : 'border-white/5 bg-white/[0.015]'
+        }`;
+    const englishLineClass = variant === 'full'
+      ? `text-[2rem] font-semibold leading-tight tracking-[-0.02em] transition-all duration-[600ms] ${
+          segment.pendingCompletion
+            ? 'text-white/40 italic'
+            : flashingId === segment.id
+              ? 'text-blue-200'
+              : 'text-white'
+        }`
+      : `text-2xl font-semibold leading-tight tracking-[-0.015em] transition-all duration-500 ${
+          segment.pendingCompletion
+            ? 'text-white/45 italic'
+            : flashingId === segment.id
+              ? 'text-white'
+              : 'text-white/95'
+        }`;
+    const spanishLineClass = variant === 'full'
+      ? 'text-sm leading-relaxed text-stone-400'
+      : 'text-lg leading-relaxed text-sky-100/80';
+    const englishIdleClass = variant === 'full' ? 'hover:bg-white/8' : 'hover:bg-sky-200/10';
+    const englishActiveClass = variant === 'full' ? 'bg-amber-200 text-black' : 'bg-emerald-200 text-slate-950';
+    const englishLockedClass = variant === 'full' ? 'bg-amber-300 text-black ring-2 ring-amber-100/60' : 'bg-emerald-300 text-slate-950 ring-2 ring-emerald-100/70';
+    const spanishIdleClass = variant === 'full' ? 'hover:bg-white/5' : 'hover:bg-sky-200/8';
+    const spanishActiveClass = variant === 'full' ? 'bg-amber-200 text-black' : 'bg-emerald-200 text-slate-950';
+    const spanishLockedClass = variant === 'full' ? 'bg-amber-300 text-black ring-2 ring-amber-100/60' : 'bg-emerald-300 text-slate-950 ring-2 ring-emerald-100/70';
+    const linePairId = '__line__';
+
     if (phraseAlignment.length === 0) {
       return (
-        <p className={tone}>
-          {segment.english}
-        </p>
+        <div className={`${cardClass} space-y-2`}>
+          <p className={`text-[11px] font-semibold uppercase tracking-[0.24em] ${
+            variant === 'full' ? 'text-stone-500' : 'text-sky-200/55'
+          }`}>
+            {variant === 'full' ? 'English First' : 'Linked Pair'}
+          </p>
+          {renderInteractiveLine(
+            segment.english,
+            segment.id,
+            linePairId,
+            englishLineClass,
+            englishIdleClass,
+            englishActiveClass,
+            englishLockedClass,
+          )}
+          {renderInteractiveLine(
+            segment.spanish,
+            segment.id,
+            linePairId,
+            spanishLineClass,
+            spanishIdleClass,
+            spanishActiveClass,
+            spanishLockedClass,
+          )}
+        </div>
       );
     }
 
-    const revealedId = revealedPhraseBySegment[segment.id] ?? null;
-    const revealedPhrase = phraseAlignment.find((phrase) => `${phrase.english_text}|${phrase.spanish_text}` === revealedId);
+    const normalizedPhrases = phraseAlignment.map((phrase) => ({
+      id: phrase.chunk_id?.trim() || `${phrase.english_text}|${phrase.spanish_text}`,
+      english: phrase.english_text,
+      spanish: phrase.spanish_text,
+      englishSpan: phrase.english_span,
+      spanishSpan: phrase.spanish_span,
+    }));
+    const englishLine = renderAlignedLine(
+      segment.english,
+      normalizedPhrases.map((phrase) => ({ id: phrase.id, text: phrase.english, span: phrase.englishSpan })),
+      segment.id,
+      englishLineClass,
+      englishIdleClass,
+      englishActiveClass,
+      englishLockedClass,
+    );
+    const spanishLine = renderAlignedLine(
+      segment.spanish,
+      normalizedPhrases.map((phrase) => ({ id: phrase.id, text: phrase.spanish, span: phrase.spanishSpan })),
+      segment.id,
+      spanishLineClass,
+      spanishIdleClass,
+      spanishActiveClass,
+      spanishLockedClass,
+    );
+
+    if (!englishLine || !spanishLine) {
+      return (
+        <div className={`${cardClass} space-y-2`}>
+          <p className={`text-[11px] font-semibold uppercase tracking-[0.24em] ${
+            variant === 'full' ? 'text-stone-500' : 'text-sky-200/55'
+          }`}>
+            Whole-Line Pair
+          </p>
+          {renderInteractiveLine(
+            segment.english,
+            segment.id,
+            linePairId,
+            englishLineClass,
+            englishIdleClass,
+            englishActiveClass,
+            englishLockedClass,
+          )}
+          {renderInteractiveLine(
+            segment.spanish,
+            segment.id,
+            linePairId,
+            spanishLineClass,
+            spanishIdleClass,
+            spanishActiveClass,
+            spanishLockedClass,
+          )}
+        </div>
+      );
+    }
 
     return (
-      <div className="space-y-3">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-gray-500">
-          Tap English to reveal the Spanish phrase
+      <div className={`${cardClass} space-y-2`}>
+        <p className={`text-[11px] font-semibold uppercase tracking-[0.24em] ${
+          variant === 'full' ? 'text-stone-500' : 'text-sky-200/55'
+        }`}>
+          {variant === 'full' ? 'Linked Pair' : 'Phrase Study'}
         </p>
-        <div className="flex flex-wrap gap-2">
-          {phraseAlignment.map((phrase) => {
-            const phraseId = `${phrase.english_text}|${phrase.spanish_text}`;
-            const active = revealedId === phraseId;
-            return (
-              <button
-                key={phraseId}
-                onClick={() => togglePhraseReveal(segment.id, phraseId)}
-                className={`rounded-2xl border px-3 py-2 text-left text-sm font-semibold transition-colors ${
-                  active
-                    ? 'border-blue-200 bg-blue-100 text-black'
-                    : 'border-white/10 bg-white/5 text-white hover:bg-white/10'
-                }`}
-              >
-                {phrase.english_text}
-              </button>
-            );
-          })}
-        </div>
-        {revealedPhrase ? (
-          <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-gray-500">Spanish</p>
-            <p className="mt-2 text-base leading-snug text-gray-300">{revealedPhrase.spanish_text}</p>
-          </div>
-        ) : (
-          <p className="text-sm text-gray-500">Spanish stays hidden until you tap a phrase.</p>
-        )}
+        {englishLine}
+        {spanishLine}
       </div>
     );
-  }, [revealedPhraseBySegment, togglePhraseReveal]);
+  }, [flashingId, renderAlignedLine, renderInteractiveLine, selectedSegmentId]);
 
   const liveDock = liveEnglish ? (
     <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-6 py-4 backdrop-blur">
@@ -253,19 +559,9 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                   key={segment.id}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1, transition: { duration: 0.4 } }}
-                  className="space-y-1"
+                  className="space-y-2"
                 >
-                  <p className="text-3xl font-semibold leading-snug">{segment.spanish}</p>
-                  {renderAlignedEnglish(
-                    segment,
-                    `text-lg leading-snug transition-all duration-500 ${
-                      segment.pendingCompletion
-                        ? 'text-blue-300/50 italic'
-                        : flashingId === segment.id
-                          ? 'text-blue-100'
-                          : 'text-blue-300'
-                    }`,
-                  )}
+                  {renderLinkedPair(segment, 'bilingual')}
                   {renderVerseChips(segment)}
                 </motion.div>
               ))}
@@ -298,22 +594,10 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
                 key={segment.id}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1, transition: { duration: 0.4 } }}
-                className="space-y-1"
+                className="space-y-2"
               >
-                {renderAlignedEnglish(
-                  segment,
-                  `text-3xl font-semibold leading-snug transition-all duration-[600ms] ${
-                    segment.pendingCompletion
-                      ? 'text-white/40 italic'
-                      : flashingId === segment.id
-                        ? 'text-blue-200'
-                        : ''
-                  }`,
-                )}
+                {renderLinkedPair(segment, 'full')}
                 {renderVerseChips(segment)}
-                {(!segment.phraseAlignment || segment.phraseAlignment.length === 0) && (
-                  <p className="text-base text-gray-500 leading-snug">{segment.spanish}</p>
-                )}
               </motion.div>
             ))}
           </div>

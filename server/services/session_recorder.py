@@ -14,11 +14,56 @@ AUDIO_SAMPLE_RATE = 16000  # PCM16 mono, matches Google Speech input
 class CaptureResult:
     audio_path: str | None
     events_path: str | None
+    metadata_path: str | None
     duration_s: float
     segment_count: int  # number of stt_final events seen
     latency_ms: dict    # {"stt_to_sentence": {"p50":…, "p90":…, "count":…}, …}
     started_at: float
     ended_at: float
+
+
+@dataclass(frozen=True)
+class BenchmarkCaptureMetadata:
+    enabled: bool | None = None
+    benchmark_session_id: str = ""
+    benchmark_run_id: str = ""
+    benchmark_scenario_id: str = ""
+    benchmark_pipeline_id: str = ""
+    benchmark_capture_label: str = ""
+
+    @classmethod
+    def from_payload(cls, payload: dict | None) -> "BenchmarkCaptureMetadata | None":
+        if not isinstance(payload, dict):
+            return None
+        return cls(
+            enabled=payload.get("enabled"),
+            benchmark_session_id=str(payload.get("sessionId") or payload.get("benchmarkSessionId") or "").strip(),
+            benchmark_run_id=str(payload.get("runId") or payload.get("benchmarkRunId") or "").strip(),
+            benchmark_scenario_id=str(payload.get("scenarioId") or payload.get("benchmarkScenarioId") or "").strip(),
+            benchmark_pipeline_id=str(payload.get("pipelineId") or payload.get("benchmarkPipelineId") or "").strip(),
+            benchmark_capture_label=str(payload.get("captureLabel") or payload.get("benchmarkCaptureLabel") or "").strip(),
+        )
+
+    def is_named_benchmark(self) -> bool:
+        return any(
+            (
+                self.benchmark_session_id,
+                self.benchmark_run_id,
+                self.benchmark_scenario_id,
+                self.benchmark_pipeline_id,
+                self.benchmark_capture_label,
+            )
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "benchmark_session_id": self.benchmark_session_id,
+            "benchmark_run_id": self.benchmark_run_id,
+            "benchmark_scenario_id": self.benchmark_scenario_id,
+            "benchmark_pipeline_id": self.benchmark_pipeline_id,
+            "benchmark_capture_label": self.benchmark_capture_label,
+        }
 
 
 class SessionRecorder:
@@ -32,26 +77,65 @@ class SessionRecorder:
     so a crash here cannot disrupt a live service.
     """
 
-    def __init__(self, session_id: int, church_id: str) -> None:
+    def __init__(
+        self,
+        session_id: int,
+        church_id: str,
+        benchmark_capture: BenchmarkCaptureMetadata | None = None,
+    ) -> None:
         self._session_id = session_id
         self._church_id = church_id
+        self._benchmark_capture = benchmark_capture
         self._started_at = time.time()
         self._audio_chunks: list[bytes] = []
         self._events_buf: list[str] = []
         # {segment_ts: {"stt": wall_ms, "sentence": wall_ms, "translation": wall_ms, "enrichment": wall_ms}}
         self._timing: dict[int, dict[str, int]] = {}
         self._segment_count = 0
-        self._audio_path, self._events_path = self._setup_paths()
+        self._audio_path, self._events_path, self._metadata_path = self._setup_paths()
 
-    def _setup_paths(self) -> tuple[Path, Path]:
+    def _safe_slug(self, value: str, fallback: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in str(value or "").strip())
+        cleaned = cleaned.strip("-_.")
+        return cleaned or fallback
+
+    def _setup_paths(self) -> tuple[Path, Path, Path]:
         ts_str = str(int(self._started_at))
-        audio_dir = Path("tests/audio/captured")
-        events_dir = Path("logs/sessions")
+        benchmark_capture = self._benchmark_capture
+        if benchmark_capture and benchmark_capture.is_named_benchmark():
+            benchmark_session = self._safe_slug(
+                benchmark_capture.benchmark_session_id,
+                fallback=f"session-{self._session_id}",
+            )
+            benchmark_run = self._safe_slug(
+                benchmark_capture.benchmark_run_id,
+                fallback=f"run-{self._session_id}",
+            )
+            pipeline = self._safe_slug(
+                benchmark_capture.benchmark_pipeline_id,
+                fallback="pipeline",
+            )
+            label = self._safe_slug(
+                benchmark_capture.benchmark_capture_label,
+                fallback=f"{benchmark_run}-{pipeline}",
+            )
+            audio_dir = Path("tests/audio/captured/benchmarks") / benchmark_session
+            events_dir = Path("logs/sessions/benchmarks") / benchmark_session
+            audio_name = f"{benchmark_run}_{pipeline}_{label}.wav"
+            events_name = f"{benchmark_run}_{pipeline}_{label}.jsonl"
+            metadata_name = f"{benchmark_run}_{pipeline}_{label}.metadata.json"
+        else:
+            audio_dir = Path("tests/audio/captured")
+            events_dir = Path("logs/sessions")
+            audio_name = f"{ts_str}_{self._church_id}_{self._session_id}.wav"
+            events_name = f"{self._session_id}.jsonl"
+            metadata_name = f"{self._session_id}.metadata.json"
         audio_dir.mkdir(parents=True, exist_ok=True)
         events_dir.mkdir(parents=True, exist_ok=True)
         return (
-            audio_dir / f"{ts_str}_{self._church_id}_{self._session_id}.wav",
-            events_dir / f"{self._session_id}.jsonl",
+            audio_dir / audio_name,
+            events_dir / events_name,
+            events_dir / metadata_name,
         )
 
     def record_audio(self, pcm16_bytes: bytes) -> None:
@@ -113,9 +197,11 @@ class SessionRecorder:
         ended_at = time.time()
         audio_path = self._flush_wav()
         events_path = self._flush_jsonl()
+        metadata_path = self._flush_metadata()
         return CaptureResult(
             audio_path=str(audio_path) if audio_path else None,
             events_path=str(events_path) if events_path else None,
+            metadata_path=str(metadata_path) if metadata_path else None,
             duration_s=ended_at - self._started_at,
             segment_count=self._segment_count,
             latency_ms=self.compute_latency(),
@@ -161,4 +247,25 @@ class SessionRecorder:
             return self._events_path
         except Exception as e:
             logger.error("[recorder:%s] JSONL write failed: %s", self._session_id, e)
+            return None
+
+    def _flush_metadata(self) -> Path | None:
+        metadata = {
+            "session_id": self._session_id,
+            "church_id": self._church_id,
+            "started_at": self._started_at,
+            "benchmark_capture": self._benchmark_capture.as_dict() if self._benchmark_capture else None,
+            "audio_path": str(self._audio_path),
+            "events_path": str(self._events_path),
+            "segment_count": self._segment_count,
+            "latency_ms": self.compute_latency(),
+        }
+        try:
+            self._metadata_path.write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            return self._metadata_path
+        except Exception as e:
+            logger.error("[recorder:%s] Metadata write failed: %s", self._session_id, e)
             return None

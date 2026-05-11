@@ -126,6 +126,29 @@ It is a replay benchmark, not a microphone-capture benchmark. It does not test
 iPhone/browser acquisition, echo cancellation, AGC, device routing, or other
 front-end audio-processing behavior.
 
+## Benchmark Capture Retention
+
+The live `/api/stream/v1` server path now accepts an optional `benchmarkCapture`
+object inside `session.start`. When present, the backend can:
+
+- honor an explicit per-session capture enable or disable request
+- name saved WAV and JSONL artifacts with benchmark session and run labels
+- persist a metadata sidecar path plus benchmark identifiers in `session_captures`
+
+Expected fields inside `benchmarkCapture`:
+
+- `enabled`
+- `sessionId`
+- `runId`
+- `scenarioId`
+- `pipelineId`
+- `captureLabel`
+
+Named benchmark artifacts are written under:
+
+- `tests/audio/captured/benchmarks/<sessionId>/`
+- `logs/sessions/benchmarks/<sessionId>/`
+
 ### Prerequisites
 
 - `.env` present at the repo root with the required runtime keys

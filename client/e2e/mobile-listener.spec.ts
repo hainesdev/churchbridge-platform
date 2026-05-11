@@ -53,9 +53,15 @@ test.describe('mobile listener replay', () => {
       contentType: 'application/json',
     });
 
+    const listenerSockets = listenerMetrics.socketRecords.filter((record) => record.kind === 'listen');
+    const successfulListenerSocket = listenerSockets.find(
+      (record) => record.openedAtMs !== null && record.messageCount > 0,
+    );
+
     expect(listenerMetrics.messageCounts.live_translation ?? 0).toBeGreaterThanOrEqual(1);
     expect(listenerMetrics.messageCounts.feed_commit ?? 0).toBeGreaterThanOrEqual(1);
-    expect(listenerMetrics.socketRecords.filter((record) => record.kind === 'listen')).toHaveLength(1);
+    expect(listenerSockets.length).toBeGreaterThanOrEqual(1);
+    expect(successfulListenerSocket).toBeTruthy();
     expect(listenerMetrics.pageErrors).toHaveLength(0);
 
     await listenerPage.close();

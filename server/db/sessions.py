@@ -63,16 +63,36 @@ async def finalize_capture(
     capture_id: int,
     audio_path: str,
     events_path: str,
+    metadata_path: str,
     duration_s: float,
     segment_count: int,
+    benchmark_session_id: str = "",
+    benchmark_run_id: str = "",
+    benchmark_scenario_id: str = "",
+    benchmark_pipeline_id: str = "",
+    benchmark_capture_label: str = "",
 ) -> None:
     async with get_db() as db:
         await db.execute(
             """UPDATE session_captures
-               SET audio_path = ?, events_path = ?, duration_s = ?,
-                   segment_count = ?, ended_at = datetime('now')
+               SET audio_path = ?, events_path = ?, metadata_path = ?, duration_s = ?,
+                   segment_count = ?, benchmark_session_id = ?, benchmark_run_id = ?,
+                   benchmark_scenario_id = ?, benchmark_pipeline_id = ?, benchmark_capture_label = ?,
+                   ended_at = datetime('now')
                WHERE id = ?""",
-            (audio_path, events_path, duration_s, segment_count, capture_id),
+            (
+                audio_path,
+                events_path,
+                metadata_path,
+                duration_s,
+                segment_count,
+                benchmark_session_id,
+                benchmark_run_id,
+                benchmark_scenario_id,
+                benchmark_pipeline_id,
+                benchmark_capture_label,
+                capture_id,
+            ),
         )
         await db.commit()
 
@@ -80,8 +100,10 @@ async def finalize_capture(
 async def list_captures_for_church(church_id: str, limit: int = 20) -> list[dict]:
     async with get_db() as db:
         cursor = await db.execute(
-            """SELECT sc.id, sc.session_id, sc.audio_path, sc.events_path,
-                      sc.duration_s, sc.segment_count, sc.started_at, sc.ended_at
+            """SELECT sc.id, sc.session_id, sc.audio_path, sc.events_path, sc.metadata_path,
+                      sc.duration_s, sc.segment_count, sc.started_at, sc.ended_at,
+                      sc.benchmark_session_id, sc.benchmark_run_id, sc.benchmark_scenario_id,
+                      sc.benchmark_pipeline_id, sc.benchmark_capture_label
                FROM session_captures sc
                JOIN service_sessions ss ON ss.id = sc.session_id
                WHERE ss.church_id = ?
@@ -93,8 +115,10 @@ async def list_captures_for_church(church_id: str, limit: int = 20) -> list[dict
     return [
         {
             "id": r[0], "session_id": r[1], "audio_path": r[2],
-            "events_path": r[3], "duration_s": r[4], "segment_count": r[5],
-            "started_at": r[6], "ended_at": r[7],
+            "events_path": r[3], "metadata_path": r[4], "duration_s": r[5], "segment_count": r[6],
+            "started_at": r[7], "ended_at": r[8],
+            "benchmark_session_id": r[9], "benchmark_run_id": r[10], "benchmark_scenario_id": r[11],
+            "benchmark_pipeline_id": r[12], "benchmark_capture_label": r[13],
         }
         for r in rows
     ]

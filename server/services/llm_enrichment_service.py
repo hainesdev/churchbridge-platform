@@ -28,6 +28,18 @@ DEFERRED_RELEASE_INCOMPLETE_S = 2.0
 _VALID_SERMON_MODES = frozenset({
     "scripture", "exposition", "illustration", "application", "exhortation", "procedural"
 })
+_VALID_TOPIC_REFRESH_STRENGTHS = frozenset({"none", "soft", "strong"})
+_VALID_TOPIC_REFRESH_REASONS = frozenset({
+    "passage_change",
+    "mode_shift",
+    "theme_shift",
+    "illustration_started",
+    "illustration_ended",
+    "application_started",
+    "exhortation_started",
+    "altar_call_started",
+    "closing_shift",
+})
 VERSE_GAP_THRESHOLD_S = float(os.getenv("VERSE_GAP_THRESHOLD_S", "45"))
 
 
@@ -204,6 +216,19 @@ RULES:
     When false, the translation is suppressed until a merge arrives or a fallback timeout fires.
     Be accurate — this drives whether the caption appears on screen.
 
+15. topic_refresh_signal: an advisory hint to the rolling topic-memory tracker.
+    Set strength="strong" when this sentence clearly marks a major rhetorical pivot
+    (a new explicit passage, a definitive shift into illustration / application /
+    exhortation / altar call, or a closing transition).
+    Set strength="soft" for gradual rhetorical movement that may eventually warrant
+    a refresh but is not urgent on its own (a theme drift, a moderate mode shift).
+    Set strength="none" when topic state should keep its scheduled cadence.
+    reason must be one of: "passage_change" | "mode_shift" | "theme_shift" |
+    "illustration_started" | "illustration_ended" | "application_started" |
+    "exhortation_started" | "altar_call_started" | "closing_shift". Use the most
+    specific reason that fits; when strength="none" the reason is ignored.
+    Default to {"strength": "none", "reason": "mode_shift"} when nothing changed.
+
 JSON schema (return exactly this shape):
 {
   "discourse_tag": "statement" | "rhetorical_question" | "answer_to_question" | "quote_introduction" | "scripture_quote" | "transition" | "exhortation_appeal",
@@ -225,7 +250,11 @@ JSON schema (return exactly this shape):
     "canonical_english": "string",
     "reference": "string",
     "confidence": "explicit" | "quoted"
-  } | null
+  } | null,
+  "topic_refresh_signal": {
+    "strength": "none" | "soft" | "strong",
+    "reason": "passage_change" | "mode_shift" | "theme_shift" | "illustration_started" | "illustration_ended" | "application_started" | "exhortation_started" | "altar_call_started" | "closing_shift"
+  }
 }\
 """
 
@@ -619,9 +648,9 @@ def _normalize_alignment_compare(text: str) -> str:
     return re.sub(r"[\W_]+", "", text.lower())
 
 
-def _ordered_alignment_coverage(chunks: list[str], chosen_english: str) -> float:
-    normalized_chosen = _normalize_alignment_compare(chosen_english)
-    if not normalized_chosen:
+def _ordered_alignment_coverage(chunks: list[str], source_text: str) -> float:
+    normalized_source = _normalize_alignment_compare(source_text)
+    if not normalized_source:
         return 0.0
     cursor = 0
     matched = 0
@@ -629,12 +658,12 @@ def _ordered_alignment_coverage(chunks: list[str], chosen_english: str) -> float
         normalized_chunk = _normalize_alignment_compare(chunk)
         if not normalized_chunk:
             continue
-        index = normalized_chosen.find(normalized_chunk, cursor)
+        index = normalized_source.find(normalized_chunk, cursor)
         if index < 0:
             return 0.0
         matched += len(normalized_chunk)
         cursor = index + len(normalized_chunk)
-    return matched / len(normalized_chosen)
+    return matched / len(normalized_source)
 
 
 def _alignment_allowed(
@@ -655,7 +684,21 @@ def _alignment_allowed(
     return False
 
 
-def _sanitize_phrase_alignment(raw_alignment: object, chosen_english: str) -> list[dict]:
+def _alignment_chunk_is_too_thin(text: str) -> bool:
+    tokens = _translation_word_tokens(text)
+    if not tokens:
+        return True
+    if len(tokens) == 1:
+        token = tokens[0]
+        return len(token) <= 2 or token in _COMPLETENESS_STOPWORDS
+    meaningful_tokens = [
+        token for token in tokens
+        if len(token) >= 3 and token not in _COMPLETENESS_STOPWORDS
+    ]
+    return not meaningful_tokens and len(tokens) <= 2
+
+
+def _sanitize_phrase_alignment(raw_alignment: object, chosen_english: str, source_spanish: str) -> list[dict]:
     if not isinstance(raw_alignment, list):
         return []
 
@@ -679,6 +722,13 @@ def _sanitize_phrase_alignment(raw_alignment: object, chosen_english: str) -> li
     if len(sanitized) < minimum_items:
         return []
 
+    thin_chunk_count = sum(
+        1 for item in sanitized
+        if _alignment_chunk_is_too_thin(item["english_text"])
+    )
+    if thin_chunk_count >= len(sanitized):
+        return []
+
     coverage_ratio = _ordered_alignment_coverage(
         [item["english_text"] for item in sanitized],
         chosen_english,
@@ -687,6 +737,17 @@ def _sanitize_phrase_alignment(raw_alignment: object, chosen_english: str) -> li
         return []
     minimum_coverage = 0.35 if chosen_word_count <= 8 else 0.45
     if coverage_ratio < minimum_coverage:
+        return []
+
+    spanish_word_count = len(_translation_word_tokens(source_spanish))
+    spanish_coverage_ratio = _ordered_alignment_coverage(
+        [item["spanish_text"] for item in sanitized],
+        source_spanish,
+    )
+    if spanish_coverage_ratio <= 0:
+        return []
+    minimum_spanish_coverage = 0.35 if spanish_word_count <= 8 else 0.45
+    if spanish_coverage_ratio < minimum_spanish_coverage:
         return []
 
     return sanitized
@@ -874,6 +935,8 @@ def _build_alignment_request_message(
     english: str,
     *,
     google_english: str = "",
+    interim_english_hint: str = "",
+    prior_phrase_alignment: list[dict] | None = None,
     source_quality: str = "clean",
     translation_register: str = "expository",
     discourse_tag: str = "statement",
@@ -885,6 +948,31 @@ def _build_alignment_request_message(
     ]
     if google_english:
         parts.append(f"[GOOGLE ENGLISH BASELINE]\n{google_english}")
+    if interim_english_hint:
+        parts.append(
+            "[INTERIM ENGLISH HINT]\n"
+            f"{interim_english_hint}\n"
+            "(Use only as a secondary hint for clause boundaries or dropped words; "
+            "do not override the displayed English with this hint.)"
+        )
+    if prior_phrase_alignment:
+        prior_lines: list[str] = []
+        for item in prior_phrase_alignment:
+            if not isinstance(item, dict):
+                continue
+            english_text = str(item.get("english_text", "")).strip()
+            spanish_text = str(item.get("spanish_text", "")).strip()
+            chunk_id = str(item.get("chunk_id", "")).strip()
+            if not english_text or not spanish_text:
+                continue
+            label = f"{chunk_id}: " if chunk_id else ""
+            prior_lines.append(f"- {label}{english_text} => {spanish_text}")
+        if prior_lines:
+            parts.append(
+                "[PRIOR ACCEPTED ALIGNMENT]\n"
+                + "\n".join(prior_lines)
+                + "\nPreserve these chunk boundaries when they still fit the displayed English and source Spanish."
+            )
     parts.append(f"[SOURCE QUALITY]\n{source_quality}")
     parts.append(f"[TRANSLATION REGISTER]\n{translation_register}")
     parts.append(f"[DISCOURSE TAG]\n{discourse_tag}")
@@ -1034,10 +1122,19 @@ def _build_user_message_blocks(
     recent_modes: list[str] | None = None,
     current_stt_context: dict | None = None,
     prev_stt_context: dict | None = None,
+    topic_blocks: str = "",
 ) -> list[dict[str, object]]:
     prefix_parts: list[str] = []
 
-    if topic_context:
+    # Prefer the structured topic-memory blocks emitted by TopicTracker
+    # (Phase 6). The blocks already carry their own [ACTIVE PASSAGE],
+    # [SERMON ARC], [PRIMARY THEMES] etc. headers, so we splice them in
+    # verbatim rather than wrapping them in [SERMON CONTEXT]. The legacy
+    # ``topic_context`` path is only used as a fallback for callers that
+    # have not migrated yet (e.g. older test stubs).
+    if topic_blocks:
+        prefix_parts.append(topic_blocks)
+    elif topic_context:
         prefix_parts.append(f"[SERMON CONTEXT]\n{topic_context}")
 
     if current_mode_label:
@@ -1046,7 +1143,10 @@ def _build_user_message_blocks(
     if recent_modes and len(recent_modes) > 1:
         prefix_parts.append(f"[MODE TRAJECTORY — most recent last]\n{' → '.join(recent_modes)}")
 
-    if active_passage:
+    # When structured topic blocks already include [ACTIVE PASSAGE], we
+    # skip re-emitting the verse-detection passage block to keep prompt
+    # tokens tight and avoid duplicate signals to the LLM.
+    if active_passage and "[ACTIVE PASSAGE]" not in topic_blocks:
         prefix_parts.append(
             f"[ACTIVE PASSAGE]\n"
             f"The preacher is currently expounding: "
@@ -1135,6 +1235,7 @@ def _build_user_message(
     recent_modes: list[str] | None = None,
     current_stt_context: dict | None = None,
     prev_stt_context: dict | None = None,
+    topic_blocks: str = "",
 ) -> str:
     return "\n\n".join(
         str(block["text"])
@@ -1150,6 +1251,7 @@ def _build_user_message(
             recent_modes,
             current_stt_context,
             prev_stt_context,
+            topic_blocks=topic_blocks,
         )
     )
 
@@ -1705,25 +1807,7 @@ class LLMEnrichmentService:
         chain = self._active_chain
         if not chain:
             return
-        if chain.alignment_scheduled:
-            return
-        chain_english = chain.english.strip()
-        chain_spanish = chain.spanish.strip()
-        if not chain_english or not chain_spanish:
-            return
         chain.phase = "finalizing_chain"
-        chain.alignment_scheduled = True
-        self._schedule_phrase_alignment(
-            ts=chain.head_ts,
-            spanish=chain_spanish,
-            english=chain_english,
-            google_english=chain.google_english,
-            source_quality=chain.source_quality,
-            translation_register=chain.translation_register,
-            discourse_tag=chain.discourse_tag,
-            verse_detected=chain.verse_detected,
-            merge_with_previous=False,
-        )
 
     def enrich(
         self,
@@ -1759,6 +1843,8 @@ class LLMEnrichmentService:
         spanish: str,
         english: str,
         google_english: str = "",
+        interim_english_hint: str = "",
+        prior_phrase_alignment: list[dict] | None = None,
         source_quality: str,
         translation_register: str = "expository",
         discourse_tag: str = "statement",
@@ -1791,6 +1877,8 @@ class LLMEnrichmentService:
                 spanish=spanish,
                 english=english,
                 google_english=google_english,
+                interim_english_hint=interim_english_hint,
+                prior_phrase_alignment=prior_phrase_alignment,
                 source_quality=source_quality,
                 translation_register=translation_register,
                 discourse_tag=discourse_tag,
@@ -1851,6 +1939,8 @@ class LLMEnrichmentService:
         spanish: str,
         english: str,
         google_english: str = "",
+        interim_english_hint: str = "",
+        prior_phrase_alignment: list[dict] | None = None,
         source_quality: str = "clean",
         translation_register: str = "expository",
         discourse_tag: str = "statement",
@@ -1861,6 +1951,8 @@ class LLMEnrichmentService:
             spanish=spanish,
             english=english,
             google_english=google_english,
+            interim_english_hint=interim_english_hint,
+            prior_phrase_alignment=prior_phrase_alignment,
             source_quality=source_quality,
             translation_register=translation_register,
             discourse_tag=discourse_tag,
@@ -2093,6 +2185,8 @@ class LLMEnrichmentService:
         spanish: str,
         english: str,
         google_english: str = "",
+        interim_english_hint: str = "",
+        prior_phrase_alignment: list[dict] | None = None,
         source_quality: str = "clean",
         translation_register: str = "expository",
         discourse_tag: str = "statement",
@@ -2105,6 +2199,8 @@ class LLMEnrichmentService:
                     spanish,
                     english,
                     google_english=google_english,
+                    interim_english_hint=interim_english_hint,
+                    prior_phrase_alignment=prior_phrase_alignment,
                     source_quality=source_quality,
                     translation_register=translation_register,
                     discourse_tag=discourse_tag,
@@ -2126,6 +2222,7 @@ class LLMEnrichmentService:
         phrase_alignment = _sanitize_phrase_alignment(
             result.get("phrase_alignment"),
             english,
+            spanish,
         )
         if not phrase_alignment:
             return
@@ -2232,9 +2329,23 @@ class LLMEnrichmentService:
         terminal_incomplete: bool,
         stt_context: dict | None,
     ) -> None:
-        # topic_context is from TopicTracker (updated on an independent schedule,
-        # not affected by enrichment apply ordering — snapshot early is fine).
+        # topic_context / topic_blocks are from TopicTracker (updated on an
+        # independent schedule, not affected by enrichment apply ordering —
+        # snapshot early is fine). We prefer the structured prompt blocks
+        # (Phase 6); ``get_context()`` remains as a fallback for older
+        # tracker shims that don't yet expose ``get_prompt_blocks_text``.
         topic_context = self._topic_tracker.get_context()
+        topic_blocks_fn = getattr(self._topic_tracker, "get_prompt_blocks_text", None)
+        topic_blocks = ""
+        if callable(topic_blocks_fn):
+            try:
+                topic_blocks = topic_blocks_fn() or ""
+            except Exception as exc:
+                logger.debug(
+                    "[enrichment:%s] topic prompt-blocks fetch failed: %s",
+                    self._church_id, exc,
+                )
+                topic_blocks = ""
 
         # Wait for our apply turn before snapshotting shared enrichment state.
         # This guarantees that prev_discourse, sentence_history, and active_passage
@@ -2272,6 +2383,7 @@ class LLMEnrichmentService:
         user_blocks = _build_user_message_blocks(
             spanish, google_english, topic_context, history, active_passage, shown,
             current_mode_label, prev_discourse, recent_modes, stt_context, prev_stt_context,
+            topic_blocks=topic_blocks,
         )
 
         try:
@@ -2338,6 +2450,8 @@ class LLMEnrichmentService:
         sermon_mode = result.get("sermon_mode", "exposition")
         if sermon_mode not in _VALID_SERMON_MODES:
             sermon_mode = "exposition"
+
+        topic_refresh_signal = _parse_topic_refresh_signal(result.get("topic_refresh_signal"))
 
         if not display_ready:
             if terminal_incomplete:
@@ -2558,6 +2672,33 @@ class LLMEnrichmentService:
                 await self._state_tracker.add_signal(sermon_mode, ts)
             self._recent_modes.append(sermon_mode)
 
+            # Forward the structural enrichment's topic refresh hint to
+            # the topic tracker. The tracker applies its own cooldown,
+            # dedupe, and in-flight protection, so this call is cheap
+            # and fire-and-forget. Falling back to ``getattr`` keeps test
+            # stubs that don't implement ``request_refresh`` working.
+            if topic_refresh_signal is not None:
+                request_refresh = getattr(
+                    self._topic_tracker, "request_refresh", None
+                )
+                if callable(request_refresh):
+                    strength, reason = topic_refresh_signal
+                    try:
+                        request_refresh(
+                            reason=reason,
+                            strength=strength,
+                            ts=ts,
+                            metadata={
+                                "sermon_mode": sermon_mode,
+                                "discourse_tag": discourse_tag,
+                            },
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "[enrichment:%s] topic request_refresh failed: %s",
+                            self._church_id, exc,
+                        )
+
             # Track noisy input
             if source_quality == "noisy":
                 self.metrics["noisy_input_detected"] += 1
@@ -2644,19 +2785,6 @@ class LLMEnrichmentService:
                 merge_with_previous=merge_with_previous,
             )
 
-            if display_ready and self._chain_allows_expensive_downstream(chain_action):
-                self._schedule_phrase_alignment(
-                    ts=ts,
-                    spanish=spanish,
-                    english=best_english,
-                    google_english=google_english,
-                    source_quality=source_quality,
-                    translation_register=translation_register,
-                    discourse_tag=discourse_tag,
-                    verse_detected=result.get("verse_detected") if isinstance(result.get("verse_detected"), dict) else None,
-                    merge_with_previous=merge_with_previous,
-                )
-
             await self._apply_chain_action(
                 chain_action=chain_action,
                 prev_ts=prev_ts,
@@ -2731,6 +2859,25 @@ class LLMEnrichmentService:
                             self._topic_tracker.set_active_passage(
                                 verse["reference"], verse["canonical_english"]
                             )
+                            # Hard passage flip: ask the tracker to refresh
+                            # surrounding semantic memory immediately. Strong
+                            # urgent reasons preempt the usual cooldown.
+                            request_refresh = getattr(
+                                self._topic_tracker, "request_refresh", None
+                            )
+                            if callable(request_refresh):
+                                try:
+                                    request_refresh(
+                                        reason="passage_change",
+                                        strength="strong",
+                                        ts=ts,
+                                        metadata={"source": "verse_detection"},
+                                    )
+                                except Exception as exc:
+                                    logger.debug(
+                                        "[enrichment:%s] topic request_refresh failed: %s",
+                                        self._church_id, exc,
+                                    )
                     await self._handle_verse_detection(verse, audio_start, audio_end, ts)
                 else:
                     logger.debug(
@@ -2848,18 +2995,6 @@ class LLMEnrichmentService:
                 if release_text:
                     try:
                         await self._on_translation_update(ts, release_text, entry.phrase_alignment)
-                        if entry.allow_alignment and entry.spanish:
-                            self._schedule_phrase_alignment(
-                                ts=ts,
-                                spanish=entry.spanish,
-                                english=release_text,
-                                google_english=entry.google_english,
-                                source_quality="clean",
-                                translation_register=entry.translation_register,
-                                discourse_tag=entry.discourse_tag,
-                                verse_detected=entry.verse_detected,
-                                merge_with_previous=False,
-                            )
                     except Exception as e:
                         logger.warning(
                             "[enrichment:%s] deferred translation_update failed ts=%d: %s",
@@ -3226,6 +3361,29 @@ def _is_valid_suggestion(s: dict) -> bool:
         and isinstance(s.get("canonical_english"), str) and s["canonical_english"]
         and isinstance(s.get("relevance_note"), str)
     )
+
+
+def _parse_topic_refresh_signal(value: object) -> tuple[str, str] | None:
+    """Validate the structural enrichment ``topic_refresh_signal`` block.
+
+    Returns a normalized ``(strength, reason)`` tuple when the signal is
+    well-formed and indicates a non-trivial refresh hint, else ``None``.
+    A ``"none"`` strength is dropped here so we never round-trip it to
+    the topic tracker; the tracker's own ``request_refresh`` would reject
+    it anyway, but skipping it locally avoids a noisy metric bump.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    strength = value.get("strength")
+    reason = value.get("reason")
+    if not isinstance(strength, str) or strength not in _VALID_TOPIC_REFRESH_STRENGTHS:
+        return None
+    if strength == "none":
+        return None
+    if not isinstance(reason, str) or reason not in _VALID_TOPIC_REFRESH_REASONS:
+        return None
+    return strength, reason
 
 
 def _extract_suggestions(raw: str, church_id: str, ts: int) -> list[dict] | None:

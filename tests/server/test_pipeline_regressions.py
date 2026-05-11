@@ -252,6 +252,10 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def _without_pipeline_traces(events):
+    return [event for event in events if event.get("type") != "pipeline_trace"]
+
+
 async def _wait_for(predicate, interval_s: float = 0.01):
     while not predicate():
         await asyncio.sleep(interval_s)
@@ -552,17 +556,18 @@ class TestCorrectionSuppressedEvent:
             # assert against the actually-shipped events.
             await session._flush_all_pending_feed_revisions()
 
-            assert events == [
-                {"type": "correction_suppressed", "segment_id": 1000, "ts": 1000},
-                {
-                    "type": "feed_revision",
-                    "segment_id": 2000,
-                    "ts": 2000,
-                    "english": "Normal correction",
-                    "source": "google",
-                    "reason": "forward_context_correction",
-                },
-            ]
+            visible_events = _without_pipeline_traces(events)
+            assert visible_events[0] == {"type": "correction_suppressed", "segment_id": 1000, "ts": 1000}
+            assert visible_events[1] == {
+                "type": "feed_revision",
+                "segment_id": 2000,
+                "ts": 2000,
+                "english": "Normal correction",
+                "source": "google",
+                "reason": "forward_context_correction",
+                "root_segment_id": 2000,
+                "merged_from_segment_ids": [2000],
+            }
 
         run(run_())
 
@@ -886,9 +891,8 @@ class TestSessionCloseIncompleteMetadata:
         assert service._classify_chain_action(prev_ts=2000, merge_with_previous=True) == "extending_chain"
         assert service._classify_chain_action(prev_ts=3000, merge_with_previous=False) == "finalizing_chain"
 
-    def test_finalizing_chain_action_closes_chain_and_schedules_alignment_once(self):
+    def test_finalizing_chain_action_closes_chain_without_speculative_alignment(self):
         async def run_():
-            alignment_requests = []
             service = LLMEnrichmentService(
                 church_id="test",
                 church_terms={},
@@ -901,7 +905,6 @@ class TestSessionCloseIncompleteMetadata:
                 on_caption_merge=lambda *args: asyncio.sleep(0),
                 state_tracker=StubStateTracker(),
             )
-            service._schedule_phrase_alignment = lambda **kwargs: alignment_requests.append(kwargs)
             service._set_active_chain(
                 head_ts=1000,
                 tail_ts=2000,
@@ -931,26 +934,12 @@ class TestSessionCloseIncompleteMetadata:
 
             assert service._active_chain is None
             assert service.metrics["merge_chain_closed"] == 1
-            assert alignment_requests == [
-                {
-                    "ts": 1000,
-                    "spanish": "uno dos",
-                    "english": "One two",
-                    "google_english": "One two",
-                    "source_quality": "clean",
-                    "translation_register": "expository",
-                    "discourse_tag": "statement",
-                    "verse_detected": None,
-                    "merge_with_previous": False,
-                }
-            ]
 
         run(run_())
 
-    def test_hidden_merge_prefers_google_chain_text_and_defers_head_alignment_until_close(self):
+    def test_hidden_merge_prefers_google_chain_text_without_speculative_alignment(self):
         async def run_():
             merges = []
-            alignment_requests = []
 
             async def on_caption_merge(absorb_ts, keep_ts, merged_spanish, merged_english):
                 merges.append((absorb_ts, keep_ts, merged_spanish, merged_english))
@@ -968,7 +957,6 @@ class TestSessionCloseIncompleteMetadata:
                 state_tracker=StubStateTracker(),
             )
             service._should_generate_verse_suggestions = lambda *args: False
-            service._schedule_phrase_alignment = lambda **kwargs: alignment_requests.append(kwargs)
             service._client = FakeAnthropicClient({
                 "primero": (0.01, make_json_result("First")),
                 "segundo": (
@@ -983,21 +971,15 @@ class TestSessionCloseIncompleteMetadata:
             })
 
             await service.enrich("primero", "First", 1000)
-            alignment_requests.clear()
 
             await service.enrich("segundo", "Second", 2000)
 
             assert merges == [(2000, 1000, "primero segundo", "First Second")]
-            assert alignment_requests == []
 
             await service.enrich("tercero", "Third", 3000)
 
-            assert any(
-                request["ts"] == 1000
-                and request["spanish"] == "primero segundo"
-                and request["english"] == "First Second"
-                for request in alignment_requests
-            )
+            assert service._active_chain is None
+            assert service.metrics["merge_chain_closed"] == 1
 
         run(run_())
 
@@ -1316,7 +1298,7 @@ class TestSessionCloseIncompleteMetadata:
                 ("Ahora, vamos a entender frase por frase palabra por palabra, lo que", events[0]["ts"])
             ]
             assert session._pending_audio_timing[events[0]["ts"]]["terminal_incomplete"] is True
-            assert len(events) == 1
+            assert len(_without_pipeline_traces(events)) == 1
 
         run(run_())
 
@@ -1360,26 +1342,315 @@ class TestSessionCloseIncompleteMetadata:
             )
             await session._flush_all_pending_commits()
 
-            assert [event["type"] for event in events] == [
+            visible_events = _without_pipeline_traces(events)
+            assert [event["type"] for event in visible_events] == [
                 "live_translation",
                 "feed_commit",
                 "live_translation_clear",
             ]
-            assert events[0]["text"] == "Now, let's understand, phrase by phrase, word by word, what..."
-            assert events[1] == {
+            assert visible_events[0]["text"] == "Now, let's understand, phrase by phrase, word by word, what..."
+            assert visible_events[1] == {
                 "type": "feed_commit",
                 "spanish": "Ahora, vamos a entender frase por frase palabra por palabra, lo que",
                 "english": "Now, let's understand, phrase by phrase, word by word, what...",
                 "source": "google",
                 "segment_id": 1000,
                 "ts": 1000,
+                "root_segment_id": 1000,
+                "merged_from_segment_ids": [1000],
             }
-            assert events[2] == {
+            assert visible_events[2] == {
                 "type": "live_translation_clear",
                 "reason": "committed",
                 "segment_id": 1000,
                 "ts": 1000,
             }
+
+        run(run_())
+
+
+class TestPostCommitPhraseAlignment:
+    def test_commit_requests_phrase_alignment_from_stable_segment(self):
+        async def run_():
+            events = []
+            alignment_requests = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubEnrichment:
+                def request_phrase_alignment(self, **kwargs):
+                    alignment_requests.append(kwargs)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._db_session_id = None
+            session._enrichment = _StubEnrichment()
+            session._recorder = None
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {
+                1000: {
+                    "source_quality": "clean",
+                    "translation_register": "scripture",
+                    "discourse_tag": "scripture_quote",
+                }
+            }
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {
+                1000: {
+                    "reference": "1 John 1:7",
+                    "canonical_english": "If we walk in the light...",
+                    "spanish_text": "Si andamos en la luz",
+                }
+            }
+            session._detected_verse_cache = {}
+            session._pending_suggested_verses = {}
+            session._segment_stt_cache = {}
+            session._pending_audio_timing = {}
+
+            await session._queue_feed_commit(
+                segment_id=1000,
+                spanish="Si andamos en la luz, tenemos comunión unos con otros.",
+                english="If we walk in the light, we have fellowship with one another.",
+                source="llm",
+                phrase_alignment=None,
+                google_english="If we walk in the light, we have communion with each other.",
+                delay_s=0.01,
+                stt_context={},
+            )
+            await session._flush_all_pending_commits()
+
+            visible_events = _without_pipeline_traces(events)
+            assert [event["type"] for event in visible_events] == [
+                "feed_commit",
+                "live_translation_clear",
+                "verse_detected",
+            ]
+            assert alignment_requests == [
+                {
+                    "ts": 1000,
+                    "spanish": "Si andamos en la luz, tenemos comunión unos con otros.",
+                    "english": "If we walk in the light, we have fellowship with one another.",
+                    "google_english": "If we walk in the light, we have communion with each other.",
+                    "interim_english_hint": "",
+                    "prior_phrase_alignment": None,
+                    "source_quality": "clean",
+                    "translation_register": "scripture",
+                    "discourse_tag": "scripture_quote",
+                    "verse_detected": {
+                        "reference": "1 John 1:7",
+                        "canonical_english": "If we walk in the light...",
+                        "spanish_text": "Si andamos en la luz",
+                    },
+                }
+            ]
+
+        run(run_())
+
+    def test_passthrough_commit_does_not_request_phrase_alignment(self):
+        async def run_():
+            alignment_requests = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    pass
+
+            class _StubEnrichment:
+                def request_phrase_alignment(self, **kwargs):
+                    alignment_requests.append(kwargs)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._db_session_id = None
+            session._enrichment = _StubEnrichment()
+            session._recorder = None
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {}
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._detected_verse_cache = {}
+            session._pending_suggested_verses = {}
+            session._segment_stt_cache = {}
+            session._pending_audio_timing = {}
+
+            await session._queue_feed_commit(
+                segment_id=1000,
+                spanish="God is light",
+                english="God is light",
+                source="passthrough",
+                phrase_alignment=None,
+                google_english="God is light",
+                delay_s=0.01,
+                stt_context={"stt_primary_language": "en-US"},
+            )
+            await session._flush_all_pending_commits()
+
+            assert alignment_requests == []
+
+        run(run_())
+
+    def test_commit_uses_stronger_interim_hint_for_phrase_alignment(self):
+        async def run_():
+            events = []
+            alignment_requests = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubEnrichment:
+                def request_phrase_alignment(self, **kwargs):
+                    alignment_requests.append(kwargs)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._db_session_id = None
+            session._enrichment = _StubEnrichment()
+            session._recorder = None
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {}
+            session._segment_alignment_hint_cache = {}
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._detected_verse_cache = {}
+            session._pending_suggested_verses = {}
+            session._segment_stt_cache = {}
+            session._pending_audio_timing = {}
+
+            await session._queue_feed_commit(
+                segment_id=1000,
+                spanish="Porque la gracia de Dios se ha manifestado.",
+                english="Because the grace of God has been revealed.",
+                source="llm",
+                phrase_alignment=None,
+                google_english="Because the grace of God has appeared.",
+                interim_english_hint="Because the grace of God has appeared to all men.",
+                delay_s=0.01,
+                stt_context={},
+            )
+            await session._flush_all_pending_commits()
+
+            assert alignment_requests == [
+                {
+                    "ts": 1000,
+                    "spanish": "Porque la gracia de Dios se ha manifestado.",
+                    "english": "Because the grace of God has been revealed.",
+                    "google_english": "Because the grace of God has appeared.",
+                    "interim_english_hint": "Because the grace of God has appeared to all men.",
+                    "prior_phrase_alignment": None,
+                    "source_quality": "clean",
+                    "translation_register": "expository",
+                    "discourse_tag": "statement",
+                    "verse_detected": None,
+                }
+            ]
+            alignment_request_events = [
+                event for event in events
+                if event.get("type") == "pipeline_trace" and event.get("trace_stage") == "alignment.request"
+            ]
+            assert len(alignment_request_events) == 1
+            request_data = alignment_request_events[0]["data"]
+            assert request_data["interim_hint_used"] is True
+            assert request_data["interim_hint_reason"] == "accepted"
+
+        run(run_())
+
+    def test_commit_skips_interim_hint_when_disabled(self):
+        async def run_():
+            events = []
+            alignment_requests = []
+
+            class _StubBroadcaster:
+                async def publish(self, church_id, event):
+                    events.append(event)
+
+            class _StubEnrichment:
+                def request_phrase_alignment(self, **kwargs):
+                    alignment_requests.append(kwargs)
+
+            from server.services.session_manager import ServiceSession
+
+            session = ServiceSession.__new__(ServiceSession)
+            session._church_id = "test"
+            session._broadcaster = _StubBroadcaster()
+            session._db_session_id = None
+            session._enrichment = _StubEnrichment()
+            session._recorder = None
+            session._pending_feed_commits = {}
+            session._committed_segment_ids = set()
+            session._persisted_segment_ids = set()
+            session._segment_text_cache = {}
+            session._segment_metadata_cache = {}
+            session._segment_alignment_hint_cache = {}
+            session._pending_segment_metadata = {}
+            session._pending_detected_verses = {}
+            session._detected_verse_cache = {}
+            session._pending_suggested_verses = {}
+            session._segment_stt_cache = {}
+            session._pending_audio_timing = {}
+
+            prior = os.environ.get("CHURCHBRIDGE_INTERIM_ALIGNMENT_HINTS")
+            os.environ["CHURCHBRIDGE_INTERIM_ALIGNMENT_HINTS"] = "0"
+            try:
+                await session._queue_feed_commit(
+                    segment_id=1000,
+                    spanish="Porque la gracia de Dios se ha manifestado.",
+                    english="Because the grace of God has been revealed.",
+                    source="llm",
+                    phrase_alignment=None,
+                    google_english="Because the grace of God has appeared.",
+                    interim_english_hint="Because the grace of God has appeared to all men.",
+                    delay_s=0.01,
+                    stt_context={},
+                )
+                await session._flush_all_pending_commits()
+            finally:
+                if prior is None:
+                    os.environ.pop("CHURCHBRIDGE_INTERIM_ALIGNMENT_HINTS", None)
+                else:
+                    os.environ["CHURCHBRIDGE_INTERIM_ALIGNMENT_HINTS"] = prior
+
+            assert alignment_requests == [
+                {
+                    "ts": 1000,
+                    "spanish": "Porque la gracia de Dios se ha manifestado.",
+                    "english": "Because the grace of God has been revealed.",
+                    "google_english": "Because the grace of God has appeared.",
+                    "interim_english_hint": "",
+                    "prior_phrase_alignment": None,
+                    "source_quality": "clean",
+                    "translation_register": "expository",
+                    "discourse_tag": "statement",
+                    "verse_detected": None,
+                }
+            ]
+            alignment_request_events = [
+                event for event in events
+                if event.get("type") == "pipeline_trace" and event.get("trace_stage") == "alignment.request"
+            ]
+            assert len(alignment_request_events) == 1
+            request_data = alignment_request_events[0]["data"]
+            assert request_data["interim_hint_used"] is False
+            assert request_data["interim_hint_reason"] == "disabled"
 
         run(run_())
 
@@ -1802,6 +2073,13 @@ class TestSessionStats:
             "emitted_forward_context_correction": 0,
             "emitted_other": 0,
         }
+        session._chunk_alignment_metrics = {
+            "chunk_id_reused_count": 0,
+            "chunk_lineage_only_count": 0,
+            "chunk_ambiguous_match_count": 0,
+            "chunk_fresh_after_merge_count": 0,
+            "chunk_span_missing_count": 0,
+        }
 
         stats = session.get_stats()
 
@@ -1824,6 +2102,13 @@ class TestSessionStats:
             "emitted_phrase_alignment": 0,
             "emitted_forward_context_correction": 0,
             "emitted_other": 0,
+        }
+        assert stats["chunk_alignment"] == {
+            "chunk_id_reused_count": 0,
+            "chunk_lineage_only_count": 0,
+            "chunk_ambiguous_match_count": 0,
+            "chunk_fresh_after_merge_count": 0,
+            "chunk_span_missing_count": 0,
         }
 
     def test_feed_revision_metrics_track_per_reason_emissions(self):
@@ -1878,6 +2163,17 @@ class TestFeedRevisionCoalescer:
             "emitted_other": 0,
             "coalesced_count": 0,
         }
+        session._chunk_alignment_metrics = {
+            "chunk_id_reused_count": 0,
+            "chunk_lineage_only_count": 0,
+            "chunk_ambiguous_match_count": 0,
+            "chunk_fresh_after_merge_count": 0,
+            "chunk_span_missing_count": 0,
+        }
+        session._segment_alignment_state_cache = {}
+        session._segment_alignment_version_cache = {}
+        session._segment_root_id_cache = {}
+        session._segment_merge_lineage_cache = {}
         session._pending_feed_revisions = {}
         session._feed_revision_timers = {}
         broadcasts: list[dict] = []
@@ -1913,14 +2209,16 @@ class TestFeedRevisionCoalescer:
 
             await asyncio.sleep(0.2)
 
-            assert len(broadcasts) == 1
-            payload = broadcasts[0]
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert len(visible_broadcasts) == 1
+            payload = visible_broadcasts[0]
             assert payload["english"] == "Second English"
             # context_repair beats phrase_alignment in the precedence table.
             assert payload["reason"] == "context_repair"
-            assert payload["phrase_alignment"] == [
-                {"english_text": "Second", "spanish_text": "Segundo"}
-            ]
+            assert [
+                (item["english_text"], item["spanish_text"])
+                for item in payload["phrase_alignment"]
+            ] == [("Second", "Segundo")]
             assert session._feed_revision_metrics["coalesced_count"] == 1
             assert session._feed_revision_metrics["emitted_total"] == 1
             assert session._feed_revision_metrics["emitted_context_repair"] == 1
@@ -1949,14 +2247,16 @@ class TestFeedRevisionCoalescer:
 
             await asyncio.sleep(0.2)
 
-            assert len(broadcasts) == 1
-            payload = broadcasts[0]
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert len(visible_broadcasts) == 1
+            payload = visible_broadcasts[0]
             assert payload["reason"] == "segmentation_repair"
             assert payload["english"] == "Merged English"
             assert payload["spanish"] == "Hola adios"
-            assert payload["phrase_alignment"] == [
-                {"english_text": "Hi", "spanish_text": "Hola"}
-            ], "alignment from the earlier payload should be preserved across collapse"
+            assert [
+                (item["english_text"], item["spanish_text"])
+                for item in payload["phrase_alignment"]
+            ] == [("Hi", "Hola")], "alignment from the earlier payload should be preserved across collapse"
 
         run(run_())
 
@@ -1981,7 +2281,7 @@ class TestFeedRevisionCoalescer:
 
             await asyncio.sleep(0.2)
 
-            segment_ids = sorted(b["segment_id"] for b in broadcasts)
+            segment_ids = sorted(b["segment_id"] for b in _without_pipeline_traces(broadcasts))
             assert segment_ids == [1000, 2000]
             assert session._feed_revision_metrics["coalesced_count"] == 0
 
@@ -2002,8 +2302,9 @@ class TestFeedRevisionCoalescer:
 
             await session._flush_all_pending_feed_revisions()
 
-            assert len(broadcasts) == 1
-            assert broadcasts[0]["english"] == "Pending English"
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert len(visible_broadcasts) == 1
+            assert visible_broadcasts[0]["english"] == "Pending English"
             assert session._feed_revision_timers == {}
             assert session._pending_feed_revisions == {}
 
@@ -2042,6 +2343,13 @@ class TestPhraseAlignmentDedup:
         session._segment_text_cache = {1000: {"english": "Hello world", "spanish": "Hola mundo"}}
         session._segment_stt_cache = {}
         session._segment_alignment_signature = {}
+        session._chunk_alignment_metrics = {
+            "chunk_id_reused_count": 0,
+            "chunk_lineage_only_count": 0,
+            "chunk_ambiguous_match_count": 0,
+            "chunk_fresh_after_merge_count": 0,
+            "chunk_span_missing_count": 0,
+        }
         session._feed_revision_metrics = {
             "emitted_total": 0,
             "emitted_context_repair": 0,
@@ -2054,6 +2362,10 @@ class TestPhraseAlignmentDedup:
         }
         session._pending_feed_revisions = {}
         session._feed_revision_timers = {}
+        session._segment_alignment_state_cache = {}
+        session._segment_alignment_version_cache = {}
+        session._segment_root_id_cache = {}
+        session._segment_merge_lineage_cache = {}
         broadcasts: list[dict] = []
 
         async def _broadcast(payload):
@@ -2077,9 +2389,10 @@ class TestPhraseAlignmentDedup:
             await session._on_phrase_alignment(1000, list(alignment))
             await session._flush_all_pending_feed_revisions()
 
-            assert len(broadcasts) == 1, (
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert len(visible_broadcasts) == 1, (
                 "duplicate alignment should be deduped; "
-                f"got {len(broadcasts)} broadcasts"
+                f"got {len(visible_broadcasts)} broadcasts"
             )
             assert session._feed_revision_metrics["suppressed_alignment_unchanged"] == 1
             assert session._feed_revision_metrics["emitted_phrase_alignment"] == 1
@@ -2101,9 +2414,10 @@ class TestPhraseAlignmentDedup:
             await session._on_phrase_alignment(1000, list(alignment))
             await session._flush_all_pending_feed_revisions()
 
-            assert len(broadcasts) == 2, (
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert len(visible_broadcasts) == 2, (
                 "alignment must re-emit when the head English changes; "
-                f"got {len(broadcasts)} broadcasts"
+                f"got {len(visible_broadcasts)} broadcasts"
             )
             assert session._feed_revision_metrics["suppressed_alignment_unchanged"] == 0
 
@@ -2127,8 +2441,317 @@ class TestPhraseAlignmentDedup:
             )
             await session._flush_all_pending_feed_revisions()
 
-            assert len(broadcasts) == 2
+            assert len(_without_pipeline_traces(broadcasts)) == 2
             assert session._feed_revision_metrics["suppressed_alignment_unchanged"] == 0
+
+        run(run_())
+
+    def test_phrase_alignment_payload_reuses_chunk_ids_and_tracks_lineage(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {"english_text": "Hello", "spanish_text": "Hola"},
+                    {"english_text": "world", "spanish_text": "mundo"},
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {"english_text": "Hello", "spanish_text": "Hola"},
+                    {"english_text": "world again", "spanish_text": "mundo otra vez"},
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert len(visible_broadcasts) == 2
+            first_payload = visible_broadcasts[0]
+            second_payload = visible_broadcasts[1]
+            first_alignment = first_payload["phrase_alignment"]
+            second_alignment = second_payload["phrase_alignment"]
+
+            assert first_payload["alignment_version"] == 1
+            assert first_payload["previous_alignment_version"] is None
+            assert first_payload["root_segment_id"] == 1000
+            assert first_payload["merged_from_segment_ids"] == [1000]
+            assert first_alignment[0]["chunk_id"] == "seg1000-v1-c1"
+            assert first_alignment[0]["english_span"] == {"start": 0, "end": 5}
+            assert first_alignment[1]["spanish_span"] == {"start": 5, "end": 10}
+            assert first_alignment[0]["remap_decision"] == "fresh"
+            assert first_alignment[0]["ambiguity_reason"] is None
+
+            assert second_payload["alignment_version"] == 2
+            assert second_payload["previous_alignment_version"] == 1
+            assert second_alignment[0]["chunk_id"] == first_alignment[0]["chunk_id"]
+            assert second_alignment[0]["derived_from_chunk_ids"] == [first_alignment[0]["chunk_id"]]
+            assert second_alignment[0]["remap_decision"] in {"exact_reuse", "strong_reuse"}
+            assert second_alignment[1]["chunk_id"] == first_alignment[1]["chunk_id"]
+            assert second_alignment[1]["derived_from_chunk_ids"] == [first_alignment[1]["chunk_id"]]
+            assert second_alignment[1]["remap_decision"] in {"exact_reuse", "strong_reuse"}
+            assert session._chunk_alignment_metrics["chunk_id_reused_count"] == 2
+            assert session._chunk_alignment_metrics["chunk_lineage_only_count"] == 0
+
+        run(run_())
+
+    def test_phrase_alignment_ambiguous_overlap_uses_fresh_id_and_tracks_ambiguity(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+            session._segment_text_cache[1000] = {
+                "english": "Alpha beta gamma",
+                "spanish": "Uno dos tres",
+            }
+
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {"english_text": "Alpha beta", "spanish_text": "Uno dos"},
+                    {"english_text": "beta gamma", "spanish_text": "dos tres"},
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {"english_text": "Alpha beta gamma", "spanish_text": "Uno dos tres"},
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            payload = visible_broadcasts[-1]
+            alignment = payload["phrase_alignment"][0]
+            assert alignment["chunk_id"] == "seg1000-v2-c1"
+            assert alignment["remap_decision"] == "lineage_only"
+            assert alignment["ambiguity_reason"] == "close_competition"
+            assert alignment["derived_from_chunk_ids"] == ["seg1000-v1-c1", "seg1000-v1-c2"]
+            assert session._chunk_alignment_metrics["chunk_ambiguous_match_count"] == 1
+            assert session._chunk_alignment_metrics["chunk_lineage_only_count"] == 1
+            assert session._chunk_alignment_metrics["chunk_id_reused_count"] == 0
+
+        run(run_())
+
+    def test_phrase_alignment_adjacent_merge_uses_lineage_without_ambiguity(self):
+        async def run_():
+            session, broadcasts = self._make_session()
+            session._segment_text_cache[1000] = {
+                "english": "because he lived with Christ,",
+                "spanish": "porque vivió con Cristo,",
+            }
+
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {
+                        "english_text": "because he lived with Christ,",
+                        "spanish_text": "porque vivió con Cristo,",
+                    },
+                    {
+                        "english_text": "didn't he?",
+                        "spanish_text": "¿no?",
+                    },
+                ],
+            )
+            session._segment_text_cache[1000] = {
+                "english": "because he lived with Christ, didn't he?",
+                "spanish": "porque vivió con Cristo, ¿no?",
+            }
+            broadcasts.clear()
+
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {
+                        "english_text": "because he lived with Christ, didn't he?",
+                        "spanish_text": "porque vivió con Cristo, ¿no?",
+                    },
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+
+            payload = _without_pipeline_traces(broadcasts)[-1]
+            alignment = payload["phrase_alignment"][0]
+            assert alignment["chunk_id"] == "seg1000-v2-c1"
+            assert alignment["remap_decision"] == "lineage_only"
+            assert alignment["ambiguity_reason"] == "adjacent_merge"
+            assert alignment["derived_from_chunk_ids"] == ["seg1000-v1-c1", "seg1000-v1-c2"]
+            assert session._chunk_alignment_metrics["chunk_ambiguous_match_count"] == 0
+            assert session._chunk_alignment_metrics["chunk_lineage_only_count"] == 1
+            assert session._chunk_alignment_metrics["chunk_id_reused_count"] == 0
+
+        run(run_())
+
+    def test_phrase_alignment_multiversion_merge_prefers_adjacent_lineage_over_phase1_style_ambiguity(self):
+        async def run_():
+            from server.services.session_manager import (
+                _find_alignment_span,
+                _segment_alignment_text_overlap,
+                _span_overlap_ratio,
+            )
+
+            session, broadcasts = self._make_session()
+            english = (
+                'Christ. That\'s the message we\'ve heard from him, because last night, remember, '
+                'John said, "I touched him, I saw him, I heard him," because he lived with Christ, didn\'t he?'
+            )
+            spanish = (
+                "Cristo. es el mensaje que hemos oído de él, porque anoche se acuerdan que él, "
+                "Juan dice, yo lo he tocado, yo lo he visto, yo lo he oído a Cristo, "
+                "porque él convivió con Cristo, ¿no es cierto?"
+            )
+            session._segment_text_cache[1000] = {
+                "english": english,
+                "spanish": spanish,
+            }
+
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {
+                        "english_text": "That's the message we've heard from him",
+                        "spanish_text": "es el mensaje que hemos oído de él",
+                    },
+                    {
+                        "english_text": "because last night, remember",
+                        "spanish_text": "porque anoche se acuerdan",
+                    },
+                    {
+                        "english_text": 'John said, "I touched him, I saw him, I heard him"',
+                        "spanish_text": "Juan dice, yo lo he tocado, yo lo he visto, yo lo he oído",
+                    },
+                    {
+                        "english_text": "because he lived with Christ",
+                        "spanish_text": "porque él convivió con Cristo",
+                    },
+                    {
+                        "english_text": "didn't he?",
+                        "spanish_text": "¿no es cierto?",
+                    },
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+
+            first_payload = _without_pipeline_traces(broadcasts)[-1]
+            first_alignment = first_payload["phrase_alignment"]
+            prior_by_id = {
+                str(item["chunk_id"]): item
+                for item in first_alignment
+            }
+            target_english = "because he lived with Christ, didn't he?"
+            target_spanish = "porque él convivió con Cristo, ¿no es cierto?"
+            target_english_span = _find_alignment_span(english, target_english)
+            target_spanish_span = _find_alignment_span(spanish, target_spanish)
+            assert target_english_span == {"start": 131, "end": 171}
+            assert target_spanish_span == {"start": 146, "end": 191}
+
+            def legacy_phase1_style_lineage() -> dict:
+                overlap_candidates: list[tuple[float, float, float, int, str]] = []
+                for prior_id, prior in prior_by_id.items():
+                    english_overlap = _segment_alignment_text_overlap(
+                        target_english,
+                        str(prior.get("english_text", "")),
+                    )
+                    spanish_overlap = _segment_alignment_text_overlap(
+                        target_spanish,
+                        str(prior.get("spanish_text", "")),
+                    )
+                    english_span_overlap = _span_overlap_ratio(
+                        target_english_span,
+                        prior.get("english_span") if isinstance(prior.get("english_span"), dict) else None,
+                    )
+                    spanish_span_overlap = _span_overlap_ratio(
+                        target_spanish_span,
+                        prior.get("spanish_span") if isinstance(prior.get("spanish_span"), dict) else None,
+                    )
+                    bilingual_overlap = min(english_overlap, spanish_overlap)
+                    span_overlap = min(english_span_overlap, spanish_span_overlap)
+                    score = max(bilingual_overlap, span_overlap)
+                    if score >= 0.55:
+                        overlap_candidates.append((
+                            score,
+                            bilingual_overlap,
+                            span_overlap,
+                            abs(3 - int(prior.get("ordinal", 3))),
+                            prior_id,
+                        ))
+                overlap_candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+                top_score, top_bilingual, top_span, _, top_prior_id = overlap_candidates[0]
+                second_score = overlap_candidates[1][0] if len(overlap_candidates) > 1 else 0.0
+                strong_one_to_one = (
+                    top_bilingual >= 0.8
+                    and (top_span >= 0.6 or top_bilingual >= 0.9)
+                    and (top_score - second_score >= 0.15 or len(overlap_candidates) == 1)
+                )
+                if strong_one_to_one:
+                    return {
+                        "chunk_id": top_prior_id,
+                        "derived_from_chunk_ids": [top_prior_id],
+                        "remap_decision": "strong_reuse",
+                        "ambiguity_reason": None,
+                    }
+                return {
+                    "chunk_id": "seg1000-v2-c4",
+                    "derived_from_chunk_ids": [candidate_id for *_, candidate_id in overlap_candidates[:2]],
+                    "remap_decision": "lineage_only",
+                    "ambiguity_reason": (
+                        "close_competition"
+                        if len(overlap_candidates) > 1 and abs(top_score - second_score) < 0.15
+                        else None
+                    ),
+                }
+
+            legacy_result = legacy_phase1_style_lineage()
+            assert legacy_result == {
+                "chunk_id": "seg1000-v2-c4",
+                "derived_from_chunk_ids": ["seg1000-v1-c4", "seg1000-v1-c5"],
+                "remap_decision": "lineage_only",
+                "ambiguity_reason": "close_competition",
+            }
+
+            broadcasts.clear()
+            await session._on_phrase_alignment(
+                1000,
+                [
+                    {
+                        "english_text": "That's the message we've heard from him",
+                        "spanish_text": "es el mensaje que hemos oído de él",
+                    },
+                    {
+                        "english_text": "because last night, remember",
+                        "spanish_text": "porque anoche se acuerdan",
+                    },
+                    {
+                        "english_text": 'John said, "I touched him, I saw him, I heard him"',
+                        "spanish_text": "Juan dice, yo lo he tocado, yo lo he visto, yo lo he oído",
+                    },
+                    {
+                        "english_text": target_english,
+                        "spanish_text": target_spanish,
+                    },
+                ],
+            )
+            await session._flush_all_pending_feed_revisions()
+
+            payload = _without_pipeline_traces(broadcasts)[-1]
+            alignment = payload["phrase_alignment"]
+            assert payload["alignment_version"] == 2
+            assert payload["previous_alignment_version"] == 1
+            assert [item["chunk_id"] for item in alignment[:3]] == [
+                "seg1000-v1-c1",
+                "seg1000-v1-c2",
+                "seg1000-v1-c3",
+            ]
+            merged = alignment[3]
+            assert merged["chunk_id"] == "seg1000-v2-c4"
+            assert merged["derived_from_chunk_ids"] == ["seg1000-v1-c4", "seg1000-v1-c5"]
+            assert merged["remap_decision"] == "lineage_only"
+            assert merged["ambiguity_reason"] == "adjacent_merge"
+            assert session._chunk_alignment_metrics["chunk_id_reused_count"] == 3
+            assert session._chunk_alignment_metrics["chunk_lineage_only_count"] == 1
+            assert session._chunk_alignment_metrics["chunk_ambiguous_match_count"] == 0
 
         run(run_())
 
@@ -2180,11 +2803,12 @@ class TestCodeSwitchingPassthrough:
             )
 
             assert translation_calls == []
-            assert broadcasts[0]["type"] == "stt_final"
-            assert broadcasts[1]["type"] == "live_translation"
-            assert broadcasts[1]["text"] == "God is light"
-            assert broadcasts[1]["source"] == "stt_passthrough"
-            assert broadcasts[1]["merge_strategy"] == "replace"
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert visible_broadcasts[0]["type"] == "stt_final"
+            assert visible_broadcasts[1]["type"] == "live_translation"
+            assert visible_broadcasts[1]["text"] == "God is light"
+            assert visible_broadcasts[1]["source"] == "stt_passthrough"
+            assert visible_broadcasts[1]["merge_strategy"] == "replace"
             assert add_calls == [(
                 "God is light",
                 1.0,
@@ -2250,23 +2874,26 @@ class TestCodeSwitchingPassthrough:
             await session._flush_all_pending_commits()
 
             assert translate_calls == []
-            assert [event["type"] for event in events] == [
+            visible_events = _without_pipeline_traces(events)
+            assert [event["type"] for event in visible_events] == [
                 "final_spanish",
                 "live_translation",
                 "feed_commit",
                 "live_translation_clear",
             ]
-            assert events[1]["text"] == "God is light"
-            assert events[1]["source"] == "stt_passthrough"
-            assert events[2] == {
+            assert visible_events[1]["text"] == "God is light"
+            assert visible_events[1]["source"] == "stt_passthrough"
+            assert visible_events[2] == {
                 "type": "feed_commit",
                 "spanish": "God is light",
                 "english": "God is light",
                 "source": "passthrough",
                 "stt_primary_language": "en-US",
                 "stt_detected_languages": ["en-US"],
-                "segment_id": events[2]["segment_id"],
-                "ts": events[2]["ts"],
+                "segment_id": visible_events[2]["segment_id"],
+                "ts": visible_events[2]["ts"],
+                "root_segment_id": visible_events[2]["segment_id"],
+                "merged_from_segment_ids": [visible_events[2]["segment_id"]],
             }
 
         run(run_())
@@ -2337,10 +2964,11 @@ class TestInterimPreview:
             )
 
             assert translation_calls == []
-            assert [event["type"] for event in broadcasts] == ["interim", "live_translation"]
-            assert broadcasts[1]["text"] == "God is light"
-            assert broadcasts[1]["source"] == "stt_passthrough"
-            assert broadcasts[1]["merge_strategy"] == "replace"
+            visible_broadcasts = _without_pipeline_traces(broadcasts)
+            assert [event["type"] for event in visible_broadcasts] == ["interim", "live_translation"]
+            assert visible_broadcasts[1]["text"] == "God is light"
+            assert visible_broadcasts[1]["source"] == "stt_passthrough"
+            assert visible_broadcasts[1]["merge_strategy"] == "replace"
 
         run(run_())
 
@@ -2368,6 +2996,31 @@ class TestInterimPreview:
 
 
 class TestFollowUpPhraseAlignment:
+    def test_alignment_request_message_includes_prior_alignment(self):
+        message = _build_alignment_request_message(
+            "Si andamos en luz, tenemos comunión unos con otros.",
+            "If we walk in the light, we have fellowship with one another.",
+            prior_phrase_alignment=[
+                {
+                    "chunk_id": "seg1000-v1-c1",
+                    "english_text": "If we walk in the light",
+                    "spanish_text": "Si andamos en luz",
+                },
+                {
+                    "chunk_id": "seg1000-v1-c2",
+                    "english_text": "we have fellowship",
+                    "spanish_text": "tenemos comunión",
+                },
+            ],
+            source_quality="clean",
+            translation_register="scripture",
+            discourse_tag="scripture_quote",
+        )
+
+        assert "[PRIOR ACCEPTED ALIGNMENT]" in message
+        assert "seg1000-v1-c1: If we walk in the light => Si andamos en luz" in message
+        assert "Preserve these chunk boundaries" in message
+
     def test_follow_up_alignment_emits_revision_payload(self):
         async def run_():
             alignments = []
@@ -2482,6 +3135,7 @@ class TestFollowUpPhraseAlignment:
             "Si andamos en luz, tenemos comuniÃ³n unos con otros.",
             "If we walk in the light, we have fellowship with one another.",
             google_english="If we walk in the light, we have communion with each other.",
+            interim_english_hint="If we walk in the light as he is in the light, we have fellowship with one another.",
             source_quality="clean",
             translation_register="scripture",
             discourse_tag="scripture_quote",
@@ -2493,6 +3147,7 @@ class TestFollowUpPhraseAlignment:
         )
 
         assert "[GOOGLE ENGLISH BASELINE]" in message
+        assert "[INTERIM ENGLISH HINT]" in message
         assert "[SCRIPTURE CONTEXT]" in message
         assert "reference: 1 John 1:7" in message
 
@@ -2534,6 +3189,7 @@ class TestFollowUpPhraseAlignment:
                 spanish="yo lo he tocado, yo lo he visto, yo lo he oído",
                 english="I have touched him, I have seen him, I have heard him.",
                 google_english="I have touched him, I have seen him, I have heard him.",
+                interim_english_hint="I have touched him, I have seen him, I have heard him with my own ears.",
                 source_quality="noisy",
                 translation_register="expository",
                 discourse_tag="statement",
@@ -2588,6 +3244,7 @@ class TestFollowUpPhraseAlignment:
                 spanish="porque hay mucha gente dice",
                 english="Because many people say",
                 google_english="Because many people say",
+                interim_english_hint="Because many people say many things about this.",
                 source_quality="noisy",
                 translation_register="expository",
                 discourse_tag="statement",
@@ -2642,8 +3299,21 @@ class TestMergeAlignmentReschedule:
                 "If we say that we have fellowship with him, but walk in darkness, we lie.",
             )
 
-            assert alignment_requests == []
-            assert any(event["type"] == "caption_merge" for event in events)
+            assert alignment_requests == [
+                {
+                    "ts": 1000,
+                    "spanish": "Si decimos que tenemos comuniÃ³n con Ã©l, pero andamos en tinieblas, mentimos.",
+                    "english": "If we say that we have fellowship with him, but walk in darkness, we lie.",
+                    "google_english": "If we say that we have fellowship with him, but walk in darkness, we lie.",
+                    "interim_english_hint": "",
+                    "prior_phrase_alignment": None,
+                    "source_quality": "clean",
+                    "translation_register": "scripture",
+                    "discourse_tag": "statement",
+                    "verse_detected": None,
+                }
+            ]
+            assert any(event["type"] == "caption_merge" for event in _without_pipeline_traces(events))
 
         run(run_())
 
@@ -2686,14 +3356,15 @@ class TestTranslationRepairFallback:
             await session._on_translation("uno", "One", 1000)
             await session._on_translation_update(1000, "The first one")
 
-            assert [event["type"] for event in events] == [
+            visible_events = _without_pipeline_traces(events)
+            assert [event["type"] for event in visible_events] == [
                 "live_translation",
                 "live_translation",
                 "feed_commit",
                 "live_translation_clear",
             ]
-            assert events[2]["english"] == "The first one"
-            assert events[2]["source"] == "llm"
+            assert visible_events[2]["english"] == "The first one"
+            assert visible_events[2]["source"] == "llm"
 
         run(run_())
 

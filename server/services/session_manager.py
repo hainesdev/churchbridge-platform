@@ -23,7 +23,7 @@ from server.services.stt import STTConfig
 from server.services.sermon_state_tracker import SermonStateTracker
 from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
-from server.services.session_recorder import SessionRecorder, CaptureResult
+from server.services.session_recorder import SessionRecorder, CaptureResult, BenchmarkCaptureMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 PREFERRED_COMMIT_DELAY_S = 0.85
 SHORT_FRAGMENT_COMMIT_DELAY_S = 1.5
 TERMINAL_INCOMPLETE_COMMIT_DELAY_S = 0.35
+
+
+def _session_capture_enabled() -> bool:
+    """Default session capture to on unless explicitly disabled."""
+    value = os.getenv("SESSION_CAPTURE_ENABLED")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "off", "no"}
 
 # Splits an STT final at internal sentence boundaries — e.g.
 # "yo soy un cristiano. Pentecostés viene Juan y dice," becomes two parts.
@@ -262,6 +270,244 @@ def _preferred_commit_delay_s(text: str, *, terminal_incomplete: bool) -> float:
     return PREFERRED_COMMIT_DELAY_S
 
 
+def _interim_alignment_hints_enabled() -> bool:
+    value = os.getenv("CHURCHBRIDGE_INTERIM_ALIGNMENT_HINTS")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _english_preview_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+
+
+def _choose_stronger_interim_hint(current: str, candidate: str, *, replace: bool) -> str:
+    current = (current or "").strip()
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    if replace:
+        return candidate
+    current_tokens = _english_preview_tokens(current)
+    candidate_tokens = _english_preview_tokens(candidate)
+    if len(candidate_tokens) > len(current_tokens):
+        return candidate
+    if len(candidate) > len(current):
+        return candidate
+    return current
+
+
+def _select_alignment_hint_english(
+    *,
+    english: str,
+    google_english: str,
+    interim_english_hint: str,
+) -> tuple[str, str]:
+    hint = (interim_english_hint or "").strip()
+    if not hint:
+        return "", "missing"
+
+    normalized_hint = " ".join(hint.split()).lower()
+    normalized_english = " ".join((english or "").split()).lower()
+    normalized_google = " ".join((google_english or "").split()).lower()
+    if normalized_hint in {"", normalized_english, normalized_google}:
+        return "", "duplicate_of_final"
+
+    hint_tokens = _english_preview_tokens(hint)
+    if len(hint_tokens) < 4:
+        return "", "too_short"
+
+    baseline_tokens = _english_preview_tokens(english) or _english_preview_tokens(google_english)
+    if not baseline_tokens:
+        return "", "missing_baseline"
+
+    baseline_vocab = set(baseline_tokens)
+    hint_vocab = set(hint_tokens)
+    overlap_ratio = len(hint_vocab & baseline_vocab) / max(min(len(hint_vocab), len(baseline_vocab)), 1)
+    if overlap_ratio < 0.5:
+        return "", "low_overlap"
+
+    baseline_word_count = max(
+        len(_english_preview_tokens(english)),
+        len(_english_preview_tokens(google_english)),
+    )
+    if len(hint_tokens) < baseline_word_count + 2 and len(hint_tokens) <= 8:
+        return "", "not_meaningfully_longer"
+
+    return hint, "accepted"
+
+
+def _normalize_alignment_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9']+", " ", (text or "").lower()).strip()
+
+
+def _segment_alignment_text_overlap(left: str, right: str) -> float:
+    left_tokens = {token for token in _normalize_alignment_text(left).split() if token}
+    right_tokens = {token for token in _normalize_alignment_text(right).split() if token}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(min(len(left_tokens), len(right_tokens)), 1)
+
+
+def _span_overlap_ratio(
+    left: dict[str, int] | None,
+    right: dict[str, int] | None,
+) -> float:
+    if not left or not right:
+        return 0.0
+    left_start = int(left.get("start", -1))
+    left_end = int(left.get("end", -1))
+    right_start = int(right.get("start", -1))
+    right_end = int(right.get("end", -1))
+    if left_start < 0 or right_start < 0 or left_end <= left_start or right_end <= right_start:
+        return 0.0
+    overlap_start = max(left_start, right_start)
+    overlap_end = min(left_end, right_end)
+    if overlap_end <= overlap_start:
+        return 0.0
+    overlap = overlap_end - overlap_start
+    left_len = left_end - left_start
+    right_len = right_end - right_start
+    return overlap / max(min(left_len, right_len), 1)
+
+
+def _find_alignment_span(text: str, chunk_text: str) -> dict[str, int] | None:
+    source = text or ""
+    target = (chunk_text or "").strip()
+    if not source or not target:
+        return None
+
+    direct_index = source.lower().find(target.lower())
+    if direct_index >= 0:
+        return {
+            "start": direct_index,
+            "end": direct_index + len(target),
+        }
+
+    tokens = re.findall(r"[A-Za-z0-9']+|[^A-Za-z0-9'\s]+", target)
+    if not tokens:
+        return None
+    pattern = "".join(
+        (
+            re.escape(token)
+            if re.fullmatch(r"[A-Za-z0-9']+", token)
+            else re.escape(token).replace(r"\.", ".?")
+        )
+        + (r"[\s\u00A0,.;:!?\"'“”‘’()\-\u2013\u2014]*" if index < len(tokens) - 1 else "")
+        for index, token in enumerate(tokens)
+    )
+    match = re.search(pattern, source, re.IGNORECASE)
+    if not match:
+        return None
+    return {
+        "start": match.start(),
+        "end": match.end(),
+    }
+
+
+def _union_alignment_spans(*spans: dict[str, int] | None) -> dict[str, int] | None:
+    valid_spans: list[tuple[int, int]] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+        start = int(span.get("start", -1))
+        end = int(span.get("end", -1))
+        if start < 0 or end <= start:
+            continue
+        valid_spans.append((start, end))
+    if not valid_spans:
+        return None
+    return {
+        "start": min(start for start, _ in valid_spans),
+        "end": max(end for _, end in valid_spans),
+    }
+
+
+def _select_adjacent_merge_lineage(
+    *,
+    current_english_text: str,
+    current_spanish_text: str,
+    current_english_span: dict[str, int] | None,
+    current_spanish_span: dict[str, int] | None,
+    current_ordinal: int,
+    overlap_candidates: list[tuple[float, float, float, int, str]],
+    prior_by_id: dict[str, dict],
+) -> tuple[list[str], str | None]:
+    if len(overlap_candidates) < 2:
+        return [], None
+
+    candidate_ids = [candidate_id for *_, candidate_id in overlap_candidates[:3]]
+    candidate_pairs: list[tuple[float, list[str]]] = []
+    for left_index, left_id in enumerate(candidate_ids):
+        left_prior = prior_by_id.get(left_id) or {}
+        left_ordinal = int(left_prior.get("ordinal", current_ordinal))
+        for right_id in candidate_ids[left_index + 1:]:
+            right_prior = prior_by_id.get(right_id) or {}
+            right_ordinal = int(right_prior.get("ordinal", current_ordinal))
+            if abs(left_ordinal - right_ordinal) != 1:
+                continue
+            prior_english_overlap = _span_overlap_ratio(
+                left_prior.get("english_span") if isinstance(left_prior.get("english_span"), dict) else None,
+                right_prior.get("english_span") if isinstance(right_prior.get("english_span"), dict) else None,
+            )
+            prior_spanish_overlap = _span_overlap_ratio(
+                left_prior.get("spanish_span") if isinstance(left_prior.get("spanish_span"), dict) else None,
+                right_prior.get("spanish_span") if isinstance(right_prior.get("spanish_span"), dict) else None,
+            )
+            prior_chunk_overlap = min(prior_english_overlap, prior_spanish_overlap)
+            if prior_chunk_overlap >= 0.2:
+                continue
+            ordered = sorted(
+                ((left_ordinal, left_id, left_prior), (right_ordinal, right_id, right_prior)),
+                key=lambda item: (item[0], item[1]),
+            )
+            ordered_ids = [item[1] for item in ordered]
+            combined_english = " ".join(
+                str(item[2].get("english_text", "")).strip()
+                for item in ordered
+                if str(item[2].get("english_text", "")).strip()
+            ).strip()
+            combined_spanish = " ".join(
+                str(item[2].get("spanish_text", "")).strip()
+                for item in ordered
+                if str(item[2].get("spanish_text", "")).strip()
+            ).strip()
+            if not combined_english or not combined_spanish:
+                continue
+            combined_bilingual_overlap = min(
+                _segment_alignment_text_overlap(current_english_text, combined_english),
+                _segment_alignment_text_overlap(current_spanish_text, combined_spanish),
+            )
+            combined_span_overlap = min(
+                _span_overlap_ratio(
+                    current_english_span,
+                    _union_alignment_spans(
+                        left_prior.get("english_span") if isinstance(left_prior.get("english_span"), dict) else None,
+                        right_prior.get("english_span") if isinstance(right_prior.get("english_span"), dict) else None,
+                    ),
+                ),
+                _span_overlap_ratio(
+                    current_spanish_span,
+                    _union_alignment_spans(
+                        left_prior.get("spanish_span") if isinstance(left_prior.get("spanish_span"), dict) else None,
+                        right_prior.get("spanish_span") if isinstance(right_prior.get("spanish_span"), dict) else None,
+                    ),
+                ),
+            )
+            combined_score = max(combined_bilingual_overlap, combined_span_overlap)
+            if combined_bilingual_overlap < 0.8 and combined_span_overlap < 0.8:
+                continue
+            candidate_pairs.append((combined_score, ordered_ids))
+
+    if not candidate_pairs:
+        return [], None
+
+    candidate_pairs.sort(key=lambda item: (-item[0], item[1]))
+    return candidate_pairs[0][1], "adjacent_merge"
+
+
 # Co-incident `feed_revision` debounce window. 150 ms is short enough to stay
 # below the perceptual threshold for revision-event arrival but long enough to
 # catch the structural collision pattern (`context_repair` → `phrase_alignment`
@@ -319,6 +565,13 @@ class ServiceSession:
         self._segment_text_cache: dict[int, dict] = {}
         self._segment_stt_cache: dict[int, dict] = {}
         self._segment_metadata_cache: dict[int, dict] = {}
+        self._segment_alignment_hint_cache: dict[int, str] = {}
+        self._segment_alignment_state_cache: dict[int, dict] = {}
+        self._segment_alignment_version_cache: dict[int, int] = {}
+        self._segment_root_id_cache: dict[int, int] = {}
+        self._segment_merge_lineage_cache: dict[int, list[int]] = {}
+        self._current_interim_alignment_hint: str = ""
+        self._benchmark_capture: BenchmarkCaptureMetadata | None = None
         # Per-reason feed_revision broadcast counters. Bumped inside
         # `_emit_feed_revision_now` so the values reflect what actually shipped
         # to the client (post-coalesce volume), not what producers tried to send.
@@ -335,6 +588,13 @@ class ServiceSession:
             "coalesced_count": 0,
             "suppressed_alignment_unchanged": 0,
         }
+        self._chunk_alignment_metrics: dict[str, int] = {
+            "chunk_id_reused_count": 0,
+            "chunk_lineage_only_count": 0,
+            "chunk_ambiguous_match_count": 0,
+            "chunk_fresh_after_merge_count": 0,
+            "chunk_span_missing_count": 0,
+        }
         # Last-broadcast phrase-alignment signature per segment_id, keyed by
         # `(english, ((en_text, es_text), ...))`. A repeated alignment payload
         # whose signature matches the previous emit is dropped — those revisions
@@ -350,6 +610,7 @@ class ServiceSession:
         self._feed_revision_timers: dict[int, asyncio.TimerHandle] = {}
         self._pending_segment_metadata: dict[int, dict] = {}
         self._pending_detected_verses: dict[int, dict] = {}
+        self._detected_verse_cache: dict[int, dict] = {}
         self._pending_suggested_verses: dict[int, list[dict]] = {}
         self._last_segment_id: int = 0
         self._stt_config: STTConfig = STTConfig()
@@ -361,6 +622,41 @@ class ServiceSession:
             self._segment_stt_cache = cache
         return cache
 
+    def _ensure_segment_alignment_hint_cache(self) -> dict[int, str]:
+        cache = getattr(self, "_segment_alignment_hint_cache", None)
+        if cache is None:
+            cache = {}
+            self._segment_alignment_hint_cache = cache
+        return cache
+
+    def _ensure_segment_alignment_state_cache(self) -> dict[int, dict]:
+        cache = getattr(self, "_segment_alignment_state_cache", None)
+        if cache is None:
+            cache = {}
+            self._segment_alignment_state_cache = cache
+        return cache
+
+    def _ensure_segment_alignment_version_cache(self) -> dict[int, int]:
+        cache = getattr(self, "_segment_alignment_version_cache", None)
+        if cache is None:
+            cache = {}
+            self._segment_alignment_version_cache = cache
+        return cache
+
+    def _ensure_segment_root_id_cache(self) -> dict[int, int]:
+        cache = getattr(self, "_segment_root_id_cache", None)
+        if cache is None:
+            cache = {}
+            self._segment_root_id_cache = cache
+        return cache
+
+    def _ensure_segment_merge_lineage_cache(self) -> dict[int, list[int]]:
+        cache = getattr(self, "_segment_merge_lineage_cache", None)
+        if cache is None:
+            cache = {}
+            self._segment_merge_lineage_cache = cache
+        return cache
+
     async def start(
         self,
         sample_rate: int,
@@ -368,17 +664,25 @@ class ServiceSession:
         source_scripture_version: str = "rvr1960",
         display_scripture_version: str = "kjv",
         stt_config: STTConfig | None = None,
+        benchmark_capture: BenchmarkCaptureMetadata | None = None,
     ):
         self._sample_rate = sample_rate
         self._source_scripture_version = source_scripture_version or "rvr1960"
         self._display_scripture_version = display_scripture_version or "kjv"
         self._stt_config = stt_config or STTConfig()
+        self._benchmark_capture = benchmark_capture
         self._db_session_id = await create_service_session(self._church_id)
 
-        if os.getenv("SESSION_CAPTURE_ENABLED"):
-            self._recorder = SessionRecorder(self._db_session_id, self._church_id)
+        if self._capture_enabled_for_session():
+            self._recorder = SessionRecorder(
+                self._db_session_id,
+                self._church_id,
+                benchmark_capture=self._benchmark_capture,
+            )
             self._recorder.record_event("session_start", {
-                "church_id": self._church_id, "sample_rate": sample_rate,
+                "church_id": self._church_id,
+                "sample_rate": sample_rate,
+                "benchmark_capture": self._benchmark_capture.as_dict() if self._benchmark_capture else None,
             })
 
         glossary = await get_glossary(self._church_id)
@@ -434,6 +738,8 @@ class ServiceSession:
             "sourceScriptureVersion": self._source_scripture_version,
             "displayScriptureVersion": self._display_scripture_version,
             "sttConfig": self._stt_config.public_payload(),
+            "benchmarkCapture": self._benchmark_capture.as_dict() if self._benchmark_capture else None,
+            "captureActive": self._recorder is not None,
         })
         await self._broadcast_pipeline_trace(
             stage="session.start",
@@ -445,6 +751,8 @@ class ServiceSession:
                 "source_scripture_version": self._source_scripture_version,
                 "display_scripture_version": self._display_scripture_version,
                 "stt_config": self._stt_config.public_payload(),
+                "benchmark_capture": self._benchmark_capture.as_dict() if self._benchmark_capture else None,
+                "capture_active": self._recorder is not None,
             },
         )
         logger.info(
@@ -472,7 +780,7 @@ class ServiceSession:
             try:
                 self._recorder.record_event("session_stop", {"duration_s": 0})
                 result = self._recorder.stop()
-                await _finalize_capture_in_db(result, self._db_session_id)
+                await _finalize_capture_in_db(result, self._db_session_id, self._benchmark_capture)
             except Exception as e:
                 logger.warning("[session] Recorder stop failed: %s", e)
             self._recorder = None
@@ -654,6 +962,8 @@ class ServiceSession:
                 logger.debug("[session:%s] Hold set: rhetorical_question", self._church_id)
 
         if self._translation:
+            interim_hint = getattr(self, "_current_interim_alignment_hint", "").strip()
+            self._current_interim_alignment_hint = ""
             commit_delay_s = _preferred_commit_delay_s(
                 text,
                 terminal_incomplete=terminal_incomplete,
@@ -665,6 +975,7 @@ class ServiceSession:
                 "flush_reason": flush_reason,
                 "stt_context": stt_context,
                 "commit_delay_s": commit_delay_s,
+                "interim_english_hint": interim_hint,
             }
             # Prune entries older than 120s — these belong to sentences whose
             # translation failed after all retries and will never be consumed.
@@ -692,6 +1003,7 @@ class ServiceSession:
                 "flush_reason": "",
                 "stt_context": stt_context or {},
                 "commit_delay_s": PREFERRED_COMMIT_DELAY_S,
+                "interim_english_hint": "",
             },
         )
         stt_context = dict(stt_context or timing.get("stt_context") or {})
@@ -730,6 +1042,8 @@ class ServiceSession:
             english=english,
             source="passthrough",
             phrase_alignment=None,
+            google_english=english,
+            interim_english_hint=str(timing.get("interim_english_hint") or ""),
             delay_s=float(timing.get("commit_delay_s", PREFERRED_COMMIT_DELAY_S)),
             stt_context=stt_context,
         )
@@ -744,6 +1058,7 @@ class ServiceSession:
                 "flush_reason": "",
                 "stt_context": {},
                 "commit_delay_s": PREFERRED_COMMIT_DELAY_S,
+                "interim_english_hint": "",
             },
         )
         stt_context = dict(timing.get("stt_context") or {})
@@ -778,6 +1093,8 @@ class ServiceSession:
             english=english,
             source="google",
             phrase_alignment=None,
+            google_english=english,
+            interim_english_hint=str(timing.get("interim_english_hint") or ""),
             delay_s=float(timing.get("commit_delay_s", PREFERRED_COMMIT_DELAY_S)),
             stt_context=stt_context,
         )
@@ -793,6 +1110,7 @@ class ServiceSession:
                     "flush_reason": "",
                     "stt_context": {},
                     "commit_delay_s": PREFERRED_COMMIT_DELAY_S,
+                    "interim_english_hint": "",
                 },
             )
             audio_start = float(timing.get("audio_start", 0.0))
@@ -813,6 +1131,12 @@ class ServiceSession:
         source: str = "google_fragment",
         replace: bool = False,
     ):
+        if source in {"google_fragment", "google_interim"}:
+            self._current_interim_alignment_hint = _choose_stronger_interim_hint(
+                getattr(self, "_current_interim_alignment_hint", ""),
+                text,
+                replace=replace,
+            )
         await self._broadcast_live_translation(
             text=text,
             source=source,
@@ -820,6 +1144,235 @@ class ServiceSession:
             live_ts=_now(),
             merge_strategy="replace" if replace else "append",
         )
+
+    def _segment_root_id(self, segment_id: int) -> int:
+        return self._ensure_segment_root_id_cache().get(segment_id, segment_id)
+
+    def _segment_merge_lineage(self, segment_id: int) -> list[int]:
+        lineage = self._ensure_segment_merge_lineage_cache().get(segment_id)
+        if lineage:
+            return list(lineage)
+        return [segment_id]
+
+    def _set_segment_lineage(
+        self,
+        segment_id: int,
+        *,
+        root_segment_id: int | None = None,
+        merged_from_segment_ids: list[int] | None = None,
+    ) -> None:
+        root_id = root_segment_id if root_segment_id is not None else self._segment_root_id(segment_id)
+        self._ensure_segment_root_id_cache()[segment_id] = root_id
+        lineage = merged_from_segment_ids or self._segment_merge_lineage(segment_id)
+        deduped: list[int] = []
+        for item in lineage:
+            if item not in deduped:
+                deduped.append(item)
+        self._ensure_segment_merge_lineage_cache()[segment_id] = deduped
+
+    def _build_alignment_payload(
+        self,
+        *,
+        segment_id: int,
+        english: str,
+        spanish: str,
+        phrase_alignment: list[dict],
+        root_segment_id: int | None = None,
+        merged_from_segment_ids: list[int] | None = None,
+    ) -> dict:
+        prior_state = self._ensure_segment_alignment_state_cache().get(segment_id) or {}
+        previous_items = prior_state.get("phrase_alignment") if isinstance(prior_state, dict) else None
+        previous_items = previous_items if isinstance(previous_items, list) else []
+        previous_version = int(prior_state.get("alignment_version") or 0) if isinstance(prior_state, dict) else 0
+        version = previous_version + 1
+        resolved_root_segment_id = root_segment_id if root_segment_id is not None else self._segment_root_id(segment_id)
+        resolved_merged_from = merged_from_segment_ids or self._segment_merge_lineage(segment_id)
+        chunk_metrics = getattr(self, "_chunk_alignment_metrics", None)
+
+        available_exact: dict[tuple[str, str], list[dict]] = {}
+        prior_by_id: dict[str, dict] = {}
+        for prior in previous_items:
+            if not isinstance(prior, dict):
+                continue
+            chunk_id = str(prior.get("chunk_id") or "").strip()
+            if chunk_id:
+                prior_by_id[chunk_id] = prior
+            exact_key = (
+                _normalize_alignment_text(str(prior.get("english_text", ""))),
+                _normalize_alignment_text(str(prior.get("spanish_text", ""))),
+            )
+            if exact_key[0] and exact_key[1]:
+                available_exact.setdefault(exact_key, []).append(prior)
+
+        current_chunks: list[dict] = []
+        for ordinal, item in enumerate(phrase_alignment):
+            english_text = str(item.get("english_text", "")).strip()
+            spanish_text = str(item.get("spanish_text", "")).strip()
+            if not english_text or not spanish_text:
+                continue
+            current_chunks.append({
+                "ordinal": ordinal,
+                "english_text": english_text,
+                "spanish_text": spanish_text,
+                "english_span": _find_alignment_span(english, english_text),
+                "spanish_span": _find_alignment_span(spanish, spanish_text),
+            })
+
+        used_prior_ids: set[str] = set()
+        hydrated_items: list[dict] = []
+        for current in current_chunks:
+            ordinal = int(current["ordinal"])
+            english_text = str(current["english_text"])
+            spanish_text = str(current["spanish_text"])
+            english_span = current.get("english_span")
+            spanish_span = current.get("spanish_span")
+            if chunk_metrics is not None and (english_span is None or spanish_span is None):
+                chunk_metrics["chunk_span_missing_count"] = chunk_metrics.get("chunk_span_missing_count", 0) + 1
+
+            exact_key = (
+                _normalize_alignment_text(english_text),
+                _normalize_alignment_text(spanish_text),
+            )
+            matching_prior = available_exact.get(exact_key, [])
+            reused_prior = None
+            while matching_prior:
+                candidate = matching_prior.pop(0)
+                candidate_id = str(candidate.get("chunk_id") or "").strip()
+                if candidate_id and candidate_id not in used_prior_ids:
+                    reused_prior = candidate
+                    used_prior_ids.add(candidate_id)
+                    break
+            derived_from_chunk_ids: list[str] = []
+            chunk_id = ""
+            remap_decision = "fresh"
+            ambiguity_reason = None
+
+            if reused_prior is not None:
+                chunk_id = str(reused_prior.get("chunk_id") or "").strip()
+                if chunk_id:
+                    derived_from_chunk_ids = [chunk_id]
+                    remap_decision = "exact_reuse"
+                    if chunk_metrics is not None:
+                        chunk_metrics["chunk_id_reused_count"] = chunk_metrics.get("chunk_id_reused_count", 0) + 1
+            else:
+                overlap_candidates: list[tuple[float, float, float, int, str]] = []
+                for prior_id, prior in prior_by_id.items():
+                    if prior_id in used_prior_ids:
+                        continue
+                    english_overlap = _segment_alignment_text_overlap(
+                        english_text,
+                        str(prior.get("english_text", "")),
+                    )
+                    spanish_overlap = _segment_alignment_text_overlap(
+                        spanish_text,
+                        str(prior.get("spanish_text", "")),
+                    )
+                    english_span_overlap = _span_overlap_ratio(
+                        english_span if isinstance(english_span, dict) else None,
+                        prior.get("english_span") if isinstance(prior.get("english_span"), dict) else None,
+                    )
+                    spanish_span_overlap = _span_overlap_ratio(
+                        spanish_span if isinstance(spanish_span, dict) else None,
+                        prior.get("spanish_span") if isinstance(prior.get("spanish_span"), dict) else None,
+                    )
+                    bilingual_overlap = min(english_overlap, spanish_overlap)
+                    span_overlap = min(english_span_overlap, spanish_span_overlap)
+                    score = max(bilingual_overlap, span_overlap)
+                    if score >= 0.55:
+                        overlap_candidates.append((
+                            score,
+                            bilingual_overlap,
+                            span_overlap,
+                            abs(ordinal - int(prior.get("ordinal", ordinal))),
+                            prior_id,
+                        ))
+                overlap_candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+                if overlap_candidates:
+                    top_score, top_bilingual, top_span, _, top_prior_id = overlap_candidates[0]
+                    second_score = overlap_candidates[1][0] if len(overlap_candidates) > 1 else 0.0
+                    strong_one_to_one = (
+                        top_bilingual >= 0.8
+                        and (top_span >= 0.6 or top_bilingual >= 0.9)
+                        and (top_score - second_score >= 0.15 or len(overlap_candidates) == 1)
+                    )
+                    if strong_one_to_one:
+                        chunk_id = top_prior_id
+                        derived_from_chunk_ids = [top_prior_id]
+                        used_prior_ids.add(top_prior_id)
+                        remap_decision = "strong_reuse"
+                        if chunk_metrics is not None:
+                            chunk_metrics["chunk_id_reused_count"] = chunk_metrics.get("chunk_id_reused_count", 0) + 1
+                    else:
+                        adjacent_merge_ids, adjacent_merge_reason = _select_adjacent_merge_lineage(
+                            current_english_text=english_text,
+                            current_spanish_text=spanish_text,
+                            current_english_span=english_span if isinstance(english_span, dict) else None,
+                            current_spanish_span=spanish_span if isinstance(spanish_span, dict) else None,
+                            current_ordinal=ordinal,
+                            overlap_candidates=overlap_candidates,
+                            prior_by_id=prior_by_id,
+                        )
+                        if adjacent_merge_ids:
+                            derived_from_chunk_ids = adjacent_merge_ids
+                            ambiguity_reason = adjacent_merge_reason
+                        else:
+                            derived_from_chunk_ids = [candidate_id for *_, candidate_id in overlap_candidates[:2]]
+                        remap_decision = "lineage_only"
+                        if (
+                            not adjacent_merge_ids
+                            and len(overlap_candidates) > 1
+                            and abs(top_score - second_score) < 0.15
+                        ):
+                            ambiguity_reason = "close_competition"
+                            if chunk_metrics is not None:
+                                chunk_metrics["chunk_ambiguous_match_count"] = (
+                                    chunk_metrics.get("chunk_ambiguous_match_count", 0) + 1
+                                )
+                        if chunk_metrics is not None and derived_from_chunk_ids:
+                            chunk_metrics["chunk_lineage_only_count"] = (
+                                chunk_metrics.get("chunk_lineage_only_count", 0) + 1
+                            )
+                if not chunk_id:
+                    chunk_id = f"seg{resolved_root_segment_id}-v{version}-c{ordinal + 1}"
+                if (
+                    chunk_metrics is not None
+                    and len(resolved_merged_from) > 1
+                    and remap_decision in {"fresh", "lineage_only"}
+                ):
+                    chunk_metrics["chunk_fresh_after_merge_count"] = (
+                        chunk_metrics.get("chunk_fresh_after_merge_count", 0) + 1
+                    )
+
+            if not chunk_id:
+                chunk_id = f"seg{resolved_root_segment_id}-v{version}-c{ordinal + 1}"
+
+            hydrated_items.append({
+                "chunk_id": chunk_id,
+                "english_text": english_text,
+                "spanish_text": spanish_text,
+                "english_span": english_span,
+                "spanish_span": spanish_span,
+                "ordinal": ordinal,
+                "derived_from_chunk_ids": derived_from_chunk_ids,
+                "remap_decision": remap_decision,
+                "ambiguity_reason": ambiguity_reason,
+            })
+
+        payload = {
+            "alignment_version": version,
+            "previous_alignment_version": previous_version or None,
+            "root_segment_id": resolved_root_segment_id,
+            "merged_from_segment_ids": resolved_merged_from,
+            "phrase_alignment": hydrated_items,
+        }
+        self._ensure_segment_alignment_version_cache()[segment_id] = version
+        self._ensure_segment_alignment_state_cache()[segment_id] = payload
+        self._set_segment_lineage(
+            segment_id,
+            root_segment_id=resolved_root_segment_id,
+            merged_from_segment_ids=resolved_merged_from,
+        )
+        return payload
 
     async def _on_correction(self, ts: int, english: str):
         """Silently update a previously broadcast translation with better context.
@@ -933,7 +1486,25 @@ class ServiceSession:
             source="llm",
             reason="context_repair",
             phrase_alignment=phrase_alignment,
+            root_segment_id=self._segment_root_id(ts),
+            merged_from_segment_ids=self._segment_merge_lineage(ts),
         )
+        if not phrase_alignment:
+            cached = self._segment_text_cache.get(ts, {})
+            await self._request_phrase_alignment_for_segment(
+                segment_id=ts,
+                spanish=str(cached.get("spanish", "")),
+                english=english,
+                google_english=str(cached.get("english", "") or english),
+                source="llm",
+                prior_phrase_alignment=(
+                    list(
+                        self._ensure_segment_alignment_state_cache()
+                        .get(ts, {})
+                        .get("phrase_alignment", [])
+                    )
+                ),
+            )
 
     async def _on_phrase_alignment(self, ts: int, phrase_alignment: list[dict]):
         if not phrase_alignment:
@@ -945,7 +1516,14 @@ class ServiceSession:
         if not cached:
             return
         english = cached.get("english", "")
-        signature = self._build_alignment_signature(english, phrase_alignment)
+        payload = self._build_alignment_payload(
+            segment_id=ts,
+            english=english,
+            spanish=str(cached.get("spanish", "")),
+            phrase_alignment=phrase_alignment,
+        )
+        hydrated_alignment = payload.get("phrase_alignment", [])
+        signature = self._build_alignment_signature(english, hydrated_alignment)
         signatures = getattr(self, "_segment_alignment_signature", None)
         if signatures is None:
             signatures = {}
@@ -969,8 +1547,12 @@ class ServiceSession:
             segment_id=ts,
             trace_kind="alignment",
             data={
-                "phrase_alignment": phrase_alignment,
-                "phrase_count": len(phrase_alignment),
+                "alignment_version": payload.get("alignment_version"),
+                "previous_alignment_version": payload.get("previous_alignment_version"),
+                "root_segment_id": payload.get("root_segment_id"),
+                "merged_from_segment_ids": payload.get("merged_from_segment_ids"),
+                "phrase_alignment": hydrated_alignment,
+                "phrase_count": len(hydrated_alignment),
             },
         )
         await self._broadcast_feed_revision(
@@ -978,7 +1560,11 @@ class ServiceSession:
             english=english,
             source="llm",
             reason="phrase_alignment",
-            phrase_alignment=phrase_alignment,
+            phrase_alignment=hydrated_alignment,
+            alignment_version=int(payload.get("alignment_version") or 0),
+            previous_alignment_version=payload.get("previous_alignment_version"),
+            root_segment_id=int(payload.get("root_segment_id") or ts),
+            merged_from_segment_ids=list(payload.get("merged_from_segment_ids") or [ts]),
         )
 
     @staticmethod
@@ -1070,6 +1656,11 @@ class ServiceSession:
     async def _on_verse_detected(self, ts: int, verse: dict):
         verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse detected: %s", self._church_id, verse.get("reference"))
+        detected_cache = getattr(self, "_detected_verse_cache", None)
+        if detected_cache is None:
+            detected_cache = {}
+            self._detected_verse_cache = detected_cache
+        detected_cache[ts] = verse
         await self._broadcast_pipeline_trace(
             stage="verse.detected",
             summary=f"verse detected: {verse.get('reference')}",
@@ -1085,6 +1676,11 @@ class ServiceSession:
     async def _on_verse_range_update(self, ts: int, verse: dict):
         verse = await self._hydrate_detected_verse(verse)
         logger.info("[session:%s] Verse range update: %s", self._church_id, verse.get("reference"))
+        detected_cache = getattr(self, "_detected_verse_cache", None)
+        if detected_cache is None:
+            detected_cache = {}
+            self._detected_verse_cache = detected_cache
+        detected_cache[ts] = verse
         if ts not in self._committed_segment_ids:
             self._pending_detected_verses[ts] = verse
             return
@@ -1137,9 +1733,31 @@ class ServiceSession:
         if signatures is not None:
             signatures.pop(absorb_ts, None)
             signatures.pop(keep_ts, None)
+        prior_alignment_state = self._ensure_segment_alignment_state_cache().get(keep_ts)
+        merged_lineage: list[int] = []
+        for item in (
+            self._segment_merge_lineage(keep_ts)
+            + self._segment_merge_lineage(absorb_ts)
+            + [keep_ts, absorb_ts]
+        ):
+            if item not in merged_lineage:
+                merged_lineage.append(item)
+        self._set_segment_lineage(
+            keep_ts,
+            root_segment_id=self._segment_root_id(keep_ts),
+            merged_from_segment_ids=merged_lineage,
+        )
+        self._ensure_segment_alignment_state_cache().pop(absorb_ts, None)
+        self._ensure_segment_alignment_version_cache().pop(absorb_ts, None)
+        self._ensure_segment_root_id_cache().pop(absorb_ts, None)
+        self._ensure_segment_merge_lineage_cache().pop(absorb_ts, None)
         self._segment_text_cache.pop(absorb_ts, None)
         self._ensure_segment_stt_cache().pop(absorb_ts, None)
         self._segment_metadata_cache.pop(absorb_ts, None)
+        self._ensure_segment_alignment_hint_cache().pop(absorb_ts, None)
+        detected_cache = getattr(self, "_detected_verse_cache", None)
+        if detected_cache is not None:
+            detected_cache.pop(absorb_ts, None)
         self._pending_segment_metadata.pop(absorb_ts, None)
         self._pending_detected_verses.pop(absorb_ts, None)
         self._pending_suggested_verses.pop(absorb_ts, None)
@@ -1149,6 +1767,12 @@ class ServiceSession:
             pending["english"] = merged_english
             pending["source"] = "llm"
             pending["phrase_alignment"] = None
+            pending["google_english"] = merged_english
+            pending["interim_english_hint"] = _choose_stronger_interim_hint(
+                str(pending.get("interim_english_hint") or ""),
+                self._ensure_segment_alignment_hint_cache().get(absorb_ts, ""),
+                replace=False,
+            )
             await self._broadcast_live_translation(
                 text=merged_english,
                 source="llm",
@@ -1162,6 +1786,8 @@ class ServiceSession:
             "reason": "segmentation_repair",
             "spanish": merged_spanish,
             "english": merged_english,
+            "root_segment_id": self._segment_root_id(keep_ts),
+            "merged_from_segment_ids": merged_lineage,
             **self._merge_ref(keep_ts, absorb_ts),
         })
         if keep_was_committed:
@@ -1172,6 +1798,20 @@ class ServiceSession:
                 source="llm",
                 reason="segmentation_repair",
                 phrase_alignment=None,
+                root_segment_id=self._segment_root_id(keep_ts),
+                merged_from_segment_ids=merged_lineage,
+            )
+            await self._request_phrase_alignment_for_segment(
+                segment_id=keep_ts,
+                spanish=merged_spanish,
+                english=merged_english,
+                google_english=merged_english,
+                source="llm",
+                interim_english_hint=self._ensure_segment_alignment_hint_cache().get(keep_ts, ""),
+                prior_phrase_alignment=(
+                    list(prior_alignment_state.get("phrase_alignment", []))
+                    if isinstance(prior_alignment_state, dict) else None
+                ),
             )
 
     async def _on_segment_metadata(self, ts: int, metadata: dict):
@@ -1246,6 +1886,7 @@ class ServiceSession:
             },
             "enrichment": dict(self._enrichment.metrics) if self._enrichment else {},
             "feed_revision": dict(getattr(self, "_feed_revision_metrics", {}) or {}),
+            "chunk_alignment": dict(getattr(self, "_chunk_alignment_metrics", {}) or {}),
             "stt_session": self._stt_session.get_stats() if self._stt_session else {},
             "stt_noise_removed_count": self._stt_noise_removed_count,
             "_enrichment_settled_size": len(self._enrichment_settled),
@@ -1256,6 +1897,7 @@ class ServiceSession:
                 "translation_to_enrichment": {"p50": None, "p90": None, "count": 0},
             },
             "capture_active": self._recorder is not None,
+            "benchmark_capture": self._benchmark_capture.as_dict() if self._benchmark_capture else None,
         }
 
     async def _on_observability_event(self, event: dict) -> None:
@@ -1303,7 +1945,9 @@ class ServiceSession:
         english: str,
         source: str,
         phrase_alignment: list[dict] | None,
+        google_english: str | None,
         delay_s: float,
+        interim_english_hint: str | None = None,
         stt_context: dict | None = None,
     ) -> None:
         await self._drop_pending_commit(segment_id)
@@ -1313,6 +1957,8 @@ class ServiceSession:
             "english": english,
             "source": source,
             "phrase_alignment": phrase_alignment,
+            "google_english": google_english if google_english is not None else english,
+            "interim_english_hint": interim_english_hint or "",
             "stt_context": dict(stt_context or {}),
             "task": task,
         }
@@ -1348,12 +1994,109 @@ class ServiceSession:
             phrase_alignment=pending.get("phrase_alignment"),
             stt_context=pending.get("stt_context"),
         )
+        hint_enabled = _interim_alignment_hints_enabled()
+        if hint_enabled:
+            interim_hint, interim_hint_reason = _select_alignment_hint_english(
+                english=pending["english"],
+                google_english=str(pending.get("google_english") or pending["english"]),
+                interim_english_hint=str(pending.get("interim_english_hint") or ""),
+            )
+        else:
+            interim_hint = ""
+            interim_hint_reason = "disabled"
+        if interim_hint:
+            self._ensure_segment_alignment_hint_cache()[segment_id] = interim_hint
+        else:
+            self._ensure_segment_alignment_hint_cache().pop(segment_id, None)
+        if not pending.get("phrase_alignment"):
+            await self._request_phrase_alignment_for_segment(
+                segment_id=segment_id,
+                spanish=pending["spanish"],
+                english=pending["english"],
+                google_english=str(pending.get("google_english") or pending["english"]),
+                source=pending["source"],
+                interim_english_hint=interim_hint,
+                interim_hint_reason=interim_hint_reason,
+                prior_phrase_alignment=(
+                    list(
+                        self._ensure_segment_alignment_state_cache()
+                        .get(segment_id, {})
+                        .get("phrase_alignment", [])
+                    )
+                ),
+            )
         await self._broadcast_live_translation_clear(reason="committed", segment_id=segment_id)
         self._committed_segment_ids.add(segment_id)
         if self._db_session_id and is_first_commit and segment_id not in self._persisted_segment_ids:
             await append_segment(self._db_session_id, pending["spanish"], pending["english"])
             self._persisted_segment_ids.add(segment_id)
         await self._flush_buffered_segment_state(segment_id)
+
+    async def _request_phrase_alignment_for_segment(
+        self,
+        *,
+        segment_id: int,
+        spanish: str,
+        english: str,
+        google_english: str,
+        source: str,
+        interim_english_hint: str = "",
+        interim_hint_reason: str = "",
+        prior_phrase_alignment: list[dict] | None = None,
+    ) -> None:
+        enrichment = getattr(self, "_enrichment", None)
+        if enrichment is None or source == "passthrough":
+            return
+        if not spanish.strip() or not english.strip():
+            return
+
+        metadata = (
+            getattr(self, "_pending_segment_metadata", {}).get(segment_id)
+            or getattr(self, "_segment_metadata_cache", {}).get(segment_id)
+            or {}
+        )
+        if metadata.get("pending_completion"):
+            return
+
+        verse_detected = (
+            getattr(self, "_pending_detected_verses", {}).get(segment_id)
+            or getattr(self, "_detected_verse_cache", {}).get(segment_id)
+        )
+
+        effective_interim_hint = (
+            interim_english_hint
+            or self._ensure_segment_alignment_hint_cache().get(segment_id, "")
+        )
+        await self._broadcast_pipeline_trace(
+            stage="alignment.request",
+            summary=f"phrase alignment requested ({interim_hint_reason or ('accepted' if effective_interim_hint else 'none')})",
+            segment_id=segment_id,
+            trace_kind="decision",
+            data={
+                "source": source,
+                "source_quality": str(metadata.get('source_quality') or 'clean'),
+                "translation_register": str(metadata.get('translation_register') or 'expository'),
+                "discourse_tag": str(metadata.get('discourse_tag') or 'statement'),
+                "interim_hint_enabled": _interim_alignment_hints_enabled(),
+                "interim_hint_reason": interim_hint_reason or ("accepted" if effective_interim_hint else "none"),
+                "interim_hint_used": bool(effective_interim_hint),
+                "interim_hint_text": effective_interim_hint,
+                "prior_phrase_alignment_count": len(prior_phrase_alignment or []),
+            },
+        )
+
+        enrichment.request_phrase_alignment(
+            ts=segment_id,
+            spanish=spanish,
+            english=english,
+            google_english=google_english or english,
+            interim_english_hint=effective_interim_hint,
+            source_quality=str(metadata.get("source_quality") or "clean"),
+            translation_register=str(metadata.get("translation_register") or "expository"),
+            discourse_tag=str(metadata.get("discourse_tag") or "statement"),
+            verse_detected=verse_detected if isinstance(verse_detected, dict) else None,
+            prior_phrase_alignment=prior_phrase_alignment or None,
+        )
 
     async def _flush_buffered_segment_state(self, segment_id: int) -> None:
         metadata = self._pending_segment_metadata.pop(segment_id, None)
@@ -1421,6 +2164,33 @@ class ServiceSession:
         stt_context: dict | None = None,
     ) -> None:
         stt_context = dict(stt_context or {})
+        if phrase_alignment:
+            payload_alignment = self._build_alignment_payload(
+                segment_id=segment_id,
+                english=english,
+                spanish=spanish,
+                phrase_alignment=phrase_alignment,
+            )
+            emitted_alignment = payload_alignment.get("phrase_alignment", [])
+            alignment_version = int(payload_alignment.get("alignment_version") or 0)
+            previous_alignment_version = payload_alignment.get("previous_alignment_version")
+            root_segment_id = int(payload_alignment.get("root_segment_id") or segment_id)
+            merged_from_segment_ids = list(payload_alignment.get("merged_from_segment_ids") or [segment_id])
+            self._segment_alignment_signature[segment_id] = self._build_alignment_signature(
+                english,
+                emitted_alignment,
+            )
+        else:
+            emitted_alignment = None
+            alignment_version = None
+            previous_alignment_version = None
+            root_segment_id = self._segment_root_id(segment_id)
+            merged_from_segment_ids = self._segment_merge_lineage(segment_id)
+            self._set_segment_lineage(
+                segment_id,
+                root_segment_id=root_segment_id,
+                merged_from_segment_ids=merged_from_segment_ids,
+            )
         self._segment_text_cache[segment_id] = {
             "spanish": spanish,
             "english": english,
@@ -1434,8 +2204,12 @@ class ServiceSession:
             **stt_context,
             **self._segment_ref(segment_id),
         }
-        if phrase_alignment:
-            payload["phrase_alignment"] = phrase_alignment
+        payload["root_segment_id"] = root_segment_id
+        payload["merged_from_segment_ids"] = merged_from_segment_ids
+        if emitted_alignment:
+            payload["phrase_alignment"] = emitted_alignment
+            payload["alignment_version"] = alignment_version
+            payload["previous_alignment_version"] = previous_alignment_version
         await self._broadcast_pipeline_trace(
             stage="display.feed_commit",
             summary="feed commit broadcast",
@@ -1445,7 +2219,11 @@ class ServiceSession:
                 "spanish": spanish,
                 "english": english,
                 "source": source,
-                "phrase_alignment": phrase_alignment,
+                "phrase_alignment": emitted_alignment,
+                "alignment_version": alignment_version,
+                "previous_alignment_version": previous_alignment_version,
+                "root_segment_id": root_segment_id,
+                "merged_from_segment_ids": merged_from_segment_ids,
                 "stt_context": stt_context,
             },
         )
@@ -1459,6 +2237,10 @@ class ServiceSession:
         reason: str,
         spanish: str | None = None,
         phrase_alignment: list[dict] | None = None,
+        alignment_version: int | None = None,
+        previous_alignment_version: int | None = None,
+        root_segment_id: int | None = None,
+        merged_from_segment_ids: list[int] | None = None,
     ) -> None:
         # Update the segment text cache eagerly so other producers (e.g. the
         # phrase_alignment handler reading `_segment_text_cache.get(ts)`) see
@@ -1475,6 +2257,10 @@ class ServiceSession:
             reason=reason,
             spanish=spanish,
             phrase_alignment=phrase_alignment,
+            alignment_version=alignment_version,
+            previous_alignment_version=previous_alignment_version,
+            root_segment_id=root_segment_id,
+            merged_from_segment_ids=merged_from_segment_ids,
         )
 
     def _enqueue_feed_revision(
@@ -1486,6 +2272,10 @@ class ServiceSession:
         reason: str,
         spanish: str | None,
         phrase_alignment: list[dict] | None,
+        alignment_version: int | None = None,
+        previous_alignment_version: int | None = None,
+        root_segment_id: int | None = None,
+        merged_from_segment_ids: list[int] | None = None,
     ) -> None:
         pending_map = getattr(self, "_pending_feed_revisions", None)
         if pending_map is None:
@@ -1505,6 +2295,10 @@ class ServiceSession:
                 "reason": reason,
                 "spanish": spanish,
                 "phrase_alignment": phrase_alignment,
+                "alignment_version": alignment_version,
+                "previous_alignment_version": previous_alignment_version,
+                "root_segment_id": root_segment_id,
+                "merged_from_segment_ids": merged_from_segment_ids,
             }
             try:
                 loop = asyncio.get_running_loop()
@@ -1520,6 +2314,10 @@ class ServiceSession:
                         reason=reason,
                         spanish=spanish,
                         phrase_alignment=phrase_alignment,
+                        alignment_version=alignment_version,
+                        previous_alignment_version=previous_alignment_version,
+                        root_segment_id=root_segment_id,
+                        merged_from_segment_ids=merged_from_segment_ids,
                     )
                 )
                 return
@@ -1543,8 +2341,16 @@ class ServiceSession:
         # segmentation_repair / context_repair drops by without one.
         if phrase_alignment:
             existing["phrase_alignment"] = phrase_alignment
+            existing["alignment_version"] = alignment_version
+            existing["previous_alignment_version"] = previous_alignment_version
+            existing["root_segment_id"] = root_segment_id
+            existing["merged_from_segment_ids"] = merged_from_segment_ids
         elif existing_alignment is not None:
             existing["phrase_alignment"] = existing_alignment
+        if existing.get("root_segment_id") is None and root_segment_id is not None:
+            existing["root_segment_id"] = root_segment_id
+        if existing.get("merged_from_segment_ids") is None and merged_from_segment_ids is not None:
+            existing["merged_from_segment_ids"] = merged_from_segment_ids
         metrics = getattr(self, "_feed_revision_metrics", None)
         if metrics is not None:
             metrics["coalesced_count"] = metrics.get("coalesced_count", 0) + 1
@@ -1598,6 +2404,10 @@ class ServiceSession:
         reason: str,
         spanish: str | None = None,
         phrase_alignment: list[dict] | None = None,
+        alignment_version: int | None = None,
+        previous_alignment_version: int | None = None,
+        root_segment_id: int | None = None,
+        merged_from_segment_ids: list[int] | None = None,
     ) -> None:
         stt_context = self._ensure_segment_stt_cache().get(segment_id, {})
         payload = {
@@ -1605,6 +2415,10 @@ class ServiceSession:
             "english": english,
             "source": source,
             "reason": reason,
+            "root_segment_id": root_segment_id if root_segment_id is not None else self._segment_root_id(segment_id),
+            "merged_from_segment_ids": (
+                merged_from_segment_ids if merged_from_segment_ids is not None else self._segment_merge_lineage(segment_id)
+            ),
             **stt_context,
             **self._segment_ref(segment_id),
         }
@@ -1612,6 +2426,8 @@ class ServiceSession:
             payload["spanish"] = spanish
         if phrase_alignment:
             payload["phrase_alignment"] = phrase_alignment
+            payload["alignment_version"] = alignment_version
+            payload["previous_alignment_version"] = previous_alignment_version
         self._bump_feed_revision_metric(reason)
         await self._broadcast_pipeline_trace(
             stage="display.feed_revision",
@@ -1624,6 +2440,10 @@ class ServiceSession:
                 "source": source,
                 "reason": reason,
                 "phrase_alignment": phrase_alignment,
+                "alignment_version": alignment_version,
+                "previous_alignment_version": previous_alignment_version,
+                "root_segment_id": payload["root_segment_id"],
+                "merged_from_segment_ids": payload["merged_from_segment_ids"],
                 "stt_context": stt_context,
             },
         )
@@ -1645,6 +2465,11 @@ class ServiceSession:
             await self._ws.send_json(msg)
         except Exception:
             pass
+
+    def _capture_enabled_for_session(self) -> bool:
+        if self._benchmark_capture and self._benchmark_capture.enabled is not None:
+            return bool(self._benchmark_capture.enabled)
+        return _session_capture_enabled()
 
     def _next_segment_id(self) -> int:
         now = _now()
@@ -1670,7 +2495,11 @@ class ServiceSession:
         }
 
 
-async def _finalize_capture_in_db(result: CaptureResult, session_id: int | None) -> None:
+async def _finalize_capture_in_db(
+    result: CaptureResult,
+    session_id: int | None,
+    benchmark_capture: BenchmarkCaptureMetadata | None = None,
+) -> None:
     """Persist capture file paths and metrics to the session_captures table."""
     if not session_id:
         return
@@ -1681,8 +2510,14 @@ async def _finalize_capture_in_db(result: CaptureResult, session_id: int | None)
             capture_id,
             audio_path=result.audio_path or "",
             events_path=result.events_path or "",
+            metadata_path=result.metadata_path or "",
             duration_s=result.duration_s,
             segment_count=result.segment_count,
+            benchmark_session_id=benchmark_capture.benchmark_session_id if benchmark_capture else "",
+            benchmark_run_id=benchmark_capture.benchmark_run_id if benchmark_capture else "",
+            benchmark_scenario_id=benchmark_capture.benchmark_scenario_id if benchmark_capture else "",
+            benchmark_pipeline_id=benchmark_capture.benchmark_pipeline_id if benchmark_capture else "",
+            benchmark_capture_label=benchmark_capture.benchmark_capture_label if benchmark_capture else "",
         )
     except Exception as e:
         logger.warning("[session] DB capture finalize failed: %s", e)
@@ -1705,6 +2540,7 @@ class SessionManager:
         source_scripture_version: str = "rvr1960",
         display_scripture_version: str = "kjv",
         stt_config: STTConfig | None = None,
+        benchmark_capture: dict | None = None,
     ) -> ServiceSession:
         if church_id in self._sessions:
             prior = self._sessions[church_id]
@@ -1719,6 +2555,7 @@ class SessionManager:
             source_scripture_version=source_scripture_version,
             display_scripture_version=display_scripture_version,
             stt_config=stt_config,
+            benchmark_capture=BenchmarkCaptureMetadata.from_payload(benchmark_capture),
         )
         return session
 

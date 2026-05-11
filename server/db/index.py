@@ -77,8 +77,14 @@ CREATE TABLE IF NOT EXISTS session_captures (
     session_id      INTEGER NOT NULL REFERENCES service_sessions(id),
     audio_path      TEXT NOT NULL DEFAULT '',
     events_path     TEXT NOT NULL DEFAULT '',
+    metadata_path   TEXT NOT NULL DEFAULT '',
     duration_s      REAL,
     segment_count   INTEGER,
+    benchmark_session_id TEXT NOT NULL DEFAULT '',
+    benchmark_run_id TEXT NOT NULL DEFAULT '',
+    benchmark_scenario_id TEXT NOT NULL DEFAULT '',
+    benchmark_pipeline_id TEXT NOT NULL DEFAULT '',
+    benchmark_capture_label TEXT NOT NULL DEFAULT '',
     started_at      TEXT NOT NULL DEFAULT (datetime('now')),
     ended_at        TEXT
 );
@@ -195,6 +201,12 @@ async def _migrate(db) -> None:
         "ALTER TABLE bible_verses ADD COLUMN canonical_book_id INTEGER REFERENCES bible_books(id)",
         "ALTER TABLE bible_verses ADD COLUMN canonical_book_name TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE bible_verses ADD COLUMN source_book_order INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE session_captures ADD COLUMN metadata_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_captures ADD COLUMN benchmark_session_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_captures ADD COLUMN benchmark_run_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_captures ADD COLUMN benchmark_scenario_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_captures ADD COLUMN benchmark_pipeline_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_captures ADD COLUMN benchmark_capture_label TEXT NOT NULL DEFAULT ''",
     ]
     for stmt in migrations:
         try:

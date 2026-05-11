@@ -35,8 +35,15 @@ export interface VerseSuggestion {
 }
 
 export interface PhraseAlignment {
+  chunk_id?: string;
   english_text: string;
   spanish_text: string;
+  english_span?: { start: number; end: number } | null;
+  spanish_span?: { start: number; end: number } | null;
+  ordinal?: number;
+  derived_from_chunk_ids?: string[];
+  remap_decision?: string;
+  ambiguity_reason?: string | null;
 }
 
 export interface ScripturePassageVerse {
@@ -66,6 +73,10 @@ export interface Segment {
   spanish: string;
   english: string;
   phraseAlignment?: PhraseAlignment[];
+  alignmentVersion?: number;
+  previousAlignmentVersion?: number | null;
+  rootSegmentId?: number;
+  mergedFromSegmentIds?: number[];
   verseDetected?: VerseDetection;
   verseSuggestions?: VerseSuggestion[];
   register?: TranslationRegister;
@@ -99,6 +110,10 @@ export interface TranslationFeed {
   debug: BrowserFeedDebugState;
 }
 
+type TranslationFeedTestHarness = {
+  subscribe: (listener: (message: Record<string, unknown>) => void) => () => void;
+};
+
 function messageSegmentId(msg: Record<string, unknown>): number | null {
   const raw = msg.segment_id ?? msg.ts;
   if (raw === undefined || raw === null) return null;
@@ -125,9 +140,86 @@ function messagePhraseAlignment(msg: Record<string, unknown>): PhraseAlignment[]
     const english = typeof item.english_text === 'string' ? item.english_text.trim() : '';
     const spanish = typeof item.spanish_text === 'string' ? item.spanish_text.trim() : '';
     if (!english || !spanish) return [];
-    return [{ english_text: english, spanish_text: spanish }];
+    const chunkId = typeof item.chunk_id === 'string' ? item.chunk_id.trim() : '';
+    const englishSpan = (
+      item.english_span
+      && typeof item.english_span === 'object'
+      && typeof (item.english_span as Record<string, unknown>).start === 'number'
+      && typeof (item.english_span as Record<string, unknown>).end === 'number'
+    )
+      ? {
+          start: Number((item.english_span as Record<string, unknown>).start),
+          end: Number((item.english_span as Record<string, unknown>).end),
+        }
+      : null;
+    const spanishSpan = (
+      item.spanish_span
+      && typeof item.spanish_span === 'object'
+      && typeof (item.spanish_span as Record<string, unknown>).start === 'number'
+      && typeof (item.spanish_span as Record<string, unknown>).end === 'number'
+    )
+      ? {
+          start: Number((item.spanish_span as Record<string, unknown>).start),
+          end: Number((item.spanish_span as Record<string, unknown>).end),
+        }
+      : null;
+    const ordinal = typeof item.ordinal === 'number' ? Number(item.ordinal) : undefined;
+    const derivedFromChunkIds = Array.isArray(item.derived_from_chunk_ids)
+      ? item.derived_from_chunk_ids.flatMap((candidate: unknown) => (
+          typeof candidate === 'string' && candidate.trim() ? [candidate.trim()] : []
+        ))
+      : undefined;
+    const remapDecision = typeof item.remap_decision === 'string' ? item.remap_decision.trim() : undefined;
+    const ambiguityReason = item.ambiguity_reason === null
+      ? null
+      : typeof item.ambiguity_reason === 'string'
+        ? item.ambiguity_reason.trim()
+        : undefined;
+    return [{
+      chunk_id: chunkId || undefined,
+      english_text: english,
+      spanish_text: spanish,
+      english_span: englishSpan,
+      spanish_span: spanishSpan,
+      ordinal,
+      derived_from_chunk_ids: derivedFromChunkIds,
+      remap_decision: remapDecision || undefined,
+      ambiguity_reason: ambiguityReason,
+    }];
   });
   return alignment;
+}
+
+function messageAlignmentVersion(msg: Record<string, unknown>): number | undefined {
+  const raw = msg.alignment_version;
+  if (raw === undefined || raw === null) return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function messagePreviousAlignmentVersion(msg: Record<string, unknown>): number | null | undefined {
+  const raw = msg.previous_alignment_version;
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function messageRootSegmentId(msg: Record<string, unknown>): number | undefined {
+  const raw = msg.root_segment_id;
+  if (raw === undefined || raw === null) return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function messageMergedFromSegmentIds(msg: Record<string, unknown>): number[] | undefined {
+  const raw = msg.merged_from_segment_ids;
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw.flatMap((item) => {
+    const parsed = Number(item);
+    return Number.isFinite(parsed) ? [parsed] : [];
+  });
+  return values.length > 0 ? values : undefined;
 }
 
 function defaultLiveMergeStrategy(source: string): 'append' | 'replace' {
@@ -209,6 +301,266 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
       setLiveUpdatedAt(Date.now());
     };
 
+    const handleMessage = (msg: Record<string, unknown>) => {
+      setDebug(prev => ({
+        ...prev,
+        totalEvents: prev.totalEvents + 1,
+        lastEventType: String(msg.type ?? 'unknown'),
+        lastEventAt: Date.now(),
+      }));
+
+      if (msg.type === 'interim') {
+        const text = String(msg.text ?? '');
+        setPartialSpanish(text);
+        setLastInterimSpanish(text);
+        setLastInterimAt(Date.now());
+        return;
+      }
+
+      if (msg.type === 'stt_final') {
+        const text = String(msg.text ?? '');
+        setSpanishLines(prev => [...prev, text].slice(-8));
+        setPartialSpanish('');
+        setLastFinalSpanish(text);
+        setLastFinalAt(Date.now());
+        return;
+      }
+
+      if (msg.type === 'live_translation') {
+        const text = String(msg.text ?? '').trim();
+        if (!text) return;
+        const source = typeof msg.source === 'string' ? msg.source : 'live_translation';
+        const mergeStrategy = msg.merge_strategy === 'replace' || msg.merge_strategy === 'append'
+          ? msg.merge_strategy
+          : defaultLiveMergeStrategy(source);
+        setLiveEnglish(prev => (
+          mergeStrategy === 'replace'
+            ? text
+            : mergeLiveEnglish(prev, text)
+        ));
+        setLiveSegmentId(messageSegmentId(msg));
+        setLiveUpdatedAt(Date.now());
+        return;
+      }
+
+      if (msg.type === 'live_translation_clear') {
+        clearLiveIfMatches(messageSegmentId(msg));
+        return;
+      }
+
+      if (msg.type === 'feed_commit') {
+        const segmentId = messageSegmentId(msg);
+        if (segmentId === null) {
+          console.warn('[useTranslationFeed] feed_commit missing segment_id:', msg);
+          return;
+        }
+        const english = String(msg.english ?? '');
+        const spanish = String(msg.spanish ?? '');
+        const phraseAlignment = messagePhraseAlignment(msg) ?? [];
+        const alignmentVersion = messageAlignmentVersion(msg);
+        const previousAlignmentVersion = messagePreviousAlignmentVersion(msg);
+        const rootSegmentId = messageRootSegmentId(msg) ?? segmentId;
+        const mergedFromSegmentIds = messageMergedFromSegmentIds(msg) ?? [segmentId];
+        setSegments(prev => {
+          const existing = prev.some(segment => segment.id === segmentId);
+          if (existing) {
+            return prev.map(segment =>
+              segment.id === segmentId
+                ? {
+                    ...segment,
+                    english,
+                    spanish,
+                    phraseAlignment,
+                    alignmentVersion,
+                    previousAlignmentVersion,
+                    rootSegmentId,
+                    mergedFromSegmentIds,
+                    pendingCompletion: false,
+                  }
+                : segment,
+            );
+          }
+          return [...prev.slice(-99), {
+            id: segmentId,
+            english,
+            spanish,
+            phraseAlignment,
+            alignmentVersion,
+            previousAlignmentVersion,
+            rootSegmentId,
+            mergedFromSegmentIds,
+          }];
+        });
+        clearLiveIfMatches(segmentId);
+        setLastCommittedEnglish(english);
+        setLastTranslationAt(Date.now());
+        return;
+      }
+
+      if (msg.type === 'feed_revision') {
+        const segmentId = messageSegmentId(msg);
+        if (segmentId === null) {
+          console.warn('[useTranslationFeed] feed_revision missing segment_id:', msg);
+          return;
+        }
+        const english = String(msg.english ?? '');
+        const spanish = msg.spanish === undefined ? null : String(msg.spanish ?? '');
+        const phraseAlignment = messagePhraseAlignment(msg);
+        const alignmentVersion = messageAlignmentVersion(msg);
+        const previousAlignmentVersion = messagePreviousAlignmentVersion(msg);
+        const rootSegmentId = messageRootSegmentId(msg) ?? segmentId;
+        const mergedFromSegmentIds = messageMergedFromSegmentIds(msg) ?? [segmentId];
+        let found = false;
+        setSegments(prev => {
+          const updated = prev.map(segment => {
+            if (segment.id !== segmentId) return segment;
+            found = true;
+            return {
+              ...segment,
+              english,
+              spanish: spanish ?? segment.spanish,
+              phraseAlignment: phraseAlignment ?? segment.phraseAlignment,
+              alignmentVersion: alignmentVersion ?? segment.alignmentVersion,
+              previousAlignmentVersion: previousAlignmentVersion ?? segment.previousAlignmentVersion,
+              rootSegmentId,
+              mergedFromSegmentIds,
+              pendingCompletion: false,
+            };
+          });
+          if (found) return updated;
+          return [...updated.slice(-99), {
+            id: segmentId,
+            english,
+            spanish: spanish ?? '',
+            phraseAlignment: phraseAlignment ?? [],
+            alignmentVersion,
+            previousAlignmentVersion,
+            rootSegmentId,
+            mergedFromSegmentIds,
+            pendingCompletion: false,
+          }];
+        });
+        setLastCommittedEnglish(english);
+        setLastTranslationAt(Date.now());
+        flashSegment(segmentId);
+        return;
+      }
+
+      if (msg.type === 'verse_detected') {
+        const segmentId = messageSegmentId(msg);
+        if (segmentId === null) return;
+        const verse = msg.verse as VerseDetection;
+        const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+        setSegments(prev => attachVerseToVisibleSegment(prev, targetSegmentId, verse));
+        setVerses(prev => [...prev, verse]);
+        setActiveVerseTs(targetSegmentId);
+        return;
+      }
+
+      if (msg.type === 'verse_range_update') {
+        const segmentId = messageSegmentId(msg);
+        if (segmentId === null) return;
+        const verse = msg.verse as VerseDetection;
+        const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+        setVerses(prev => prev.map(existing =>
+          existing.book === verse.book && existing.chapter === verse.chapter
+            ? verse
+            : existing,
+        ));
+        setSegments(prev => attachVerseToVisibleSegment(prev, targetSegmentId, verse));
+        return;
+      }
+
+      if (msg.type === 'verse_suggestion') {
+        const segmentId = messageSegmentId(msg);
+        if (segmentId === null) return;
+        const nextSuggestions = msg.suggestions as VerseSuggestion[];
+        const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+        setSuggestions(nextSuggestions);
+        setSegments(prev => prev.map(segment =>
+          segment.id === targetSegmentId
+            ? { ...segment, verseSuggestions: nextSuggestions }
+            : segment,
+        ));
+        setActiveVerseTs(targetSegmentId);
+        return;
+      }
+
+      if (msg.type === 'caption_merge') {
+        if (msg.reason && msg.reason !== 'segmentation_repair') {
+          console.warn('[useTranslationFeed] Ignoring unexpected caption_merge reason:', msg.reason);
+          return;
+        }
+        const { keep, absorb } = messageMergeRef(msg);
+        if (keep === null || absorb === null) {
+          console.warn('[useTranslationFeed] caption_merge missing segment refs:', msg);
+          return;
+        }
+        setSegments(prev => {
+          const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, keep);
+          const absorbedSegment = prev.find(segment => segment.id === absorb);
+          const rootSegmentId = messageRootSegmentId(msg) ?? resolvedKeep;
+          const mergedFromSegmentIds = messageMergedFromSegmentIds(msg) ?? [resolvedKeep, absorb];
+          mergedIntoRef.current.set(absorb, resolvedKeep);
+          const filtered = prev.filter(segment => segment.id !== absorb);
+          return filtered.map(segment =>
+            segment.id === resolvedKeep
+              ? {
+                  ...segment,
+                  english: String(msg.english ?? segment.english),
+                  spanish: String(msg.spanish ?? segment.spanish),
+                  phraseAlignment: [],
+                  alignmentVersion: undefined,
+                  previousAlignmentVersion: segment.alignmentVersion ?? null,
+                  rootSegmentId,
+                  mergedFromSegmentIds,
+                  pendingCompletion: false,
+                  verseDetected: segment.verseDetected ?? absorbedSegment?.verseDetected,
+                  verseSuggestions: segment.verseSuggestions ?? absorbedSegment?.verseSuggestions,
+                }
+              : segment,
+          );
+        });
+        flashSegment(keep);
+        return;
+      }
+
+      if (msg.type === 'segment_metadata') {
+        const segmentId = messageSegmentId(msg);
+        if (segmentId === null) return;
+        const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
+        setSegments(prev => prev.map(segment =>
+          segment.id === targetSegmentId
+            ? {
+                ...segment,
+                register: msg.translation_register as TranslationRegister | undefined,
+                paragraphBreak: msg.paragraph_break as boolean | undefined,
+                sourceQuality: msg.source_quality as 'clean' | 'noisy' | 'fragmented' | undefined,
+                pendingCompletion: msg.pending_completion as boolean | undefined,
+                terminalIncomplete: (msg.terminal_incomplete as boolean | undefined) ?? segment.terminalIncomplete,
+              }
+            : segment,
+        ));
+        return;
+      }
+
+      if (msg.type === 'mode_change') {
+        setSermonMode(msg.to as SermonMode);
+      }
+    };
+
+    const testHarness = typeof window !== 'undefined'
+      ? (window.__cbDisplayTestHarness as TranslationFeedTestHarness | undefined)
+      : undefined;
+    if (testHarness) {
+      const unsubscribe = testHarness.subscribe(handleMessage);
+      return () => {
+        stopped = true;
+        unsubscribe();
+        if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+      };
+    }
+
     const connect = () => {
       if (stopped) return;
       ws = new WebSocket(`${getWebSocketBaseUrl()}/api/display/v1?church_id=${encodeURIComponent(churchId)}`);
@@ -247,210 +599,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
           console.warn('[useTranslationFeed] Malformed WebSocket message:', e.data);
           return;
         }
-        setDebug(prev => ({
-          ...prev,
-          totalEvents: prev.totalEvents + 1,
-          lastEventType: String(msg.type ?? 'unknown'),
-          lastEventAt: Date.now(),
-        }));
-
-        if (msg.type === 'interim') {
-          const text = String(msg.text ?? '');
-          setPartialSpanish(text);
-          setLastInterimSpanish(text);
-          setLastInterimAt(Date.now());
-          return;
-        }
-
-        if (msg.type === 'stt_final') {
-          const text = String(msg.text ?? '');
-          setSpanishLines(prev => [...prev, text].slice(-8));
-          setPartialSpanish('');
-          setLastFinalSpanish(text);
-          setLastFinalAt(Date.now());
-          return;
-        }
-
-        if (msg.type === 'live_translation') {
-          const text = String(msg.text ?? '').trim();
-          if (!text) return;
-          const source = typeof msg.source === 'string' ? msg.source : 'live_translation';
-          const mergeStrategy = msg.merge_strategy === 'replace' || msg.merge_strategy === 'append'
-            ? msg.merge_strategy
-            : defaultLiveMergeStrategy(source);
-          setLiveEnglish(prev => (
-            mergeStrategy === 'replace'
-              ? text
-              : mergeLiveEnglish(prev, text)
-          ));
-          setLiveSegmentId(messageSegmentId(msg));
-          setLiveUpdatedAt(Date.now());
-          return;
-        }
-
-        if (msg.type === 'live_translation_clear') {
-          clearLiveIfMatches(messageSegmentId(msg));
-          return;
-        }
-
-        if (msg.type === 'feed_commit') {
-          const segmentId = messageSegmentId(msg);
-          if (segmentId === null) {
-            console.warn('[useTranslationFeed] feed_commit missing segment_id:', msg);
-            return;
-          }
-          const english = String(msg.english ?? '');
-          const spanish = String(msg.spanish ?? '');
-          const phraseAlignment = messagePhraseAlignment(msg) ?? [];
-          setSegments(prev => {
-            const existing = prev.some(segment => segment.id === segmentId);
-            if (existing) {
-              return prev.map(segment =>
-                segment.id === segmentId
-                  ? { ...segment, english, spanish, phraseAlignment, pendingCompletion: false }
-                  : segment,
-              );
-            }
-            return [...prev.slice(-99), { id: segmentId, english, spanish, phraseAlignment }];
-          });
-          clearLiveIfMatches(segmentId);
-          setLastCommittedEnglish(english);
-          setLastTranslationAt(Date.now());
-          return;
-        }
-
-        if (msg.type === 'feed_revision') {
-          const segmentId = messageSegmentId(msg);
-          if (segmentId === null) {
-            console.warn('[useTranslationFeed] feed_revision missing segment_id:', msg);
-            return;
-          }
-          const english = String(msg.english ?? '');
-          const spanish = msg.spanish === undefined ? null : String(msg.spanish ?? '');
-          const phraseAlignment = messagePhraseAlignment(msg);
-          let found = false;
-          setSegments(prev => {
-            const updated = prev.map(segment => {
-              if (segment.id !== segmentId) return segment;
-              found = true;
-              return {
-                ...segment,
-                english,
-                spanish: spanish ?? segment.spanish,
-                phraseAlignment: phraseAlignment ?? segment.phraseAlignment,
-                pendingCompletion: false,
-              };
-            });
-            if (found) return updated;
-            return [...updated.slice(-99), {
-              id: segmentId,
-              english,
-              spanish: spanish ?? '',
-              phraseAlignment: phraseAlignment ?? [],
-              pendingCompletion: false,
-            }];
-          });
-          setLastCommittedEnglish(english);
-          setLastTranslationAt(Date.now());
-          flashSegment(segmentId);
-          return;
-        }
-
-        if (msg.type === 'verse_detected') {
-          const segmentId = messageSegmentId(msg);
-          if (segmentId === null) return;
-          const verse = msg.verse as VerseDetection;
-          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
-          setSegments(prev => attachVerseToVisibleSegment(prev, targetSegmentId, verse));
-          setVerses(prev => [...prev, verse]);
-          setActiveVerseTs(targetSegmentId);
-          return;
-        }
-
-        if (msg.type === 'verse_range_update') {
-          const segmentId = messageSegmentId(msg);
-          if (segmentId === null) return;
-          const verse = msg.verse as VerseDetection;
-          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
-          setVerses(prev => prev.map(existing =>
-            existing.book === verse.book && existing.chapter === verse.chapter
-              ? verse
-              : existing,
-          ));
-          setSegments(prev => attachVerseToVisibleSegment(prev, targetSegmentId, verse));
-          return;
-        }
-
-        if (msg.type === 'verse_suggestion') {
-          const segmentId = messageSegmentId(msg);
-          if (segmentId === null) return;
-          const nextSuggestions = msg.suggestions as VerseSuggestion[];
-          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
-          setSuggestions(nextSuggestions);
-          setSegments(prev => prev.map(segment =>
-            segment.id === targetSegmentId
-              ? { ...segment, verseSuggestions: nextSuggestions }
-              : segment,
-          ));
-          setActiveVerseTs(targetSegmentId);
-          return;
-        }
-
-        if (msg.type === 'caption_merge') {
-          if (msg.reason && msg.reason !== 'segmentation_repair') {
-            console.warn('[useTranslationFeed] Ignoring unexpected caption_merge reason:', msg.reason);
-            return;
-          }
-          const { keep, absorb } = messageMergeRef(msg);
-          if (keep === null || absorb === null) {
-            console.warn('[useTranslationFeed] caption_merge missing segment refs:', msg);
-            return;
-          }
-          setSegments(prev => {
-            const resolvedKeep = resolveMergedSegmentId(mergedIntoRef.current, keep);
-            const absorbedSegment = prev.find(segment => segment.id === absorb);
-            mergedIntoRef.current.set(absorb, resolvedKeep);
-            const filtered = prev.filter(segment => segment.id !== absorb);
-            return filtered.map(segment =>
-              segment.id === resolvedKeep
-                ? {
-                    ...segment,
-                    english: String(msg.english ?? segment.english),
-                    spanish: String(msg.spanish ?? segment.spanish),
-                    phraseAlignment: [],
-                    pendingCompletion: false,
-                    verseDetected: segment.verseDetected ?? absorbedSegment?.verseDetected,
-                    verseSuggestions: segment.verseSuggestions ?? absorbedSegment?.verseSuggestions,
-                  }
-                : segment,
-            );
-          });
-          flashSegment(keep);
-          return;
-        }
-
-        if (msg.type === 'segment_metadata') {
-          const segmentId = messageSegmentId(msg);
-          if (segmentId === null) return;
-          const targetSegmentId = resolveMergedSegmentId(mergedIntoRef.current, segmentId);
-          setSegments(prev => prev.map(segment =>
-            segment.id === targetSegmentId
-              ? {
-                  ...segment,
-                  register: msg.translation_register as TranslationRegister | undefined,
-                  paragraphBreak: msg.paragraph_break as boolean | undefined,
-                  sourceQuality: msg.source_quality as 'clean' | 'noisy' | 'fragmented' | undefined,
-                  pendingCompletion: msg.pending_completion as boolean | undefined,
-                  terminalIncomplete: (msg.terminal_incomplete as boolean | undefined) ?? segment.terminalIncomplete,
-                }
-              : segment,
-          ));
-          return;
-        }
-
-        if (msg.type === 'mode_change') {
-          setSermonMode(msg.to as SermonMode);
-        }
+        handleMessage(msg);
       };
     };
 
@@ -483,4 +632,10 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     lastCommittedEnglish,
     debug,
   };
+}
+
+declare global {
+  interface Window {
+    __cbDisplayTestHarness?: TranslationFeedTestHarness;
+  }
 }
