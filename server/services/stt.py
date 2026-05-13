@@ -11,8 +11,8 @@ def _default_model() -> str:
     return (
         os.getenv("STT_MODEL")
         or os.getenv("GOOGLE_SPEECH_MODEL")
-        or "chirp_3"
-    ).strip() or "chirp_3"
+        or "nova-3"
+    ).strip() or "nova-3"
 
 
 def _dedupe_language_codes(codes: list[str] | tuple[str, ...]) -> tuple[str, ...]:

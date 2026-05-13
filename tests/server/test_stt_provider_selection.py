@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from server.services.deepgram_speech_session import _build_deepgram_listen_options
 from server.services.deepgram_speech_session import DeepgramSpeechSession
-from server.services.stt import STTConfig, deepgram_language_option, infer_stt_provider
+from server.services.stt import STTConfig, _default_model, deepgram_language_option, infer_stt_provider
 
 
 def test_infers_google_provider_for_chirp_three() -> None:
@@ -12,6 +12,13 @@ def test_infers_google_provider_for_chirp_three() -> None:
 
 def test_infers_deepgram_provider_for_nova_three() -> None:
     assert infer_stt_provider("nova-3") == "deepgram"
+
+
+def test_default_model_prefers_nova_three_when_no_env_override(monkeypatch) -> None:
+    monkeypatch.delenv("STT_MODEL", raising=False)
+    monkeypatch.delenv("GOOGLE_SPEECH_MODEL", raising=False)
+
+    assert _default_model() == "nova-3"
 
 
 def test_multilingual_codes_switches_nova_three_to_multi_language() -> None:
