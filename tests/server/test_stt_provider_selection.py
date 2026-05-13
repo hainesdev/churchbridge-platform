@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlparse
 
 from server.services.deepgram_speech_session import _build_deepgram_listen_options
 from server.services.deepgram_speech_session import DeepgramSpeechSession
@@ -43,7 +43,7 @@ def test_single_language_codes_collapse_to_deepgram_family_code() -> None:
     assert deepgram_language_option(config) == "es"
 
 
-def test_deepgram_listen_options_use_safe_minimal_live_profile() -> None:
+def test_deepgram_listen_options_restore_live_flags_and_keyterms() -> None:
     config = STTConfig.from_payload(
         {
             "model": "nova-3",
@@ -68,46 +68,52 @@ def test_deepgram_listen_options_use_safe_minimal_live_profile() -> None:
     assert options["model"] == "nova-3"
     assert options["encoding"] == "linear16"
     assert options["sample_rate"] == 16_000
+    assert options["channels"] == 1
     assert options["language"] == "multi"
-    assert set(options.keys()) == {"model", "encoding", "sample_rate", "language"}
+    assert options["interim_results"] is True
+    assert options["utterance_end_ms"] == 1800
+    assert options["vad_events"] is True
+    assert options["smart_format"] is True
+    assert options["punctuate"] is True
+    assert options["keyterms"] == ["Espiritu Santo", "Pentecostes"]
 
 
-def test_deepgram_session_start_uses_async_context_manager(monkeypatch) -> None:
+def test_deepgram_session_start_uses_raw_websocket_profile(monkeypatch) -> None:
     connect_calls: list[dict[str, object]] = []
 
     class _FakeSocket:
         def __init__(self) -> None:
             self.closed = False
 
-        async def send_media(self, message: bytes) -> None:
+        async def send(self, _message) -> None:
             return None
 
-        async def send_finalize(self) -> None:
+        async def close(self) -> None:
             self.closed = True
 
-        async def send_close_stream(self) -> None:
-            self.closed = True
-
-        async def recv(self):
+        async def __aiter__(self):
             while not self.closed:
                 await asyncio.sleep(0.01)
-            raise RuntimeError("socket closed")
+                if False:
+                    yield None
 
-    class _FakeListenV1:
-        @asynccontextmanager
-        async def connect(self, **kwargs):
-            connect_calls.append(kwargs)
-            yield _FakeSocket()
+    class _FakeConnect:
+        def __init__(self, url: str, **kwargs) -> None:
+            connect_calls.append({"url": url, **kwargs})
+            self._socket = _FakeSocket()
 
-    class _FakeAsyncDeepgramClient:
-        def __init__(self, api_key: str) -> None:
-            self.listen = type("Listen", (), {"v1": _FakeListenV1()})()
+        async def __aenter__(self):
+            return self._socket
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self._socket.closed = True
+            return False
 
     async def _run() -> None:
         monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
         from server.services import deepgram_speech_session as module
 
-        monkeypatch.setattr(module, "AsyncDeepgramClient", _FakeAsyncDeepgramClient)
+        monkeypatch.setattr(module.websockets, "connect", lambda url, **kwargs: _FakeConnect(url, **kwargs))
         session = DeepgramSpeechSession(
             church_id="benchmark-lab",
             on_interim=lambda *_args, **_kwargs: asyncio.sleep(0),
@@ -124,5 +130,13 @@ def test_deepgram_session_start_uses_async_context_manager(monkeypatch) -> None:
     asyncio.run(_run())
 
     assert connect_calls
-    assert connect_calls[0]["model"] == "nova-3"
-    assert connect_calls[0]["language"] == "multi"
+    query = parse_qs(urlparse(str(connect_calls[0]["url"])).query)
+    assert query["model"] == ["nova-3"]
+    assert query["language"] == ["multi"]
+    assert query["interim_results"] == ["true"]
+    assert query["utterance_end_ms"] == ["2000"]
+    assert query["vad_events"] == ["true"]
+    assert query["smart_format"] == ["true"]
+    assert query["punctuate"] == ["true"]
+    assert query["keyterms"] == ["Pentecostes"]
+    assert connect_calls[0]["additional_headers"] == {"Authorization": "Token test-key"}
