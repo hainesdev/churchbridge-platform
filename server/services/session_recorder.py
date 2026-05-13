@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import time
 import wave
@@ -99,6 +100,33 @@ class SessionRecorder:
         cleaned = cleaned.strip("-_.")
         return cleaned or fallback
 
+    def _safe_filename_stem(self, *parts: str, max_length: int = 220) -> str:
+        stem = "_".join(part for part in parts if part)
+        if len(stem) <= max_length:
+            return stem
+
+        digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:12]
+        remaining = max_length - len(digest) - 2
+        if remaining <= 0:
+            return digest
+
+        tail_length = min(48, max(16, remaining // 3))
+        head_length = max(remaining - tail_length, 32)
+        if head_length + tail_length > remaining:
+            tail_length = max(0, remaining - head_length)
+
+        compacted = f"{stem[:head_length]}_{digest}"
+        if tail_length > 0:
+            compacted = f"{compacted}_{stem[-tail_length:]}"
+
+        logger.info(
+            "[recorder:%s] Compacting benchmark filename stem from %d to %d characters",
+            self._session_id,
+            len(stem),
+            len(compacted),
+        )
+        return compacted
+
     def _setup_paths(self) -> tuple[Path, Path, Path]:
         ts_str = str(int(self._started_at))
         benchmark_capture = self._benchmark_capture
@@ -121,9 +149,10 @@ class SessionRecorder:
             )
             audio_dir = Path("tests/audio/captured/benchmarks") / benchmark_session
             events_dir = Path("logs/sessions/benchmarks") / benchmark_session
-            audio_name = f"{benchmark_run}_{pipeline}_{label}.wav"
-            events_name = f"{benchmark_run}_{pipeline}_{label}.jsonl"
-            metadata_name = f"{benchmark_run}_{pipeline}_{label}.metadata.json"
+            stem = self._safe_filename_stem(benchmark_run, pipeline, label)
+            audio_name = f"{stem}.wav"
+            events_name = f"{stem}.jsonl"
+            metadata_name = f"{stem}.metadata.json"
         else:
             audio_dir = Path("tests/audio/captured")
             events_dir = Path("logs/sessions")

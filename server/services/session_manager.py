@@ -15,11 +15,12 @@ from server.db.sessions import (
     append_segment,
 )
 from server.services.audio_utils import resample_float32_to_pcm16, base64_to_float32_bytes
+from server.services.deepgram_speech_session import DeepgramSpeechSession
 from server.services.google_speech_session import GoogleSpeechSession
 from server.services.google_translate_service import GoogleTranslateService
 from server.services.llm_enrichment_service import LLMEnrichmentService, _format_deferred_release_text
 from server.services.sentence_buffer import SentenceBuffer, _is_incomplete
-from server.services.stt import STTConfig
+from server.services.stt import STTConfig, infer_stt_provider
 from server.services.sermon_state_tracker import SermonStateTracker
 from server.services.topic_tracker import TopicTracker
 from server.services.broadcaster import Broadcaster
@@ -724,7 +725,9 @@ class ServiceSession:
             state_tracker=self._state_tracker,
         )
 
-        self._stt_session = GoogleSpeechSession(
+        stt_provider = infer_stt_provider(self._stt_config.model)
+        stt_session_cls = DeepgramSpeechSession if stt_provider == "deepgram" else GoogleSpeechSession
+        self._stt_session = stt_session_cls(
             church_id=self._church_id,
             on_interim=self._on_interim,
             on_final=self._on_final,
@@ -751,17 +754,19 @@ class ServiceSession:
                 "source_scripture_version": self._source_scripture_version,
                 "display_scripture_version": self._display_scripture_version,
                 "stt_config": self._stt_config.public_payload(),
+                "stt_provider": stt_provider,
                 "benchmark_capture": self._benchmark_capture.as_dict() if self._benchmark_capture else None,
                 "capture_active": self._recorder is not None,
             },
         )
         logger.info(
-            "[session] Started for church %s (db_id=%s, topic=%r, source_version=%s, display_version=%s, stt_model=%s, stt_languages=%s)",
+            "[session] Started for church %s (db_id=%s, topic=%r, source_version=%s, display_version=%s, stt_provider=%s, stt_model=%s, stt_languages=%s)",
             self._church_id,
             self._db_session_id,
             sermon_topic or "(none)",
             self._source_scripture_version,
             self._display_scripture_version,
+            stt_provider,
             self._stt_config.model,
             ",".join(self._stt_config.language_codes),
         )

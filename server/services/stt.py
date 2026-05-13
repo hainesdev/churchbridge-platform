@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Literal
+
+STTProvider = Literal["google", "deepgram"]
 
 
 def _default_model() -> str:
-    return os.getenv("GOOGLE_SPEECH_MODEL", "chirp_3").strip() or "chirp_3"
+    return (
+        os.getenv("STT_MODEL")
+        or os.getenv("GOOGLE_SPEECH_MODEL")
+        or "chirp_3"
+    ).strip() or "chirp_3"
 
 
 def _dedupe_language_codes(codes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -61,6 +68,56 @@ def _parse_language_codes(payload: dict) -> tuple[str, ...]:
     return _default_language_codes()
 
 
+def _normalized_model_name(model: str) -> str:
+    return str(model or "").strip().lower()
+
+
+def _language_family(code: str) -> str:
+    normalized = str(code or "").strip().lower()
+    if normalized.startswith("es"):
+        return "es"
+    if normalized.startswith("en"):
+        return "en"
+    if normalized.startswith("fr"):
+        return "fr"
+    if normalized.startswith("de"):
+        return "de"
+    if normalized.startswith("hi"):
+        return "hi"
+    if normalized.startswith("ru"):
+        return "ru"
+    if normalized.startswith("pt"):
+        return "pt"
+    if normalized.startswith("ja"):
+        return "ja"
+    if normalized.startswith("it"):
+        return "it"
+    if normalized.startswith("nl"):
+        return "nl"
+    return normalized.split("-", 1)[0]
+
+
+def infer_stt_provider(model: str) -> STTProvider:
+    normalized = _normalized_model_name(model)
+    if normalized.startswith("nova-") or normalized.startswith("flux"):
+        return "deepgram"
+    return "google"
+
+
+def deepgram_language_option(config: "STTConfig") -> str:
+    cleaned = [str(code).strip() for code in config.language_codes if str(code).strip()]
+    if not cleaned:
+        return "en"
+    if any(code.lower() == "multi" for code in cleaned):
+        return "multi"
+
+    families = {_language_family(code) for code in cleaned if _language_family(code)}
+    if len(cleaned) > 1 or len(families) > 1:
+        return "multi"
+
+    return _language_family(cleaned[0]) or "en"
+
+
 @dataclass(frozen=True)
 class STTConfig:
     model: str = _default_model()
@@ -108,7 +165,11 @@ class STTConfig:
             "languageCodes": list(self.language_codes),
             "location": self.location,
             "recognizer": self.recognizer,
+            "interimResults": self.interim_results,
             "utteranceEndMs": self.utterance_end_ms,
+            "vadEvents": self.vad_events,
+            "smartFormat": self.smart_format,
+            "punctuate": self.punctuate,
             "confidenceHoldThreshold": self.confidence_hold_threshold,
             "lowConfidenceHoldSecs": self.low_confidence_hold_secs,
             "diarizationEnabled": self.diarization_enabled,
