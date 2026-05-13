@@ -1,4 +1,8 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 from server.services.deepgram_speech_session import _build_deepgram_listen_options
+from server.services.deepgram_speech_session import DeepgramSpeechSession
 from server.services.stt import STTConfig, deepgram_language_option, infer_stt_provider
 
 
@@ -32,7 +36,7 @@ def test_single_language_codes_collapse_to_deepgram_family_code() -> None:
     assert deepgram_language_option(config) == "es"
 
 
-def test_deepgram_listen_options_include_keyterms_and_live_flags() -> None:
+def test_deepgram_listen_options_use_safe_minimal_live_profile() -> None:
     config = STTConfig.from_payload(
         {
             "model": "nova-3",
@@ -58,9 +62,60 @@ def test_deepgram_listen_options_include_keyterms_and_live_flags() -> None:
     assert options["encoding"] == "linear16"
     assert options["sample_rate"] == 16_000
     assert options["language"] == "multi"
-    assert options["interim_results"] is True
-    assert options["utterance_end_ms"] == 1800
-    assert options["vad_events"] is True
-    assert options["smart_format"] is True
-    assert options["punctuate"] is True
-    assert options["keyterm"] == ["Espiritu Santo", "Pentecostes"]
+    assert set(options.keys()) == {"model", "encoding", "sample_rate", "language"}
+
+
+def test_deepgram_session_start_uses_async_context_manager(monkeypatch) -> None:
+    connect_calls: list[dict[str, object]] = []
+
+    class _FakeSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send_media(self, message: bytes) -> None:
+            return None
+
+        async def send_finalize(self) -> None:
+            self.closed = True
+
+        async def send_close_stream(self) -> None:
+            self.closed = True
+
+        async def recv(self):
+            while not self.closed:
+                await asyncio.sleep(0.01)
+            raise RuntimeError("socket closed")
+
+    class _FakeListenV1:
+        @asynccontextmanager
+        async def connect(self, **kwargs):
+            connect_calls.append(kwargs)
+            yield _FakeSocket()
+
+    class _FakeAsyncDeepgramClient:
+        def __init__(self, api_key: str) -> None:
+            self.listen = type("Listen", (), {"v1": _FakeListenV1()})()
+
+    async def _run() -> None:
+        monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
+        from server.services import deepgram_speech_session as module
+
+        monkeypatch.setattr(module, "AsyncDeepgramClient", _FakeAsyncDeepgramClient)
+        session = DeepgramSpeechSession(
+            church_id="benchmark-lab",
+            on_interim=lambda *_args, **_kwargs: asyncio.sleep(0),
+            on_final=lambda *_args, **_kwargs: asyncio.sleep(0),
+            on_utterance_end=lambda: asyncio.sleep(0),
+        )
+        await session.start(
+            glossary={"Pentecostes": 5},
+            sample_rate=16_000,
+            stt_config=STTConfig.from_payload({"model": "nova-3", "languageCodes": ["es-US", "en-US"]}),
+        )
+        await session.stop()
+
+    asyncio.run(_run())
+
+    assert connect_calls
+    assert connect_calls[0]["model"] == "nova-3"
+    assert connect_calls[0]["language"] == "multi"

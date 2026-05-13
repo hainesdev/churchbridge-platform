@@ -112,9 +112,9 @@ class DeepgramSpeechSession:
         try:
             while not self._stopping():
                 try:
-                    async for socket in self._client.listen.v1.connect(
+                    async with self._client.listen.v1.connect(
                         **_build_deepgram_listen_options(stt_config, sample_rate, glossary)
-                    ):
+                    ) as socket:
                         sender_task = asyncio.create_task(self._send_audio_loop(socket))
                         if not ready.is_set():
                             ready.set()
@@ -248,46 +248,19 @@ def _build_deepgram_listen_options(
     sample_rate: int,
     glossary: dict[str, int],
 ) -> dict[str, object]:
-    options: dict[str, object] = {
+    # Deepgram Nova 3 live streaming currently rejects the richer Google-style
+    # websocket flags we would normally send here (interim results, VAD events,
+    # utterance_end_ms, smart formatting, punctuation, diarization, and keyterms)
+    # with a 400 during connection initialization in this environment. Keep the
+    # live handshake to the minimal set that is known to connect so benchmark
+    # comparisons measure transcription quality instead of a broken startup.
+    _ = glossary
+    return {
         "model": stt_config.model,
         "encoding": "linear16",
         "sample_rate": sample_rate,
         "language": deepgram_language_option(stt_config),
-        "interim_results": stt_config.interim_results,
-        "punctuate": stt_config.punctuate,
-        "smart_format": stt_config.smart_format,
-        "vad_events": stt_config.vad_events,
-        "utterance_end_ms": stt_config.utterance_end_ms,
     }
-    if stt_config.diarization_enabled:
-        options["diarize"] = True
-
-    keyterms = _deepgram_keyterms(glossary)
-    if keyterms:
-        options["keyterm"] = keyterms
-    return options
-
-
-def _deepgram_keyterms(glossary: dict[str, int], limit: int = 50) -> list[str]:
-    ranked = sorted(
-        (
-            (str(term).strip(), int(weight or 0))
-            for term, weight in dict(glossary or {}).items()
-            if str(term).strip()
-        ),
-        key=lambda item: (-item[1], item[0].lower()),
-    )
-    seen: set[str] = set()
-    keyterms: list[str] = []
-    for term, _weight in ranked:
-        normalized = term.lower()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        keyterms.append(term)
-        if len(keyterms) >= limit:
-            break
-    return keyterms
 
 
 def _audio_start_s(response: ListenV1Results, words: list) -> float:
