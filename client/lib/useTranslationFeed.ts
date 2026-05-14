@@ -93,6 +93,7 @@ export interface TranslationFeed {
   spanishLines: string[];
   partialSpanish: string;
   liveEnglish: string;
+  liveSource: string;
   liveSegmentId: number | null;
   liveUpdatedAt: number | null;
   connected: boolean;
@@ -251,6 +252,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
   const [spanishLines, setSpanishLines] = useState<string[]>([]);
   const [partialSpanish, setPartialSpanish] = useState('');
   const [liveEnglish, setLiveEnglish] = useState('');
+  const [liveSource, setLiveSource] = useState('');
   const [liveSegmentId, setLiveSegmentId] = useState<number | null>(null);
   const [liveUpdatedAt, setLiveUpdatedAt] = useState<number | null>(null);
   const [connected, setConnected] = useState(false);
@@ -287,6 +289,12 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
 
     const clearLiveIfMatches = (segmentId: number | null) => {
       setLiveEnglish(prev => {
+        if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
+          return '';
+        }
+        return prev;
+      });
+      setLiveSource(prev => {
         if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
           return '';
         }
@@ -338,6 +346,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
             ? text
             : mergeLiveEnglish(prev, text)
         ));
+        setLiveSource(source);
         setLiveSegmentId(messageSegmentId(msg));
         setLiveUpdatedAt(Date.now());
         return;
@@ -616,6 +625,7 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     spanishLines,
     partialSpanish,
     liveEnglish,
+    liveSource,
     liveSegmentId,
     liveUpdatedAt,
     connected,
