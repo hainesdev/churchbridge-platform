@@ -15,6 +15,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     spanishLines,
     partialSpanish,
     liveEnglish,
+    liveSource,
     connected,
     flashingId,
   } = useTranslationFeed(churchId);
@@ -53,6 +54,25 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     spanishLines.join(' ') +
     (spanishLines.length > 0 && partialSpanish ? ' ' : '') +
     partialSpanish;
+  const latestCommittedSpanish = segments.at(-1)?.spanish ?? '';
+  const draftSpanish = partialSpanish || latestCommittedSpanish;
+
+  const draftSourceLabel = (() => {
+    switch (liveSource) {
+      case 'google_interim':
+        return 'Draft · interim';
+      case 'google_fragment':
+        return 'Draft · fragment';
+      case 'google_sentence':
+        return 'Draft · sentence';
+      case 'llm':
+        return 'Draft · refined';
+      case 'stt_passthrough':
+        return 'Draft · passthrough';
+      default:
+        return 'Draft';
+    }
+  })();
 
   const statusBar = (label: string) => (
     <div className="flex-none px-6 py-2 bg-gray-900/80 flex items-center gap-2 z-10">
@@ -160,6 +180,43 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     );
   }, [revealedPhraseBySegment, togglePhraseReveal]);
 
+  const draftPanel = (
+    <div className="flex-none border-b border-sky-300/10 bg-gradient-to-b from-sky-300/10 via-sky-300/5 to-transparent px-6 py-5 backdrop-blur-sm">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p className="text-[11px] uppercase tracking-[0.24em] text-sky-200/60">{draftSourceLabel}</p>
+          <p className="mt-1 text-[11px] uppercase tracking-[0.18em] text-stone-500">Updates as speech comes in</p>
+        </div>
+        <div className="rounded-full border border-sky-300/15 bg-sky-300/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100/80">
+          {liveEnglish ? 'Active' : partialSpanish ? 'Listening' : 'Standby'}
+        </div>
+      </div>
+      <div className="mt-4 space-y-3">
+        <p className={`min-h-[3.5rem] text-3xl font-semibold leading-tight tracking-[-0.02em] ${
+          liveEnglish ? 'text-white' : 'text-white/35'
+        }`}>
+          {liveEnglish || 'Waiting for draft translation...'}
+          {(liveEnglish || partialSpanish) && <span className="animate-pulse text-sky-300 ml-1">▌</span>}
+        </p>
+        <p className="min-h-[1.5rem] text-sm leading-relaxed text-stone-400">
+          {draftSpanish || 'Spanish source will appear here while the draft builds.'}
+        </p>
+      </div>
+    </div>
+  );
+
+  const committedLabel = (
+    <div className="flex items-center justify-between gap-4 pt-6">
+      <div>
+        <p className="text-[11px] uppercase tracking-[0.24em] text-stone-500">Confirmed</p>
+        <p className="mt-1 text-[11px] uppercase tracking-[0.18em] text-stone-600">Stable captions after buffering and correction</p>
+      </div>
+      <div className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-stone-300">
+        {segments.length} committed
+      </div>
+    </div>
+  );
+
   const liveDock = liveEnglish ? (
     <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-6 py-4 backdrop-blur">
       <p className="text-[11px] uppercase tracking-[0.24em] text-gray-500">Live Translation</p>
@@ -177,6 +234,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
   if (mode === 'lowerthird') {
     return (
       <div className="fixed bottom-0 left-0 right-0 p-6 space-y-2">
+        {false ? liveDock : null}
         <AnimatePresence mode="popLayout">
           {segments.slice(-2).map((segment) => (
             <motion.div
@@ -246,8 +304,10 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
       <div className="h-full flex bg-black text-white overflow-hidden relative">
         <div className="flex-1 flex flex-col overflow-hidden">
           {statusBar('Live')}
+          {draftPanel}
           <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
-            <div className="min-h-full flex flex-col justify-end px-10 pt-20 pb-8 gap-5">
+            <div className="min-h-full flex flex-col justify-end px-10 pb-8 gap-5">
+              {committedLabel}
               {segments.map((segment) => (
                 <motion.div
                   key={segment.id}
@@ -271,7 +331,6 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
               ))}
             </div>
           </div>
-          {liveDock}
           {liveButton}
         </div>
         <ScripturePopover
@@ -291,8 +350,10 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     <div className="h-full flex bg-black text-white overflow-hidden relative">
       <div className="flex-1 flex flex-col overflow-hidden">
         {statusBar('Live')}
+        {draftPanel}
         <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
-          <div className="min-h-full flex flex-col justify-end px-10 pt-20 pb-8 gap-5">
+          <div className="min-h-full flex flex-col justify-end px-10 pb-8 gap-5">
+            {committedLabel}
             {segments.map((segment) => (
               <motion.div
                 key={segment.id}
@@ -318,7 +379,6 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
             ))}
           </div>
         </div>
-        {liveDock}
         {liveButton}
       </div>
       <ScripturePopover
