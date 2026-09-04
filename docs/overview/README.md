@@ -7,6 +7,8 @@ pipeline works, and which architectural decisions are shaping current work.
 
 - Project overview and quickstart:
   [`README.md`](../../README.md)
+- Runtime data flow:
+  [`data-flow.md`](./data-flow.md)
 - Governing technical directive:
   [`DIRECTIVE.md`](../../DIRECTIVE.md)
 - Caption chain lifecycle details:

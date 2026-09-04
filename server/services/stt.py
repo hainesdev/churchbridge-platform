@@ -54,6 +54,16 @@ def _default_recognizer() -> str:
     return os.getenv("GOOGLE_SPEECH_RECOGNIZER", "_").strip() or "_"
 
 
+def _default_endpointing_ms() -> int:
+    raw = os.getenv("DEEPGRAM_ENDPOINTING_MS", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 def _parse_language_codes(payload: dict) -> tuple[str, ...]:
     raw_codes = payload.get("languageCodes")
     if isinstance(raw_codes, (list, tuple)):
@@ -123,6 +133,7 @@ class STTConfig:
     model: str = _default_model()
     language_codes: tuple[str, ...] = field(default_factory=_default_language_codes)
     interim_results: bool = True
+    endpointing_ms: int = _default_endpointing_ms()
     utterance_end_ms: int = 2000
     vad_events: bool = True
     smart_format: bool = True
@@ -144,6 +155,7 @@ class STTConfig:
             model=str(payload.get("model") or "").strip() or _default_model(),
             language_codes=_parse_language_codes(payload),
             interim_results=bool(payload.get("interimResults", cls.interim_results)),
+            endpointing_ms=max(0, int(payload.get("endpointingMs", cls.endpointing_ms))),
             utterance_end_ms=max(500, int(payload.get("utteranceEndMs", cls.utterance_end_ms))),
             vad_events=bool(payload.get("vadEvents", cls.vad_events)),
             smart_format=bool(payload.get("smartFormat", cls.smart_format)),
@@ -166,6 +178,7 @@ class STTConfig:
             "location": self.location,
             "recognizer": self.recognizer,
             "interimResults": self.interim_results,
+            "endpointingMs": self.endpointing_ms,
             "utteranceEndMs": self.utterance_end_ms,
             "vadEvents": self.vad_events,
             "smartFormat": self.smart_format,

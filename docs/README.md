@@ -29,6 +29,8 @@ pretending the migration is already finished.
 
 - High-level product and pipeline overview:
   [`README.md`](../README.md)
+- Implementation-level runtime data flow:
+  [`overview/data-flow.md`](./overview/data-flow.md)
 - Governing technical direction and design constraints:
   [`DIRECTIVE.md`](../DIRECTIVE.md)
 - Caption chain lifecycle and revision behavior:
@@ -47,6 +49,14 @@ pretending the migration is already finished.
 
 - Planning index:
   [`plans/README.md`](./plans/README.md)
+- Agent-coordinated general-purpose reimplementation program plan:
+  [`plans/agent_coordinated_reimplementation_program_plan.md`](./plans/agent_coordinated_reimplementation_program_plan.md)
+- Skill manifest specification:
+  [`plans/skill_manifest_spec.md`](./plans/skill_manifest_spec.md)
+- Church-service skill extraction plan:
+  [`plans/church_service_skill_extraction_plan.md`](./plans/church_service_skill_extraction_plan.md)
+- General-purpose repo and module layout plan:
+  [`plans/general_purpose_repo_module_layout_plan.md`](./plans/general_purpose_repo_module_layout_plan.md)
 - MVP planning:
   [`MVP_PLAN.md`](../MVP_PLAN.md)
 - Production roadmap:

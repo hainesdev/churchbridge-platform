@@ -1,10 +1,21 @@
 # Chunk Identity Retention Exploration Plan
 
+Last updated: 2026-05-15
+
 ## Purpose
 
-This document turns the current chunk-identity work into a structured exploration plan.
+This document turns the current chunk-identity work into a structured tuning
+plan.
 
 The goal is not only to preserve phrase-alignment metadata, but to decide which identity-retention strategy gives the best user-facing continuity without weakening alignment quality.
+
+Status:
+
+1. The core chunk-lineage payload is already implemented.
+2. The display client already uses that payload for continuity-sensitive
+   interaction.
+3. This plan is now about improving reuse trustworthiness, not inventing the
+   first version of the model.
 
 ## Current State
 
@@ -24,22 +35,56 @@ The client now:
 1. parses the richer alignment payload
 2. prefers span-based rendering over text-only rematching
 3. resolves active hover and lock state through `chunk_id` and `derived_from_chunk_ids`
+4. preserves locked state through safe adjacent-merge lineage remaps
+5. drops locked-state transfer when ancestry is ambiguous instead of forcing
+   false continuity
+
+The system also now has targeted continuity coverage:
+
+1. display interaction tests cover safe descendant transfer through
+   `adjacent_merge`
+2. display interaction tests cover ambiguous lineage that must not inherit
+   active selection
+3. replay coverage continues to exercise real websocket display behavior while
+   richer alignment payloads are in use
 
 ## Latest Findings
 
-From the current 60-second benchmark window:
+From the current code and its supporting tests:
 
-1. Raw STT WER and committed sentence WER were unchanged relative to the earlier 60-second baseline.
-2. Phrase-alignment revision count was unchanged on the same clip.
-3. All emitted chunks had English and Spanish spans.
-4. Unchanged chunks successfully retained identity across revisions.
-5. Some merged or expanded chunks inherited ancestry a little too broadly.
+1. Phrase alignment is emitted after stable commit rather than during
+   speculative live display.
+2. All emitted chunks now include English and Spanish spans when alignment is
+   accepted.
+3. Unchanged chunks can retain identity across revisions.
+4. Merge repairs preserve segment lineage even when phrase alignment is cleared
+   and later regenerated.
+5. Client continuity through lineage is now proven for at least:
+   - unchanged chunks
+   - adjacent-merge descendant remaps
+   - ambiguity rejection when reuse is not trustworthy
+6. Some merged or expanded chunks can still inherit ancestry a little too
+   broadly, which is now the main tuning problem.
 
 Interpretation:
 
 1. Chunk identity retention is helping continuity more than alignment quality.
 2. The next problem is not "more metadata."
 3. The next problem is "more trustworthy reuse and lineage."
+
+## Proven Baseline To Preserve
+
+Any further tuning should preserve these behaviors:
+
+1. chunk identity is a post-commit enhancement on top of stable display events
+2. the display uses server-issued chunk identity, not raw text equality, as the
+   primary continuity handle
+3. safe descendant transfer is allowed only when the lineage shape is
+   trustworthy
+4. ambiguous lineage should degrade gracefully to no transfer rather than false
+   certainty
+5. merge-aware lineage at the segment level must survive phrase-alignment
+   clearing and regeneration
 
 ## Problem Statement
 
@@ -182,6 +227,8 @@ Why:
 2. B is the best follow-up if A proves too conservative.
 3. D can improve the user experience without forcing a server rewrite.
 4. C should be treated as a secondary assist, not the primary identity mechanism.
+5. E should stay aspirational until the current proven baseline stops yielding
+   useful incremental gains.
 
 ## Implementation Plan
 

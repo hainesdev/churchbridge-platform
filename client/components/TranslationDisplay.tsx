@@ -19,6 +19,8 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     spanishLines,
     partialSpanish,
     liveEnglish,
+    liveStableEnglish,
+    liveDraftEnglish,
     liveSource,
     connected,
     flashingId,
@@ -79,6 +81,29 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         return 'Draft';
     }
   })();
+
+  const renderLivePreview = useCallback((
+    stableClass: string,
+    draftClass: string,
+  ) => {
+    if (!liveEnglish) return null;
+    const stableText = liveStableEnglish.trim();
+    const draftText = liveDraftEnglish.trim();
+    if (!draftText) {
+      return liveEnglish;
+    }
+    return (
+      <>
+        {stableText && (
+          <span className={stableClass}>
+            {stableText}
+            {' '}
+          </span>
+        )}
+        <span className={draftClass}>{draftText}</span>
+      </>
+    );
+  }, [liveDraftEnglish, liveEnglish, liveStableEnglish]);
 
   const statusBar = (label: string) => (
     <div className="flex-none px-6 py-2 bg-gray-900/80 flex items-center gap-2 z-10">
@@ -501,7 +526,9 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         <p className={`min-h-[3.5rem] text-3xl font-semibold leading-tight tracking-[-0.02em] ${
           liveEnglish ? 'text-white' : 'text-white/35'
         }`}>
-          {liveEnglish || 'Waiting for draft translation...'}
+          {liveEnglish
+            ? renderLivePreview('text-white', 'text-sky-100/85 italic')
+            : 'Waiting for draft translation...'}
           {(liveEnglish || partialSpanish) && <span className="animate-pulse text-sky-300 ml-1">▌</span>}
         </p>
         <p className="min-h-[1.5rem] text-sm leading-relaxed text-stone-400">
@@ -527,7 +554,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
     <div className="flex-none border-t border-gray-800 bg-gray-950/95 px-6 py-4 backdrop-blur">
       <p className="text-[11px] uppercase tracking-[0.24em] text-gray-500">Live Translation</p>
       <p className="mt-2 text-2xl font-semibold leading-snug text-white">
-        {liveEnglish}
+        {renderLivePreview('text-white', 'text-blue-100/85 italic')}
         <span className="animate-pulse text-blue-400 ml-1">▌</span>
       </p>
     </div>
@@ -558,7 +585,7 @@ export function TranslationDisplay({ churchId, mode = 'full' }: TranslationDispl
         </AnimatePresence>
         {liveEnglish && (
           <div className="bg-black/70 px-4 py-2 rounded text-white/80 text-2xl italic">
-            {liveEnglish}
+            {renderLivePreview('text-white/90 not-italic', 'text-white/70 italic')}
             <span className="animate-pulse ml-1">▌</span>
           </div>
         )}

@@ -1,5 +1,18 @@
 # Bilingual Display And Pair Generation Plan
 
+Last updated: 2026-05-15
+
+## Status
+
+The core direction in this document is now implemented in the current
+ChurchBridge runtime.
+
+Read this doc as:
+
+1. the proven baseline for display, pair generation, and chunk-lineage behavior
+2. the explanation for why those choices were made
+3. the remaining tuning roadmap, not a blank-slate proposal
+
 ## Goals
 
 1. Make English the primary reading surface in the live display.
@@ -27,6 +40,33 @@ Recent committed segment data shows three important patterns:
 
 This means phrase alignment should be treated as a stable post-commit enhancement, not a speculative live-text feature.
 
+## Proven Design Baseline
+
+The current implementation has already proven these design choices in code:
+
+1. live draft text and committed segment state are separate concerns
+2. the server emits stable `feed_commit` events first and alignment arrives as a
+   follow-up enhancement
+3. phrase alignment is requested from the commit path, not from speculative
+   pre-commit stages
+4. the display renders bilingual linked interactions when alignment exists and
+   falls back to whole-line interaction when it does not
+5. merge repairs can temporarily clear phrase alignment on a head segment and
+   then regenerate it without losing segment lineage
+6. chunk identity and ancestry are part of the display contract
+7. browser interaction tests now prove both:
+   - continuity through safe adjacent-merge lineage
+   - refusal to transfer active state through ambiguous lineage
+
+The current sanctuary display therefore already behaves as an event-driven
+state machine with:
+
+1. draft English
+2. committed English/Spanish segment pairs
+3. follow-up `feed_revision` alignment enhancements
+4. merge-aware continuity handling
+5. verse chips and scripture popovers attached to visible segments
+
 ## Pair Generation Principles
 
 ### Quality Goals
@@ -49,20 +89,22 @@ We should avoid:
 
 ## Technical Direction
 
-### Current Problems
+### Historical Problem This Plan Solved
 
-The current alignment flow can run before final segment commitment. That creates several risks:
+The earlier alignment flow could run before final segment commitment. That
+created several risks:
 
-1. It spends work on text that may later merge or revise.
-2. It can generate pairs for unstable fragments.
-3. It increases downstream revision churn.
-4. It makes it harder to reason about pair quality in the UI.
+1. It spent work on text that might later merge or revise.
+2. It generated pairs for unstable fragments.
+3. It increased downstream revision churn.
+4. It made pair quality harder to reason about in the UI.
 
-### New Direction
+### Proven Direction
 
-Phase 1 should move phrase-alignment requests to the stable commit path.
+The current implementation now requests phrase alignment from the stable commit
+path.
 
-Desired flow:
+Current flow:
 
 1. Google and LLM translation continue to update live English as they do now.
 2. A committed segment is broadcast as soon as the final English and Spanish pair is ready.
@@ -83,6 +125,8 @@ Deliverables:
 
 ### Phase 1: Post-Commit Pair Generation
 
+Status: implemented in the current runtime.
+
 Objective:
 
 Generate phrase pairs only after a segment is committed.
@@ -102,6 +146,8 @@ Success criteria:
 
 ### Phase 2: Stronger Alignment Validation
 
+Status: partially implemented, still a tuning area.
+
 Objective:
 
 Make alignment acceptance stricter and more bilingual.
@@ -119,6 +165,8 @@ Success criteria:
 2. Fewer low-quality alignments reach the UI.
 
 ### Phase 3: Display Upgrade
+
+Status: implemented in the current runtime.
 
 Objective:
 
@@ -138,6 +186,8 @@ Success criteria:
 2. The UI remains readable on both desktop and touch devices.
 
 ### Phase 4: Observability And Tuning
+
+Status: partially implemented, still active.
 
 Objective:
 
@@ -209,6 +259,8 @@ Start with Phase 1:
 
 ## Phase 5: Chunk Identity Retention
 
+Status: implemented baseline, follow-up reuse tuning remains active.
+
 Objective:
 
 Retain phrase identity across committed revisions and segmentation repairs so linked highlighting feels continuous instead of reset-heavy.
@@ -257,6 +309,15 @@ Success criteria:
 2. Merge-heavy segments expose ancestry metadata instead of losing all structure.
 3. The client can preserve active highlight state through at least simple context repairs.
 4. Browser replay and listener flows continue to pass with the richer payload.
+
+Proven today:
+
+1. unchanged chunks can retain identity
+2. merge-heavy segments preserve segment lineage and can regenerate alignment
+3. the display preserves active state through safe descendant lineage
+4. the display intentionally refuses continuity transfer when lineage is
+   ambiguous
+5. replay and dedicated interaction tests cover the richer payload shape
 
 ### Follow-Up Exploration
 

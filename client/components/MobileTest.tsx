@@ -621,6 +621,8 @@ export function MobileTest({ churchId }: MobileTestProps) {
     spanishLines,
     partialSpanish,
     liveEnglish,
+    liveStableEnglish,
+    liveDraftEnglish,
     connected: displayConnected,
     flashingId,
     lastInterimAt,
@@ -718,6 +720,8 @@ export function MobileTest({ churchId }: MobileTestProps) {
             : 'Waiting for speech...';
   const activeSpanish =
     spanishLines.join(' ') + (spanishLines.length > 0 && partialSpanish ? ' ' : '') + partialSpanish;
+  const liveStableText = liveStableEnglish.trim();
+  const liveDraftText = liveDraftEnglish.trim();
   const panelButton = (
     <button
       type="button"
@@ -934,7 +938,14 @@ export function MobileTest({ churchId }: MobileTestProps) {
         <p className="text-[11px] uppercase tracking-[0.24em] text-gray-500">Live Translation</p>
         {liveEnglish ? (
           <p data-testid="live-translation" className="mt-2 text-xl font-semibold leading-snug text-white">
-            {liveEnglish}<span className="animate-pulse text-blue-400 ml-1">▌</span>
+            {liveDraftText ? (
+              <>
+                {liveStableText && <span className="text-white">{liveStableText} </span>}
+                <span className="text-blue-100/85 italic">{liveDraftText}</span>
+              </>
+            ) : (
+              liveEnglish
+            )}<span className="animate-pulse text-blue-400 ml-1">▌</span>
           </p>
         ) : (
           <p data-testid="live-translation-placeholder" className="mt-2 text-sm text-gray-500">Waiting for live translation...</p>

@@ -13,8 +13,8 @@ if [[ ! -f ".env.production" ]]; then
   exit 1
 fi
 
-git fetch origin "${BRANCH}"
-git checkout "${BRANCH}"
+git fetch --prune origin "${BRANCH}"
+git checkout "${BRANCH}" 2>/dev/null || git checkout -B "${BRANCH}" "origin/${BRANCH}"
 git reset --hard "${REF}"
 
 bash "${SCRIPT_DIR}/deploy.sh"

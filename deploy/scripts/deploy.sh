@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+COMPOSE_FILE="deploy/docker-compose.prod.yml"
+API_WAIT_TIMEOUT="${API_WAIT_TIMEOUT:-180}"
+WEB_WAIT_TIMEOUT="${WEB_WAIT_TIMEOUT:-240}"
 
 cd "${REPO_ROOT}"
 
@@ -70,6 +73,49 @@ ensure_google_speech_env() {
 
 ensure_google_speech_env
 
+compose() {
+  docker compose -f "${COMPOSE_FILE}" "$@"
+}
+
+print_service_logs() {
+  local service="$1"
+  echo "----- ${service} logs -----" >&2
+  compose logs --tail=200 "${service}" >&2 || true
+}
+
+wait_for_service() {
+  local service="$1"
+  local timeout_s="$2"
+  local deadline=$((SECONDS + timeout_s))
+  local container_id=""
+  local status=""
+
+  while (( SECONDS < deadline )); do
+    container_id="$(compose ps -q "${service}" 2>/dev/null | head -1)"
+    if [[ -n "${container_id}" ]]; then
+      status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_id}" 2>/dev/null || true)"
+      case "${status}" in
+        healthy|running)
+          echo "${service} is ${status}."
+          return 0
+          ;;
+        unhealthy|exited|dead)
+          echo "${service} entered terminal status: ${status}" >&2
+          print_service_logs "${service}"
+          return 1
+          ;;
+      esac
+    fi
+
+    sleep 5
+  done
+
+  echo "Timed out waiting for ${service} to become ready." >&2
+  compose ps >&2 || true
+  print_service_logs "${service}"
+  return 1
+}
+
 bash "${SCRIPT_DIR}/sync-db.sh"
 
 # Legacy cleanup: older production revisions pinned fixed container names
@@ -84,9 +130,13 @@ for legacy_name in churchbridge_api churchbridge_web; do
 done
 
 echo "Stopping current compose stack to avoid recreate-time container name conflicts..."
-docker compose -f deploy/docker-compose.prod.yml down --remove-orphans
+compose down --remove-orphans
 
-docker compose -f deploy/docker-compose.prod.yml up -d --build
+compose up -d --build api
+wait_for_service api "${API_WAIT_TIMEOUT}"
+
+compose up -d web
+wait_for_service web "${WEB_WAIT_TIMEOUT}"
 
 # Keep the shared Nginx proxy vhost config in sync.  The dhaines_nginx container
 # mounts /var/www/dhaines.dev/nginx/conf.d from the host; this file must be there

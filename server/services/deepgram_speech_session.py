@@ -253,11 +253,16 @@ class DeepgramSpeechSession:
                 "detected_language": detected_language,
                 "detected_languages": detected_languages,
                 "segment_language_mode": _segment_language_mode(detected_language, detected_languages),
+                "speech_final": bool(message.get("speech_final")),
+                "result_start_s": round(audio_start, 4),
+                "result_end_s": round(audio_end, 4),
             }
             stt_meta.update(_deepgram_speaker_metadata(words))
 
             if bool(message.get("is_final")):
                 await self._on_final(text, audio_start, audio_end, stt_meta)
+                if stt_meta["speech_final"] and self._on_utterance_end:
+                    await self._on_utterance_end()
             else:
                 await self._on_interim(text, stt_meta)
         except Exception as exc:
@@ -295,6 +300,7 @@ def _build_deepgram_listen_options(
     sample_rate: int,
     glossary: dict[str, int],
 ) -> dict[str, object]:
+    endpointing_ms = _deepgram_endpointing_ms(stt_config)
     options: dict[str, object] = {
         "model": stt_config.model,
         "language": deepgram_language_option(stt_config),
@@ -302,6 +308,7 @@ def _build_deepgram_listen_options(
         "sample_rate": sample_rate,
         "channels": 1,
         "interim_results": stt_config.interim_results,
+        "endpointing": endpointing_ms,
         "utterance_end_ms": stt_config.utterance_end_ms,
         "vad_events": stt_config.vad_events,
         "smart_format": stt_config.smart_format,
@@ -357,6 +364,15 @@ def _deepgram_keyterms(glossary: dict[str, int], limit: int = 50) -> list[str]:
         if len(keyterms) >= limit:
             break
     return keyterms
+
+
+def _deepgram_endpointing_ms(stt_config: STTConfig) -> int:
+    configured = int(getattr(stt_config, "endpointing_ms", 0) or 0)
+    if configured > 0:
+        return configured
+    if deepgram_language_option(stt_config) == "multi":
+        return 100
+    return 300
 
 
 def _deepgram_detected_languages(alt: dict) -> list[str]:

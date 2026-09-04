@@ -55,11 +55,20 @@ GitHub Actions can now deploy production on every push to `main` and via manual 
 - `DEPLOY_HEALTHCHECK_URL`: optional public health URL, for example `https://churchbridge.dhaines.dev/health`
 - `GOOGLE_SPEECH_SERVICE_ACCOUNT_JSON_B64`: optional base64-encoded service-account JSON. When set, the deploy workflow writes it to `${DEPLOY_PATH}/secrets/google-speech-service-account.json` before restarting the stack, and the API container reads it from `/app/secrets/google-speech-service-account.json`.
 
+### Required droplet Git access
+
+The droplet checkout must be able to `git fetch` the private repo non-interactively.
+
+- Recommended: add a read-only GitHub deploy key to `hainesdev/churchbridge-ai`
+- Configure the checkout remote as `git@github.com:hainesdev/churchbridge-ai.git`
+- Ensure the deploy user has an SSH config that points `github.com` at that deploy key
+
 ### Workflow behavior
 
 - On push to `main`, GitHub Actions SSHes into the droplet and deploys the exact pushed SHA.
 - Manual runs can deploy any SHA or ref through the workflow dispatch `ref` input.
 - The workflow uses `deploy/scripts/deploy-ref.sh`, which fetches `main`, hard-resets to the requested ref, and runs the existing Docker deploy script.
+- Production health verification now retries for about 60 seconds to absorb transient startup 502s while the web container finishes booting.
 
 ### Recommended `gh` commands
 
@@ -104,4 +113,5 @@ docker run --rm -v dhainesdev_certbot_conf:/etc/letsencrypt certbot/certbot:late
 - The GitHub Actions workflow is a better default control plane than the polling timer because it deploys the exact pushed SHA immediately and gives you logs in GitHub. Keep the timer only as a fallback if you still want pull-based recovery.
 - **Nginx vhost config**: `deploy/nginx/churchbridge.dhaines.dev.conf` is the source of truth. `deploy.sh` copies it to `/var/www/dhaines.dev/nginx/conf.d/churchbridge.conf` on every deploy, so the file survives a re-clone or reset of the `dhaines.dev` directory. The same file is also committed to the `dhaines.dev` repo as a fallback.
 - **Nginx reload**: `deploy.sh` reloads `dhaines_nginx` after every `docker compose up`. This is required because container recreation assigns new IP addresses; without a reload, Nginx routes to the old (dead) IPs and returns 502.
-- **GitHub Actions health check timing**: The workflow fires the health check immediately after `docker compose up` returns. The API container has a Docker health check with `start_period: 20s` (so Compose waits for it), but the web container starts after the API and needs a few additional seconds. A transient 502 from the health check step does not mean the deploy failed — verify with `curl https://churchbridge.dhaines.dev/health` directly.
+- **Staged startup**: `deploy.sh` now starts the API first, waits for it to become healthy, then starts the web container and waits for that health check too. This avoids Compose bailing out early on a temporary API health wobble before the stack has actually settled.
+- **GitHub Actions health check timing**: The workflow now retries the public health check after deploy, which makes the deploy path more tolerant of brief proxy or startup delays.

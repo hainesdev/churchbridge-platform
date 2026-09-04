@@ -93,6 +93,8 @@ export interface TranslationFeed {
   spanishLines: string[];
   partialSpanish: string;
   liveEnglish: string;
+  liveStableEnglish: string;
+  liveDraftEnglish: string;
   liveSource: string;
   liveSegmentId: number | null;
   liveUpdatedAt: number | null;
@@ -247,11 +249,33 @@ function mergeLiveEnglish(current: string, incoming: string): string {
   return `${currentTrimmed} ${incomingTrimmed}`;
 }
 
+function messageLiveTextPart(
+  msg: Record<string, unknown>,
+  key: 'stable_text' | 'draft_text',
+): string | undefined {
+  const raw = msg[key];
+  if (typeof raw !== 'string') return undefined;
+  return raw.trim();
+}
+
+function combineLiveEnglish(stable: string, draft: string, fallback: string): string {
+  const stableTrimmed = stable.trim();
+  const draftTrimmed = draft.trim();
+  if (stableTrimmed && draftTrimmed) {
+    return `${stableTrimmed} ${draftTrimmed}`;
+  }
+  if (stableTrimmed) return stableTrimmed;
+  if (draftTrimmed) return draftTrimmed;
+  return fallback.trim();
+}
+
 export function useTranslationFeed(churchId: string): TranslationFeed {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [spanishLines, setSpanishLines] = useState<string[]>([]);
   const [partialSpanish, setPartialSpanish] = useState('');
   const [liveEnglish, setLiveEnglish] = useState('');
+  const [liveStableEnglish, setLiveStableEnglish] = useState('');
+  const [liveDraftEnglish, setLiveDraftEnglish] = useState('');
   const [liveSource, setLiveSource] = useState('');
   const [liveSegmentId, setLiveSegmentId] = useState<number | null>(null);
   const [liveUpdatedAt, setLiveUpdatedAt] = useState<number | null>(null);
@@ -289,6 +313,18 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
 
     const clearLiveIfMatches = (segmentId: number | null) => {
       setLiveEnglish(prev => {
+        if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
+          return '';
+        }
+        return prev;
+      });
+      setLiveStableEnglish(prev => {
+        if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
+          return '';
+        }
+        return prev;
+      });
+      setLiveDraftEnglish(prev => {
         if (segmentId === null || liveSegmentRef.current === null || segmentId === liveSegmentRef.current) {
           return '';
         }
@@ -336,16 +372,35 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
 
       if (msg.type === 'live_translation') {
         const text = String(msg.text ?? '').trim();
-        if (!text) return;
+        const stableText = messageLiveTextPart(msg, 'stable_text');
+        const draftText = messageLiveTextPart(msg, 'draft_text');
+        const hasSplitPreview = stableText !== undefined || draftText !== undefined;
+        if (!text && !hasSplitPreview) return;
         const source = typeof msg.source === 'string' ? msg.source : 'live_translation';
         const mergeStrategy = msg.merge_strategy === 'replace' || msg.merge_strategy === 'append'
           ? msg.merge_strategy
           : defaultLiveMergeStrategy(source);
-        setLiveEnglish(prev => (
-          mergeStrategy === 'replace'
-            ? text
-            : mergeLiveEnglish(prev, text)
-        ));
+        if (hasSplitPreview) {
+          const nextStable = stableText ?? '';
+          const nextDraft = draftText ?? '';
+          const combined = combineLiveEnglish(nextStable, nextDraft, text);
+          if (!combined) return;
+          setLiveEnglish(combined);
+          setLiveStableEnglish(nextStable);
+          setLiveDraftEnglish(nextDraft);
+        } else {
+          setLiveEnglish(prev => (
+            mergeStrategy === 'replace'
+              ? text
+              : mergeLiveEnglish(prev, text)
+          ));
+          setLiveStableEnglish(prev => (
+            mergeStrategy === 'replace'
+              ? text
+              : mergeLiveEnglish(prev, text)
+          ));
+          setLiveDraftEnglish('');
+        }
         setLiveSource(source);
         setLiveSegmentId(messageSegmentId(msg));
         setLiveUpdatedAt(Date.now());
@@ -625,6 +680,8 @@ export function useTranslationFeed(churchId: string): TranslationFeed {
     spanishLines,
     partialSpanish,
     liveEnglish,
+    liveStableEnglish,
+    liveDraftEnglish,
     liveSource,
     liveSegmentId,
     liveUpdatedAt,

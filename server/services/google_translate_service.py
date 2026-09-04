@@ -41,6 +41,10 @@ def _unwrap(response: str) -> list[str]:
     return [html.unescape(m).strip() for m in _P_TAG.findall(response)]
 
 
+def _join_preview_parts(parts: list[str]) -> str:
+    return " ".join(part.strip() for part in parts if part and part.strip()).strip()
+
+
 class GoogleTranslateService:
     """Translates sentences via Google Cloud Translation v2.
 
@@ -71,7 +75,7 @@ class GoogleTranslateService:
         self,
         on_translation: Callable[[str, str, int], Awaitable[None]],
         on_correction: Callable[[int, str], Awaitable[None]],
-        on_interim_translation: Callable[[str, str, bool], Awaitable[None]],
+        on_interim_translation: Callable[[str, str, bool, str, str], Awaitable[None]],
     ):
         self._on_translation = on_translation
         self._on_correction = on_correction
@@ -113,8 +117,8 @@ class GoogleTranslateService:
 
     async def translate_fragment(self, spanish: str):
         """Fast track: translate one STT final. Uses all prior fragments in the
-        current sentence as leading context; only the current fragment's English
-        is emitted to the display."""
+        current sentence as leading context; the full stable prefix is emitted
+        so the live display preserves context while new audio keeps arriving."""
         if self._fragment_task and not self._fragment_task.done():
             self._fragment_task.cancel()
         self._last_preview_spanish = ""
@@ -126,7 +130,9 @@ class GoogleTranslateService:
 
     async def translate_interim(self, spanish: str):
         """Preview track: translate the latest STT interim as a replace-in-place
-        live preview for the current sentence hypothesis."""
+        live preview for the current sentence hypothesis. The emitted preview
+        preserves the translated stable prefix from prior STT finals and keeps
+        the latest in-flight tail separate for the UI."""
         spanish = spanish.strip()
         if len(spanish) < INTERIM_PREVIEW_MIN_CHARS:
             return
@@ -148,8 +154,14 @@ class GoogleTranslateService:
             if my_task is not self._fragment_task:
                 return
             parts = _unwrap(translated)
-            english = parts[-1] if parts else translated.strip()
-            await self._on_interim_translation(english, "google_fragment", False)
+            full_english = _join_preview_parts(parts) if parts else translated.strip()
+            await self._on_interim_translation(
+                full_english,
+                "google_fragment",
+                True,
+                full_english,
+                "",
+            )
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -164,8 +176,21 @@ class GoogleTranslateService:
             if my_task is not self._fragment_task:
                 return
             parts = _unwrap(translated)
-            english = parts[-1] if parts else translated.strip()
-            await self._on_interim_translation(english, "google_interim", True)
+            if parts:
+                stable_english = _join_preview_parts(parts[:-1])
+                draft_english = parts[-1].strip()
+                full_english = _join_preview_parts([stable_english, draft_english])
+            else:
+                stable_english = ""
+                draft_english = translated.strip()
+                full_english = draft_english
+            await self._on_interim_translation(
+                full_english,
+                "google_interim",
+                True,
+                stable_english,
+                draft_english,
+            )
         except asyncio.CancelledError:
             pass
         except Exception as e:

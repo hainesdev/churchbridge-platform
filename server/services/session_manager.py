@@ -1040,6 +1040,8 @@ class ServiceSession:
             display_ready=False,
             segment_id=ts,
             merge_strategy="replace",
+            stable_text=english,
+            draft_text="",
         )
         await self._queue_feed_commit(
             segment_id=ts,
@@ -1091,6 +1093,8 @@ class ServiceSession:
             display_ready=False,
             segment_id=ts,
             merge_strategy="replace",
+            stable_text=english,
+            draft_text="",
         )
         await self._queue_feed_commit(
             segment_id=ts,
@@ -1135,6 +1139,8 @@ class ServiceSession:
         text: str,
         source: str = "google_fragment",
         replace: bool = False,
+        stable_text: str = "",
+        draft_text: str = "",
     ):
         if source in {"google_fragment", "google_interim"}:
             self._current_interim_alignment_hint = _choose_stronger_interim_hint(
@@ -1148,6 +1154,8 @@ class ServiceSession:
             display_ready=False,
             live_ts=_now(),
             merge_strategy="replace" if replace else "append",
+            stable_text=stable_text,
+            draft_text=draft_text,
         )
 
     def _segment_root_id(self, segment_id: int) -> int:
@@ -1416,6 +1424,8 @@ class ServiceSession:
                 display_ready=False,
                 segment_id=ts,
                 merge_strategy="replace",
+                stable_text=english,
+                draft_text="",
             )
             return
         await self._broadcast_pipeline_trace(
@@ -1482,6 +1492,8 @@ class ServiceSession:
                 display_ready=True,
                 segment_id=ts,
                 merge_strategy="replace",
+                stable_text=english,
+                draft_text="",
             )
             await self._commit_pending_segment(ts)
             return
@@ -1784,6 +1796,8 @@ class ServiceSession:
                 display_ready=True,
                 segment_id=keep_ts,
                 merge_strategy="replace",
+                stable_text=merged_english,
+                draft_text="",
             )
             await self._commit_pending_segment(keep_ts)
         await self._broadcast({
@@ -2130,6 +2144,8 @@ class ServiceSession:
         live_ts: int | None = None,
         segment_id: int | None = None,
         merge_strategy: str = "append",
+        stable_text: str | None = None,
+        draft_text: str | None = None,
     ) -> None:
         payload = {
             "type": "live_translation",
@@ -2138,6 +2154,10 @@ class ServiceSession:
             "display_ready": display_ready,
             "merge_strategy": merge_strategy,
         }
+        if stable_text is not None:
+            payload["stable_text"] = stable_text
+        if draft_text is not None:
+            payload["draft_text"] = draft_text
         if segment_id is not None:
             payload.update(self._segment_ref(segment_id))
         else:

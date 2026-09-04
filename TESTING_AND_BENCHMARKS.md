@@ -313,3 +313,54 @@ Then prepend that folder to `PATH` before running the benchmark.
 - Use explicit short durations for staggered coverage windows so the harness does not benchmark a full sermon by mistake.
 - `promote`-style conclusions are intentionally gated until staggered coverage includes comparable baseline and offset windows across at least two benchmark sets.
 - Interrupting the benchmark can leave background Python processes behind; clean them up before retrying.
+
+## Provider Comparison Benchmark
+
+Phase 1 uses an STT comparison baseline before moving on to translation,
+interpretation, and subjective analysis.
+
+This benchmark compares provider performance directly across three controlled
+conditions:
+
+- `raw`
+- `echo`
+- `noise`
+
+It reuses the clipped sermon benchmark audio, applies deterministic degradations,
+then calls three providers directly:
+
+- Deepgram `nova-3`
+- Google Chirp 3
+- OpenAI `gpt-realtime-translate`
+
+Phase 1 framing:
+
+- Deepgram and Chirp 3 are the primary STT baselines
+- `gpt-realtime-translate` is included as a translation-model-under-STT-pressure probe
+- all three are scored against the Spanish SRT reference in the selected clip window
+
+Run it from the repo root:
+
+```powershell
+$env:PATH='C:\Users\Dan\Desktop\Projects\Transcribe Video\ffmpeg;' + $env:PATH
+$env:PYTHONIOENCODING='utf-8'
+server\.venv\Scripts\python.exe tests\benchmark\run_provider_model_benchmark.py
+```
+
+Useful overrides:
+
+```powershell
+server\.venv\Scripts\python.exe tests\benchmark\run_provider_model_benchmark.py `
+  --audio-dir tests/audio/2 `
+  --duration 20 `
+  --condition raw `
+  --condition echo `
+  --condition noise `
+  --echo-profile medium `
+  --noise-type hvac `
+  --snr-db 10
+```
+
+Artifacts are written under:
+
+- `tests/benchmark/results/provider-comparison/<audio_dir>/<run_id>/provider-benchmark.json`

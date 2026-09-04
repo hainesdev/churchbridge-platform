@@ -9,6 +9,7 @@ The system does not simply translate sentences as they arrive. It holds partial 
 Use these entry points depending on what you are trying to do:
 
 - Project/docs index: [`docs/README.md`](docs/README.md)
+- Implementation-level runtime data flow: [`docs/overview/data-flow.md`](docs/overview/data-flow.md)
 - Deployment and production operations: [`DEPLOYMENT.md`](DEPLOYMENT.md)
 - Testing and benchmarks: [`TESTING_AND_BENCHMARKS.md`](TESTING_AND_BENCHMARKS.md)
 - Technical directive and architecture guardrails: [`DIRECTIVE.md`](DIRECTIVE.md)
@@ -16,13 +17,22 @@ Use these entry points depending on what you are trying to do:
 
 ## How the pipeline works
 
+This section is the high-level pipeline summary. For the exact implementation
+flow, event lifecycle, and persistence boundaries, see
+[`docs/overview/data-flow.md`](docs/overview/data-flow.md).
+
+Current implementation note: the STT layer is provider-selected at runtime. With
+today's defaults the backend usually runs Deepgram (`nova-*` models), while
+Google Speech remains a supported backend when configured.
+
 ```
 Soundboard mic (browser)
   │
   └── PCM audio (Float32, resampled to 16kHz)
         │
         ▼
-  Google Speech-to-Text V2 (Chirp 3, streaming)
+  Selected streaming STT provider
+  (Deepgram `nova-*` by default, Google supported)
     interim results ──► preview language router
                          • Spanish-dominant interim ──► Google preview translation
                          • English-dominant interim ──► passthrough preview
@@ -37,7 +47,7 @@ Soundboard mic (browser)
                           SentenceBuffer (discourse-aware gating)
                             holds text until:
                               • terminal punctuation detected
-                              • utterance-end / VAD signal from Google Speech
+                              • utterance-end / VAD signal from active STT
                               • fallback timer (3.5s + extensions)
                             extends when:
                               • trailing connector word detected (que, porque, es…)
@@ -106,7 +116,7 @@ Soundboard Admin (Browser)
     │
     └── WebSocket ──► FastAPI /api/stream/v1
                           │
-                          ├── Google Speech V2 (STT, Chirp 3 streaming)
+                          ├── Selected STT provider (Deepgram or Google)
                           ├── SentenceBuffer (discourse-aware gating)
                           ├── Google Translate / English passthrough
                           ├── Claude Haiku (enrichment + verse suggestions)
@@ -117,6 +127,12 @@ Soundboard Admin (Browser)
                                   ├── /api/display/v1 → Sanctuary Display (kiosk)
                                   └── /api/listen/v1  → Mobile PWA (QR code)
 ```
+
+Display clients subscribe to the full church event stream. Mobile listeners use
+the same broadcaster but receive only translation-facing events. The detailed
+runtime flow, including `feed_commit`, `feed_revision`, `caption_merge`,
+alignment payloads, and persistence behavior, is documented in
+[`docs/overview/data-flow.md`](docs/overview/data-flow.md).
 
 ## Long-term target pipeline
 

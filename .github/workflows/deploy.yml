@@ -72,6 +72,22 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${HEALTHCHECK_URL:-}" ]]; then
+            url="${HEALTHCHECK_URL}"
+          else
+            url="https://${DEPLOY_HOST}/health"
+          fi
+
+          for attempt in {1..12}; do
+            if response="$(curl --fail --silent --show-error "${url}")"; then
+              echo "${response}"
+              exit 0
+            fi
+
+            echo "Health check attempt ${attempt}/12 failed for ${url}; retrying..." >&2
+            sleep 5
+          done
+
+          if [[ -n "${HEALTHCHECK_URL:-}" ]]; then
             curl --fail --silent --show-error "${HEALTHCHECK_URL}"
           else
             curl --fail --silent --show-error "https://${DEPLOY_HOST}/health"
