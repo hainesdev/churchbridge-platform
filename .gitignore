@@ -34,3 +34,8 @@ Thumbs.db
 # Session capture outputs
 tests/audio/captured/
 logs/
+
+# Temporary run logs
+tmp_*.log
+*.err.log
+*.out.log
