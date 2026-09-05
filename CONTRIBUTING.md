@@ -11,7 +11,7 @@ they shouldn't have, what the room was like, what the audio source was.
 Sanctuary conditions are hard to reproduce and impossible to invent.
 
 **Issues and questions.** Bug reports, deployment problems, and questions about
-pipeline behaviour are all welcome in the issue tracker.
+pipeline behavior are all welcome in the issue tracker.
 
 **Discussion before code.** For anything beyond a small fix, open an issue
 first. The ordering and gating rules in the pipeline are load-bearing in ways
