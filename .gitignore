@@ -34,3 +34,11 @@ Thumbs.db
 # Session capture outputs
 tests/audio/captured/
 logs/
+
+# Benchmark source material - third-party sermon audio and scraped captions.
+# Not ours to redistribute; keep it local.
+tests/audio/1/
+tests/audio/2/
+tests/audio/3/
+tests/audio/**/*.mp3
+tests/audio/**/*.srt
