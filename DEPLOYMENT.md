@@ -1,6 +1,8 @@
 # ChurchBridge Platform Deployment
 
-This project is deployed to `churchbridge.dhaines.dev` on the Ubuntu droplet at `167.71.84.35`.
+This project is deployed to `churchbridge.dhaines.dev` on an Ubuntu droplet.
+The host address is deliberately not recorded here; it lives in the private
+operations runbook.
 
 > **Naming note.** The GitHub repository was renamed from `churchbridge-ai` to
 > `churchbridge-platform` on 2026-09-05. Deliberately unchanged: the production
@@ -43,7 +45,7 @@ Compose now uses Docker network aliases (`churchbridge_api`, `churchbridge_web`)
 2. Create `/var/www/churchbridge-ai/.env.production` from `deploy/.env.production.example`.
    The deploy script backfills the default Chirp 3 env keys if they are missing and expects the Google credential file at `/var/www/churchbridge-ai/secrets/google-speech-service-account.json`.
 3. Copy the production SQLite file to `/var/www/churchbridge-ai/data/churchbridge.db`.
-4. Add the `churchbridge` DNS record in DigitalOcean pointing to `167.71.84.35`.
+4. Add the `churchbridge` DNS record in DigitalOcean pointing to the droplet.
 5. Issue a certificate with the existing Certbot container and webroot volume: `docker compose -f /var/www/dhaines.dev/docker-compose.yml run --rm certbot certonly --webroot -w /var/www/certbot -d churchbridge.dhaines.dev`.
 6. Run `deploy/scripts/deploy.sh` — this patches missing Google Speech env keys, installs the nginx vhost config, reloads `dhaines_nginx`, and brings up the stack.
 7. Install and enable the systemd timer for automatic updates.
@@ -56,8 +58,8 @@ GitHub Actions can now deploy production on every push to `main` and via manual 
 
 ### Required GitHub secrets
 
-- `DEPLOY_HOST`: droplet hostname or IP, for example `167.71.84.35`
-- `DEPLOY_USER`: SSH user, for example `root`
+- `DEPLOY_HOST`: droplet hostname or IP
+- `DEPLOY_USER`: SSH user for deployment
 - `DEPLOY_SSH_KEY`: private key that can SSH into the droplet
 - `DEPLOY_PATH`: repo checkout on the droplet, for example `/var/www/churchbridge-ai`
 - `DEPLOY_PORT`: optional SSH port, defaults to `22`
