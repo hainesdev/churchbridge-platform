@@ -1,6 +1,15 @@
-# ChurchBridge AI Deployment
+# ChurchBridge Platform Deployment
 
 This project is deployed to `churchbridge.dhaines.dev` on the Ubuntu droplet at `167.71.84.35`.
+
+> **Naming note.** The GitHub repository was renamed from `churchbridge-ai` to
+> `churchbridge-platform` on 2026-09-05. Deliberately unchanged: the production
+> checkout path `/var/www/churchbridge-ai`, the `churchbridge-ai-autodeploy`
+> systemd unit and timer names, and the `churchbridge_web` / `churchbridge_api`
+> container names. Server paths and unit names move in a separate infrastructure
+> migration, not with the repository rename. GitHub redirects the old URL, but
+> the `origin` remote has been updated in both the local clone and the
+> production checkout.
 
 ## Production layout
 
