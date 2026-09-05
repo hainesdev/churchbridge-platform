@@ -7,11 +7,6 @@ ChurchBridge's own code is licensed separately — see [`LICENSE`](LICENSE) and
 [`LICENSE-FAQ.md`](LICENSE-FAQ.md). Nothing in this file changes those terms, and
 the ChurchBridge license does not apply to the components listed here.
 
-> **This inventory is incomplete.** It currently covers only assets redistributed
-> directly in this repository. Runtime dependencies pulled from package managers
-> (Python, npm) and the Apple frameworks used by the iOS app are not yet
-> enumerated. Completing it is a prerequisite for making this repository public.
-
 ## Redistributed assets
 
 ### DeepFilterNet3 (Core ML model)
@@ -37,19 +32,71 @@ The original authors ask that use of the DeepFilterNet3 model be cited:
 > "DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement."
 > INTERSPEECH, 2023.
 
-## Still to enumerate
+## Dependencies
 
-Before publication, this file needs to cover:
+Direct dependencies and their licenses, verified against PyPI and the npm
+registry on 2026-09-05. **No dependency carries GPL or AGPL terms**, so none
+conflicts with releasing the combined work under PolyForm Noncommercial.
 
-- **Python dependencies** — FastAPI and the rest of the server requirements.
-- **JavaScript dependencies** — Next.js, React, and the client package tree.
-- **Apple frameworks and iOS app assets** — see the `churchbridge-ios`
-  repository.
-- **Bible texts.** Public-domain translations (ASV, KJV, WEB, RVA) can be
-  attributed here. **RVR1960 is copyrighted** (Sociedades Bíblicas Unidas /
-  American Bible Society) and is deliberately not redistributed in this
-  repository; source Bible data is gitignored. Any arrangement covering
-  server-side use of RVR1960 belongs in this file once settled.
+### Python (`server/requirements.txt`)
+
+| Package | License |
+| --- | --- |
+| fastapi | MIT |
+| uvicorn | BSD-3-Clause |
+| websockets | BSD-3-Clause |
+| python-dotenv | BSD-3-Clause |
+| deepgram-sdk | MIT |
+| anthropic | MIT |
+| redis | MIT |
+| aioredis | MIT |
+| aiosqlite | MIT |
+| numpy | BSD-3-Clause, with bundled 0BSD / MIT / Zlib components |
+| pydantic | MIT |
+| python-multipart | Apache-2.0 |
+| httpx | BSD-3-Clause |
+| pydub | MIT |
+| google-cloud-speech | Apache-2.0 |
+
+### JavaScript (`client/package.json`)
+
+| Package | License |
+| --- | --- |
+| next | MIT |
+| react, react-dom | MIT |
+| framer-motion | MIT |
+| tailwindcss, @tailwindcss/postcss | MIT |
+| @playwright/test | Apache-2.0 |
+| eslint, eslint-config-next | MIT |
+| typescript | Apache-2.0 |
+
+### Scope and caveats
+
+- This table covers **direct** dependencies. Transitive dependencies are not
+  individually enumerated; the npm tree in particular is large. Anyone
+  redistributing a built artifact should generate a full attribution report
+  from the lockfiles.
+- **ffmpeg is not a dependency of this repository**, but `pydub` shells out to
+  it when converting audio. Depending on how it was built, a local ffmpeg may
+  be GPL-licensed. It is invoked as an external program rather than linked or
+  redistributed, so it does not affect this project's licensing — but anyone
+  packaging ffmpeg *with* ChurchBridge would need to consider its terms.
+- Apple frameworks used by the iPhone app are covered in the
+  `churchbridge-ios` repository's own notices.
+
+## Bible text
+
+Public-domain translations (ASV, KJV, WEB, Reina-Valera Antigua 1909) carry no
+restriction. **Reina-Valera 1960 is copyrighted** by Sociedades Bíblicas Unidas
+/ American Bible Society. Source Bible data is not redistributed by this
+repository; `data/source_bibles/` is gitignored and has never been committed.
+
+## Benchmark source material
+
+Sermon audio used as benchmark input is third-party copyrighted material and is
+not distributed by this repository. `tests/audio/1`, `tests/audio/2`,
+`tests/audio/3`, `tests/audio/captured/`, and `retrieved_live_recordings/` are
+gitignored, and were removed from the repository's history on 2026-09-05.
 
 ## Third-party tooling, not redistributed
 
