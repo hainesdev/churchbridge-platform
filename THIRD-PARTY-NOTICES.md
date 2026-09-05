@@ -14,23 +14,24 @@ the ChurchBridge license does not apply to the components listed here.
 
 ## Redistributed assets
 
-### DeepFilterNet3
+### DeepFilterNet3 (Core ML model)
 
-- **Upstream:** https://github.com/Rikorose/DeepFilterNet
-- **Copyright:** © 2021 Hendrik Schröter
-- **License:** MIT (upstream offers MIT or Apache-2.0 at the user's option;
-  ChurchBridge elects MIT)
+- **Source:** https://huggingface.co/aufklarer/DeepFilterNet3-CoreML
+- **Author:** aufklarer
+- **License:** Apache-2.0
+- **Base model:** [Rikorose/DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet),
+  © 2021 Hendrik Schröter, MIT or Apache-2.0 at the user's option
 - **Location:** `client/public/models/DeepFilterNet3-CoreML/`
 - **Full license text:** [`client/public/models/DeepFilterNet3-CoreML/LICENSE`](client/public/models/DeepFilterNet3-CoreML/LICENSE)
 
 Used for real-time speech enhancement. The platform serves these assets to the
 iOS app at runtime; the iOS repository does not contain a copy.
 
-The files here are a Core ML conversion of the upstream released model, produced
-with coremltools 8.3.0 from a TorchScript export (torch 2.3.1). The architecture
-and trained weights are upstream's; the conversion is not.
+These are an INT8-palettized Core ML conversion of DeepFilterNet3 published by a
+third party, redistributed here **unmodified** — byte-for-byte identical to the
+upstream files. The conversion is aufklarer's work, not ChurchBridge's.
 
-Upstream asks that use of the DeepFilterNet3 model be cited:
+The original authors ask that use of the DeepFilterNet3 model be cited:
 
 > Schröter, H., Rosenkranz, T., Escalante-B., A. N., and Maier, A.
 > "DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement."
