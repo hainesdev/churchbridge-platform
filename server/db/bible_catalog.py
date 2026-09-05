@@ -279,8 +279,46 @@ BOOK_METADATA = {
 }
 
 
+# Book names reach us from three places that all spell them differently: LLM
+# verse detection over Spanish speech, the iOS app, and hand-typed lookups. An
+# exact dict lookup rejected "Psalm 42:8" — the form nearly everyone actually
+# writes — so resolution is folded on case, spacing, and punctuation, with a
+# singular/plural fallback.
+_EXTRA_BOOK_ALIASES = {
+    # Psalms is cited in the singular and abbreviated far more than any other
+    # book, in both languages.
+    "Ps": 19,
+    "Psa": 19,
+    "Sal": 19,
+}
+
+
+def _normalize_book_key(book_name: str) -> str:
+    """Fold a book name for comparison.
+
+    Case, whitespace, and punctuation are discarded so that "S. Juan",
+    "S.Juan", and "s juan" all agree. Accents are kept, because they
+    distinguish genuine names such as "Génesis".
+    """
+    return "".join(ch for ch in book_name.casefold() if ch.isalnum())
+
+
+_NORMALIZED_BOOK_ALIASES: dict[str, int] = {}
+for _alias, _book_id in {**BOOK_ALIAS_MAP, **_EXTRA_BOOK_ALIASES}.items():
+    _NORMALIZED_BOOK_ALIASES.setdefault(_normalize_book_key(_alias), _book_id)
+
+
 def canonicalize_book_name(book_name: str) -> tuple[int, str]:
     book_id = BOOK_ALIAS_MAP.get(book_name)
+
+    if book_id is None and book_name:
+        key = _normalize_book_key(book_name)
+        book_id = _NORMALIZED_BOOK_ALIASES.get(key)
+        if book_id is None and key:
+            # "Psalm" for "Psalms", "Salmo" for "Salmos".
+            alternate = key[:-1] if key.endswith("s") else key + "s"
+            book_id = _NORMALIZED_BOOK_ALIASES.get(alternate)
+
     if book_id is None:
         raise KeyError(f"Unmapped book name: {book_name}")
     return book_id, BOOK_METADATA[book_id]["canonical_name"]
