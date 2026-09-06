@@ -562,3 +562,29 @@ Recommended benchmark interpretation:
 - Treat `tests/audio/1 --start-offset 60` as a translation-safety regression window.
 - Treat clipped `tests/audio/2` windows as resilience checks, not the sole optimization target.
 - Treat broad offset sweeps as exploratory sampling, not one combined trajectory for promotion/revert decisions.
+
+## Acknowledgments
+
+The platform serves and coordinates work that other people did.
+
+**DeepFilterNet3** — Hendrik Schröter, Tobias Rosenkranz, Alberto N.
+Escalante-B., and Andreas Maier. The speech-enhancement model this platform
+serves to the iOS app is theirs.
+
+> Schröter, H., Rosenkranz, T., Escalante-B., A. N., and Maier, A.
+> "DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement."
+> INTERSPEECH, 2023.
+
+The Core ML build hosted here is
+[aufklarer's INT8 conversion](https://huggingface.co/aufklarer/DeepFilterNet3-CoreML),
+redistributed unmodified under Apache-2.0.
+
+The Bible corpus comes from
+[dscottpi/bibles](https://github.com/dscottpi/bibles).
+
+At runtime: speech recognition by [Deepgram](https://deepgram.com) (Nova) or
+Google Cloud Speech, translation by Google, and discourse enrichment — the
+judgments about whether a thought is complete and what should reach the screen —
+by [Claude](https://www.anthropic.com).
+
+Full license terms are in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
